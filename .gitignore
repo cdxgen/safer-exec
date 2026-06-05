@@ -1,0 +1,40 @@
+# Go binaries
+go/bin/
+
+# Node modules
+node_modules/
+
+# Test fixtures
+tests/fixtures/
+
+# OS files
+**/.DS_Store
+
+# IDE files
+.idea/
+
+# Build artifacts
+*.sb
+
+# Binaries
+bin/
+
+# Go intermediate files
+*.o
+*.a
+*.so
+
+# Coverage
+coverage/
+.nyc_output/
+*.cov
+
+# Log files
+*.log
+
+# Vim swap files
+*.swp
+*.swo
+
+# Core dumps
+core

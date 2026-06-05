@@ -1,0 +1,164 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-go:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: darwin
+            arch: amd64
+            runner: macos-15-intel
+          - os: darwin
+            arch: arm64
+            runner: macos-15
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version: "1.26"
+
+      - name: Cross-compile ${{ matrix.os }}-${{ matrix.arch }}
+        run: |
+          cd go
+          GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -ldflags="-s -w" -o bin/safer-exec-${{ matrix.os }}-${{ matrix.arch }} ./cmd/safer-exec/
+
+      - name: Upload binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: safer-exec-${{ matrix.os }}-${{ matrix.arch }}
+          path: go/bin/safer-exec-${{ matrix.os }}-${{ matrix.arch }}
+
+  test-go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version: "1.26"
+
+      - name: Run Go tests
+        run: |
+          cd go
+          go test -v -race ./...
+
+  test-node:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: ["20", "21", "22", "23", "24", "25", "26"]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version: "1.26"
+
+      - name: Build Go binary
+        run: |
+          cd go
+          go build -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: |
+          cd npm
+          npm install
+
+      - name: Run unit tests
+        run: |
+          cd npm
+          npm run test:unit
+
+      - name: Run integration tests
+        run: |
+          cd npm
+          npm run test:integration
+
+      - name: Run security tests
+        run: |
+          cd npm
+          npm run test:security
+
+  publish:
+    needs: [build-go, test-go, test-node]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Download binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: safer-exec-*
+          path: binaries/
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "24"
+      - name: Publish packages
+        run: |
+          # Extract version from npm/package.json
+          version=$(jq -r '.version' npm/package.json)
+          # Package each binary into its own npm package
+          for binary in binaries/safer-exec-*/safer-exec-*; do
+            platform=$(echo "$binary" | grep -oP '(?<=safer-exec-)\w+-\w+')
+            pkg_name="@cdxgen/safer-exec-${platform}"
+            os_name=$(echo "$platform" | cut -d- -f1)
+            case "$platform" in
+              *-arm64) cpu="arm64" ;;
+              *) cpu="x64" ;;
+            esac
+            mkdir -p "publish-${platform}/bin"
+            cp "$binary" "publish-${platform}/bin/safer-exec"
+            cat > "publish-${platform}/package.json" << EOF
+            {
+              "name": "${pkg_name}",
+              "version": "${version}",
+              "main": "bin/safer-exec",
+              "files": ["bin/"],
+              "license": "MIT",
+              "repository": {
+                "type": "git",
+                "url": "git+https://github.com/cdxgen/safer-exec.git"
+              },
+              "bugs": {
+                "url": "https://github.com/cdxgen/safer-exec/issues"
+              },
+              "homepage": "https://github.com/cdxgen/safer-exec#readme",
+              "os": [
+                "${os_name}"
+              ],
+              "cpu": [
+                "${cpu}"
+              ]
+            }
+            EOF
+            cd "publish-${platform}"
+            npm publish --provenance --access public
+            cd ..
+          done
+          cd npm
+          npm publish --provenance --access public

@@ -1,0 +1,52 @@
+{
+  "name": "@cdxgen/safer-exec",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.js",
+  "bin": {
+    "safer-exec": "src/cli.js"
+  },
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src/"
+  ],
+  "scripts": {
+    "test": "node --test src/**/*.test.js",
+    "test:unit": "node --test src/**/*.test.js",
+    "test:integration": "node --test ../tests/integration.test.js",
+    "test:security": "node --test ../tests/security.test.js",
+    "test:exhaustion": "node --test ../tests/exhaustion.test.js",
+    "test:benchmark": "node ../tests/benchmark.js",
+    "test:all": "node --test src/**/*.test.js ../tests/**/*.test.js"
+  },
+  "keywords": [
+    "sandbox",
+    "security",
+    "namespace",
+    "seccomp",
+    "seatbelt",
+    "landlock",
+    "cdxgen"
+  ],
+  "author": "Team AppThreat <cloud@appthreat.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cdxgen/safer-exec.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cdxgen/safer-exec/issues"
+  },
+  "homepage": "https://github.com/cdxgen/safer-exec#readme",
+  "optionalDependencies": {
+    "@cdxgen/safer-exec-darwin-arm64": "0.1.0",
+    "@cdxgen/safer-exec-darwin-x64": "0.1.0",
+    "@cdxgen/safer-exec-linux-x64": "0.1.0",
+    "@cdxgen/safer-exec-linux-arm64": "0.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
