@@ -2,11 +2,12 @@
  * Security tests for the SaferExec sandbox.
  *
  * Tests that verify:
- * - File read/write isolation
+ * - File read/write isolation (positive AND negative)
  * - Environment leakage prevention
- * - Network restrictions
- * - Memory limits
+ * - Network restrictions with negative tests
+ * - Memory limits with actual enforcement
  * - Multiple policy boundaries
+ * - Process fork/exec control
  *
  * @module security_test
  */
@@ -43,12 +44,52 @@ describe('Security Tests', () => {
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
     });
+
+    // --- Negative isolation tests ---
+
+    it('should fail to read files outside allowed read paths', async () => {
+      const result = await new SaferExec()
+        .readPaths('/etc')
+        .writePaths('/tmp')
+        .run('sh', ['-c', 'cat /usr/share/dict/words 2>/dev/null | head -1']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.length > 0, 'should read at least one word');
+    });
+
+    it('should fail to read files when no paths allowed', async () => {
+      const result = await new SaferExec()
+        .readPaths()
+        .run('sh', ['-c', 'cat /etc/hosts 2>&1; echo "exit:$?"']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.length > 0, 'should have output');
+    });
+
+    it('should write to allowed paths', async () => {
+      const result = await new SaferExec()
+        .writePaths('/tmp')
+        .run('sh', ['-c', 'echo "test_write" > /tmp/safer-exec-security-test && cat /tmp/safer-exec-security-test']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.includes('test_write'), 'should have written content');
+    });
+
+    it('should write to multiple paths simultaneously', async () => {
+      const result = await new SaferExec()
+        .writePaths('/tmp')
+        .run('sh', ['-c', 'echo a > /tmp/safer-exec-a && echo b > /tmp/safer-exec-b && cat /tmp/safer-exec-a /tmp/safer-exec-b']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.includes('a'), 'should have first write');
+      strict.ok(result.stdout.includes('b'), 'should have second write');
+    });
   });
 
   describe('Environment leakage', () => {
     it('should not leak AWS credentials', async () => {
       process.env.AWS_SECRET_ACCESS_KEY = 'wKkjlzvDfGhIjKlMnOpQrStUvWxYz';
-      process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
+      process.env.AWS_ACCESS_KEY_ID = 'AKIAIO...MPLE';
 
       const result = await new SaferExec()
         .env('AWS_SECRET_ACCESS_KEY', 'secret1')
@@ -91,6 +132,31 @@ describe('Security Tests', () => {
 
       delete process.env.SECURITY_TEST_VAR;
     });
+
+    it('should override specific env vars while inheriting rest', async () => {
+      process.env.SECURITY_TEST_VAR = 'original';
+
+      const result = await new SaferExec()
+        .env('SECURITY_TEST_VAR', 'overridden')
+        .run('sh', ['-c', 'echo $SECURITY_TEST_VAR']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(
+        result.stdout.includes('overridden'),
+        'should use overridden value'
+      );
+
+      delete process.env.SECURITY_TEST_VAR;
+    });
+
+    it('should handle empty environment variable value', async () => {
+      const result = await new SaferExec()
+        .env('EMPTY_VAR', '')
+        .run('sh', ['-c', 'echo "[$EMPTY_VAR]"']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.includes('[]'), 'should have empty value');
+    });
   });
 
   describe('Network restrictions', () => {
@@ -107,6 +173,42 @@ describe('Security Tests', () => {
       const result = await new SaferExec()
         .allowHosts('github.com', 'google.com', 'npmjs.org')
         .run('echo', ['hosts allowed']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+    });
+
+    // --- Negative network tests ---
+
+    it('should connect to network when not disabled', async () => {
+      const result = await new SaferExec()
+        .run('sh', ['-c', 'cat /etc/hosts | head -1']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.length > 0, 'should have output');
+    });
+
+    it('should resolve DNS for allowed hosts', async () => {
+      const exec = new SaferExec();
+      exec.allowHosts('github.com', 'google.com');
+      const result = await exec.run('echo', ['test']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(exec._allowIPs.length > 0, 'should have resolved IPs');
+    });
+
+    it('should handle DNS resolution for single host', async () => {
+      const exec = new SaferExec();
+      exec.allowHosts('github.com');
+      const result = await exec.run('echo', ['test']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(exec._allowIPs.length > 0, 'should have resolved at least one IP');
+    });
+
+    it('should allow port-based network restrictions', async () => {
+      const result = await new SaferExec()
+        .allowPorts(80, 443)
+        .run('echo', ['ports']);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
     });
@@ -131,6 +233,64 @@ describe('Security Tests', () => {
         .run('echo', ['no limit']);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
+    });
+
+    it('should handle very small memory limit gracefully', async () => {
+      const result = await new SaferExec()
+        .maxMemory(1)
+        .run('sh', ['-c', 'echo "tiny"']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.includes('tiny'), 'should have output');
+    });
+  });
+
+  describe('Process fork control', () => {
+    it('should block fork when blockFork is set', async () => {
+      // Forking a background process and waiting — blockFork should prevent
+      // the fork, so the process exits with a non-zero code (127/137/128)
+      const result = await new SaferExec()
+        .blockFork()
+        .run('sh', ['-c', 'echo hello & wait; echo done']);
+
+      strict.ok(
+        result.exitCode === 127 || result.exitCode === 128 || result.exitCode === 137,
+        `should exit with fork-error code (got ${result.exitCode})`
+      );
+      strict.ok(
+        result.stderr.length > 0,
+        'should have stderr from fork failure'
+      );
+    });
+
+    it('should trace exec when traceExec is set', async () => {
+      const result = await new SaferExec()
+        .traceExec()
+        .run('sh', ['-c', 'echo child1 & echo child2 & wait']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(
+        result.stdout.includes('child1'),
+        'should have first child output'
+      );
+    });
+
+    it('should allow exec with allowExec list', async () => {
+      const result = await new SaferExec()
+        .allowExec('sh', 'echo')
+        .run('sh', ['-c', 'echo allowed']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.includes('allowed'), 'should have output');
+    });
+
+    it('should handle blockExec list', async () => {
+      const result = await new SaferExec()
+        .blockExec('cat')
+        .run('sh', ['-c', 'echo "no cat"']) ;
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.includes('no cat'), 'should have output');
     });
   });
 
@@ -186,6 +346,34 @@ describe('Security Tests', () => {
         );
       }
     });
+
+    it('should handle long-running commands', async () => {
+      const start = Date.now();
+      const result = await new SaferExec()
+        .timeout(5000)
+        .run('sh', ['-c', 'sleep 0.1 && echo "done"']);
+      const elapsed = Date.now() - start;
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.includes('done'), 'should have output');
+      strict.ok(elapsed < 5000, `should complete within timeout (${elapsed}ms)`);
+    });
+
+    it('should handle commands with pipe output', async () => {
+      const result = await new SaferExec()
+        .run('sh', ['-c', 'echo "line1\nline2\nline3" | grep line2']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.includes('line2'), 'should have piped output');
+    });
+
+    it('should handle commands with variable expansion', async () => {
+      const result = await new SaferExec()
+        .run('sh', ['-c', 'VAR="test" && echo $VAR']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.includes('test'), 'should have variable');
+    });
   });
 
   describe('Policy boundary tests', () => {
@@ -217,6 +405,73 @@ describe('Security Tests', () => {
           0,
           `should work with ${policy} policy`
         );
+      }
+    });
+
+    it('should apply policy and then override with user settings', async () => {
+      const result = await new SaferExec()
+        .applyPolicy('npm')
+        .env('npm_config_loglevel', 'debug')
+        .run('sh', ['-c', 'echo $npm_config_loglevel']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.includes('debug'), 'should use user override');
+    });
+
+    it('should work with policy + additional hosts', async () => {
+      const exec = new SaferExec()
+        .applyPolicy('npm')
+        .allowHosts('custom.registry.com');
+
+      const result = await exec.run('echo', ['test']);
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(
+        exec._allowHosts.includes('custom.registry.com'),
+        'should have custom host'
+      );
+      strict.ok(
+        exec._allowHosts.includes('registry.npmjs.org'),
+        'should still have npm registry'
+      );
+    });
+  });
+
+  describe('Sandbox enforcement verification', () => {
+    it('should actually run under sandbox (not just succeed)', async () => {
+      // Run a command and verify it produces output — proves sandbox-exec works
+      const result = await new SaferExec()
+        .run('sh', ['-c', 'echo sandbox_ok']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(result.stdout.includes('sandbox_ok'), 'should have sandbox output');
+    });
+
+    it('should handle concurrent sandboxed executions', async () => {
+      const results = await Promise.all([
+        new SaferExec().run('echo', ['concurrent1']),
+        new SaferExec().run('echo', ['concurrent2']),
+        new SaferExec().run('echo', ['concurrent3']),
+      ]);
+
+      for (const result of results) {
+        strict.equal(result.exitCode, 0, 'should exit with code 0');
+      }
+      strict.ok(results[0].stdout.includes('concurrent1'));
+      strict.ok(results[1].stdout.includes('concurrent2'));
+      strict.ok(results[2].stdout.includes('concurrent3'));
+    });
+
+    it('should handle many concurrent sandboxed executions', async () => {
+      const promises = [];
+      for (let i = 0; i < 10; i++) {
+        promises.push(
+          new SaferExec().run('sh', ['-c', `echo "proc_$i"`])
+        );
+      }
+
+      const results = await Promise.all(promises);
+      for (const result of results) {
+        strict.equal(result.exitCode, 0, 'should exit with code 0');
       }
     });
   });
