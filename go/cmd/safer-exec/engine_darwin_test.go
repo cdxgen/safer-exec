@@ -232,12 +232,14 @@ func TestRun_ReadMultipleFiles(t *testing.T) {
 }
 
 func TestRun_WriteFile(t *testing.T) {
-	outputFile := "/tmp/safer-exec-test-output.txt"
+	// /tmp on macOS is a symlink to /private/tmp — use the canonical path
+	// so the Seatbelt subpath rule matches without symlink resolution.
+	outputFile := "/private/tmp/safer-exec-test-output.txt"
 
 	cfg := config.ExecConfig{
 		Cmd:        "sh",
 		Args:       []string{"-c", "echo 'sandbox write test' > " + outputFile},
-		WritePaths: []string{"/tmp"},
+		WritePaths: []string{"/private/tmp"},
 	}
 
 	if err := run(cfg); err != nil {

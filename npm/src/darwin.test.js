@@ -15,6 +15,8 @@
 import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { SaferExec } from './index.js';
+import { tmpdir } from 'node:os';
+import { realpathSync } from 'node:fs';
 
 describe('Darwin RLIMIT Enforcement', () => {
   describe('RLIMIT_AS — Memory limit', () => {
@@ -197,18 +199,20 @@ describe('Darwin Seatbelt Profile Generation', () => {
   });
 
   it('should generate Seatbelt profile with read paths', async () => {
+    const etc = realpathSync('/etc');
     const result = await new SaferExec()
-      .readPaths('/etc', '/usr')
-      .run('sh', ['-c', 'cat /etc/hosts | head -1']);
+      .readPaths(etc, '/usr')
+      .run('sh', ['-c', `cat ${etc}/hosts | head -1`]);
 
     strict.equal(result.exitCode, 0, 'should exit with code 0');
     strict.ok(result.stdout.length > 0, 'should have output');
   });
 
   it('should generate Seatbelt profile with write paths', async () => {
+    const tmp = realpathSync(tmpdir());
     const result = await new SaferExec()
-      .writePaths('/tmp')
-      .run('sh', ['-c', 'echo "test" > /tmp/safer-exec-darwin-test && cat /tmp/safer-exec-darwin-test']);
+      .writePaths(tmp)
+      .run('sh', ['-c', `echo "test" > ${tmp}/safer-exec-darwin-test && cat ${tmp}/safer-exec-darwin-test`]);
 
     strict.equal(result.exitCode, 0, 'should exit with code 0');
     strict.ok(result.stdout.includes('test'), 'should have written content');
@@ -253,9 +257,10 @@ describe('Darwin Seatbelt Profile Generation', () => {
   });
 
   it('should generate Seatbelt profile with audit mode', async () => {
+    const etc = realpathSync('/etc');
     const result = await new SaferExec()
       .enableAudit()
-      .run('sh', ['-c', 'cat /etc/hosts | head -1']);
+      .run('sh', ['-c', `cat ${etc}/hosts | head -1`]);
 
     strict.equal(result.exitCode, 0, 'should exit with code 0');
     strict.ok(result.stdout.length > 0, 'should have output');

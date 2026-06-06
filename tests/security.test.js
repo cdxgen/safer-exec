@@ -15,13 +15,16 @@
 import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { SaferExec } from '../npm/src/index.js';
+import { tmpdir } from 'node:os';
+import { realpathSync } from 'node:fs';
 
 describe('Security Tests', () => {
   describe('File read isolation', () => {
     it('should read files with sandbox', async () => {
+      const etc = realpathSync('/etc');
       const result = await new SaferExec()
-        .readPaths('/etc')
-        .run('sh', ['-c', 'cat /etc/hosts']);
+        .readPaths(etc)
+        .run('sh', ['-c', `cat ${etc}/hosts`]);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
       strict.ok(
@@ -31,16 +34,18 @@ describe('Security Tests', () => {
     });
 
     it('should read without explicit read paths (system.sb)', async () => {
+      const etc = realpathSync('/etc');
       const result = await new SaferExec()
-        .run('sh', ['-c', 'cat /etc/hosts']);
+        .run('sh', ['-c', `cat ${etc}/hosts`]);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
       strict.ok(result.stdout.length > 0, 'should read content');
     });
 
     it('should read multiple files simultaneously', async () => {
+      const etc = realpathSync('/etc');
       const result = await new SaferExec()
-        .run('sh', ['-c', 'cat /etc/hosts /etc/protocols 2>/dev/null']);
+        .run('sh', ['-c', `cat ${etc}/hosts ${etc}/protocols 2>/dev/null`]);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
     });
@@ -48,9 +53,10 @@ describe('Security Tests', () => {
     // --- Negative isolation tests ---
 
     it('should fail to read files outside allowed read paths', async () => {
+      const etc = realpathSync('/etc');
       const result = await new SaferExec()
-        .readPaths('/etc')
-        .writePaths('/tmp')
+        .readPaths(etc)
+        .writePaths(tmpdir())
         .run('sh', ['-c', 'cat /usr/share/dict/words 2>/dev/null | head -1']);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
@@ -58,27 +64,30 @@ describe('Security Tests', () => {
     });
 
     it('should fail to read files when no paths allowed', async () => {
+      const etc = realpathSync('/etc');
       const result = await new SaferExec()
         .readPaths()
-        .run('sh', ['-c', 'cat /etc/hosts 2>&1; echo "exit:$?"']);
+        .run('sh', ['-c', `cat ${etc}/hosts 2>&1; echo "exit:$?"`]);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
       strict.ok(result.stdout.length > 0, 'should have output');
     });
 
     it('should write to allowed paths', async () => {
+      const tmp = realpathSync(tmpdir());
       const result = await new SaferExec()
-        .writePaths('/tmp')
-        .run('sh', ['-c', 'echo "test_write" > /tmp/safer-exec-security-test && cat /tmp/safer-exec-security-test']);
+        .writePaths(tmp)
+        .run('sh', ['-c', `echo "test_write" > ${tmp}/safer-exec-security-test && cat ${tmp}/safer-exec-security-test`]);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
       strict.ok(result.stdout.includes('test_write'), 'should have written content');
     });
 
     it('should write to multiple paths simultaneously', async () => {
+      const tmp = realpathSync(tmpdir());
       const result = await new SaferExec()
-        .writePaths('/tmp')
-        .run('sh', ['-c', 'echo a > /tmp/safer-exec-a && echo b > /tmp/safer-exec-b && cat /tmp/safer-exec-a /tmp/safer-exec-b']);
+        .writePaths(tmp)
+        .run('sh', ['-c', `echo a > ${tmp}/safer-exec-a && echo b > ${tmp}/safer-exec-b && cat ${tmp}/safer-exec-a ${tmp}/safer-exec-b`]);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
       strict.ok(result.stdout.includes('a'), 'should have first write');
@@ -180,8 +189,9 @@ describe('Security Tests', () => {
     // --- Negative network tests ---
 
     it('should connect to network when not disabled', async () => {
+      const etc = realpathSync('/etc');
       const result = await new SaferExec()
-        .run('sh', ['-c', 'cat /etc/hosts | head -1']);
+        .run('sh', ['-c', `cat ${etc}/hosts | head -1`]);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
       strict.ok(result.stdout.length > 0, 'should have output');

@@ -19,7 +19,7 @@ import { describe, it, before } from 'node:test';
 import strict from 'node:assert/strict';
 import { SaferExec } from '../npm/src/index.js';
 import { execSync } from 'node:child_process';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, realpathSync } from 'node:fs';
 
 // Ensure the Go binary is built
 let binaryPath;
@@ -502,10 +502,11 @@ describe('Resource Exhaustion Tests', () => {
 
   describe('Audit Logging', () => {
     it('should return audit log when enabled', async () => {
+      const etc = realpathSync('/etc');
       const result = await new SaferExec()
         .binaryPath(binaryPath)
         .enableAudit()
-        .run('sh', ['-c', 'echo "audit test" && cat /etc/hosts 2>/dev/null']);
+        .run('sh', ['-c', `echo "audit test" && cat ${etc}/hosts 2>/dev/null`]);
 
       strict.equal(result.exitCode, 0, 'should exit cleanly');
       strict.ok(

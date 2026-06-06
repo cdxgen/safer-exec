@@ -11,9 +11,10 @@
 import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { SaferExec } from './index.js';
-import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -22,7 +23,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * @returns {string} Path to the test directory
  */
 function createTestDir() {
-  const dir = join('/tmp', `safer-fsdiff-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  // On macOS, /tmp is a symlink to /private/tmp — resolve it so the
+  // Seatbelt subpath rule matches without symlink confusion.
+  const realTmp = realpathSync(tmpdir());
+  const dir = join(realTmp, `safer-fsdiff-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   mkdirSync(dir, { recursive: true });
 
   // Create initial files

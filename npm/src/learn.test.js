@@ -10,9 +10,10 @@
 import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { SaferExec } from './index.js';
-import { mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, existsSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -21,7 +22,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * @returns {string} Path to the test directory
  */
 function createTestDir() {
-  const dir = join('/tmp', `safer-learn-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const dir = join(tmpdir(), `safer-learn-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'readme.md'), '# Test Project');
   writeFileSync(join(dir, 'config.json'), '{"key": "value"}');
@@ -79,9 +80,10 @@ describe('Learning Mode (enableLearn)', () => {
     });
 
     it('should return read paths for file access', async () => {
+      const etc = realpathSync('/etc');
       const result = await new SaferExec()
         .enableLearn()
-        .run('cat', ['/etc/hosts']);
+        .run('cat', [etc + '/hosts']);
 
       strict.equal(result.exitCode, 0, 'command should succeed');
       strict.ok(result.learnedPolicy, 'should have learnedPolicy');
@@ -152,7 +154,7 @@ describe('Learning Mode (enableLearn)', () => {
   describe('Chaining with other methods', () => {
     it('should chain with writePaths', async () => {
       const result = await new SaferExec()
-        .writePaths('/tmp')
+        .writePaths(tmpdir())
         .enableLearn()
         .run('echo', ['chained']);
 
@@ -353,10 +355,11 @@ describe('Learning Mode (enableLearn)', () => {
 
   describe('Learned policy can be used directly', () => {
     it('should produce a policy that can be used with SaferExec', async () => {
+      const etc = realpathSync('/etc');
       // First, learn a policy
       const learnResult = await new SaferExec()
         .enableLearn()
-        .run('cat', ['/etc/hosts']);
+        .run('cat', [etc + '/hosts']);
 
       strict.ok(learnResult.learnedPolicy, 'should have learnedPolicy');
 
@@ -374,7 +377,7 @@ describe('Learning Mode (enableLearn)', () => {
         allowHosts.forEach((h) => exec.allowHosts(h));
       }
 
-      const useResult = await exec.run('cat', ['/etc/hosts']);
+      const useResult = await exec.run('cat', [etc + '/hosts']);
       strict.equal(useResult.exitCode, 0, 'should succeed with learned policy');
       strict.ok(useResult.stdout.length > 0, 'should have output');
     });

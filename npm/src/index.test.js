@@ -10,6 +10,8 @@
 import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { SaferExec, saferExec } from './index.js';
+import { tmpdir } from 'node:os';
+import { realpathSync } from 'node:fs';
 
 describe('SaferExec', () => {
   describe('constructor', () => {
@@ -46,7 +48,7 @@ describe('SaferExec', () => {
       const exec = new SaferExec({
         allowHosts: ['example.com'],
         readPaths: ['/usr'],
-        writePaths: ['/tmp'],
+        writePaths: [tmpdir()],
         env: { TEST: 'value' },
         disableNetwork: true,
         maxMemoryMB: 256,
@@ -65,7 +67,7 @@ describe('SaferExec', () => {
 
       strict.deepEqual(exec._allowHosts, ['example.com']);
       strict.deepEqual(exec._readPaths, ['/usr']);
-      strict.deepEqual(exec._writePaths, ['/tmp']);
+      strict.deepEqual(exec._writePaths, [tmpdir()]);
       strict.deepEqual(exec._env, { TEST: 'value' });
       strict.equal(exec._disableNetwork, true);
       strict.equal(exec._maxMemoryMB, 256);
@@ -97,7 +99,7 @@ describe('SaferExec', () => {
         'readPaths should return this'
       );
       strict.equal(
-        exec.writePaths('/tmp'),
+        exec.writePaths(tmpdir()),
         exec,
         'writePaths should return this'
       );
@@ -128,7 +130,7 @@ describe('SaferExec', () => {
       const result = exec
         .allowHosts('example.com')
         .readPaths('/usr')
-        .writePaths('/tmp')
+        .writePaths(tmpdir())
         .env('KEY', 'value')
         .disableNetwork()
         .maxMemory(512)
@@ -166,25 +168,27 @@ describe('SaferExec', () => {
 
     it('should deduplicate readPaths', () => {
       const exec = new SaferExec();
-      exec.readPaths('/usr', '/etc');
+      const etc = realpathSync('/etc');
+      exec.readPaths('/usr', etc);
       exec.readPaths('/usr');
       exec.readPaths('/var');
 
       strict.deepEqual(
         exec._readPaths,
-        ['/usr', '/etc', '/var'],
+        ['/usr', etc, '/var'],
         'should deduplicate read paths'
       );
     });
 
     it('should deduplicate writePaths', () => {
       const exec = new SaferExec();
-      exec.writePaths('/tmp', '/var');
-      exec.writePaths('/tmp');
+      const tmp = tmpdir();
+      exec.writePaths(tmp, '/var');
+      exec.writePaths(tmp);
 
       strict.deepEqual(
         exec._writePaths,
-        ['/tmp', '/var'],
+        [tmp, '/var'],
         'should deduplicate write paths'
       );
     });
@@ -238,11 +242,12 @@ describe('SaferExec', () => {
 
     it('should accept multiple paths in a single readPaths call', () => {
       const exec = new SaferExec();
-      exec.readPaths('/usr', '/etc', '/var');
+      const etc = realpathSync('/etc');
+      exec.readPaths('/usr', etc, '/var');
 
       strict.deepEqual(
         exec._readPaths,
-        ['/usr', '/etc', '/var'],
+        ['/usr', etc, '/var'],
         'should accept multiple paths'
       );
     });

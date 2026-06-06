@@ -19,6 +19,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { realpathSync } from 'node:fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, 'cli.js');
@@ -165,12 +167,12 @@ describe('CLI E2E', () => {
     });
 
     it('should accept -w for --write-path', async () => {
-      const { stdout } = await runCli('-w', '/tmp', 'echo', 'write-test');
+      const { stdout } = await runCli('-w', tmpdir(), 'echo', 'write-test');
       strict.ok(stdout.includes('write-test'), 'should echo write-test');
     });
 
     it('should accept -r for --read-path', async () => {
-      const { stdout } = await runCli('-r', '/etc', 'echo', 'read-test');
+      const { stdout } = await runCli('-r', realpathSync('/etc'), 'echo', 'read-test');
       strict.ok(stdout.includes('read-test'), 'should echo read-test');
     });
 
@@ -212,12 +214,12 @@ describe('CLI E2E', () => {
     });
 
     it('should accept --write-path', async () => {
-      const { stdout } = await runCli('--write-path', '/tmp', 'echo', 'long-write-test');
+      const { stdout } = await runCli('--write-path', tmpdir(), 'echo', 'long-write-test');
       strict.ok(stdout.includes('long-write-test'), 'should echo long-write-test');
     });
 
     it('should accept --read-path', async () => {
-      const { stdout } = await runCli('--read-path', '/etc', 'echo', 'long-read-test');
+      const { stdout } = await runCli('--read-path', realpathSync('/etc'), 'echo', 'long-read-test');
       strict.ok(stdout.includes('long-read-test'), 'should echo long-read-test');
     });
 
@@ -260,7 +262,7 @@ describe('CLI E2E', () => {
     });
 
     it('should combine -n and -w', async () => {
-      const { stdout } = await runCli('-n', '-w', '/tmp', 'echo', 'combined-nw');
+      const { stdout } = await runCli('-n', '-w', tmpdir(), 'echo', 'combined-nw');
       strict.ok(stdout.includes('combined-nw'), 'should echo combined-nw');
     });
 
@@ -370,13 +372,15 @@ describe('CLI E2E', () => {
 
   describe('Working directory', () => {
     it('should accept --cwd flag', async () => {
-      const { stdout } = await runCli('--cwd', '/tmp', 'pwd');
-      strict.ok(stdout.includes('/tmp'), 'should show /tmp as working directory');
+      const cwd = tmpdir();
+      const { stdout } = await runCli('--cwd', cwd, 'pwd');
+      strict.ok(stdout.includes(cwd) || stdout.includes('/tmp') || stdout.includes('/private/tmp'), 'should show tmpdir as working directory');
     });
 
     it('should accept -C short flag for --cwd', async () => {
-      const { stdout } = await runCli('-C', '/tmp', 'pwd');
-      strict.ok(stdout.includes('/tmp'), 'should show /tmp as working directory');
+      const cwd = tmpdir();
+      const { stdout } = await runCli('-C', cwd, 'pwd');
+      strict.ok(stdout.includes(cwd) || stdout.includes('/tmp') || stdout.includes('/private/tmp'), 'should show tmpdir as working directory');
     });
   });
 
@@ -415,12 +419,12 @@ describe('CLI E2E', () => {
     });
 
     it('should run cat with diff enabled', async () => {
-      const { stdout } = await runCli('-d', 'cat', '/etc/hosts');
+      const { stdout } = await runCli('-d', 'cat', realpathSync('/etc') + '/hosts');
       strict.ok(stdout.length > 0, 'should have /etc/hosts content');
     });
 
     it('should run with learn mode on file operations', async () => {
-      const { stdout } = await runCli('-l', 'ls', '-la', '/tmp');
+      const { stdout } = await runCli('-l', 'ls', '-la', tmpdir());
       strict.ok(stdout.length > 0, 'should have ls output');
     });
 

@@ -353,17 +353,22 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		sb.WriteString("(trace process-exec)\n")
 	}
 
-	sb.WriteString("(allow file-read*)\n")
-	sb.WriteString("(allow file-write*)\n")
+	// File read/write rules — use per-path subpath rules when paths are
+	// specified; fall back to blanket allows only when no paths given.
+	if len(cfg.ReadPaths) > 0 || len(cfg.WritePaths) > 0 {
+		for _, path := range cfg.ReadPaths {
+			sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", path))
+		}
+		for _, path := range cfg.WritePaths {
+			sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", path))
+			sb.WriteString(fmt.Sprintf("(allow file-write* (subpath %q))\n", path))
+		}
+	} else {
+		sb.WriteString("(allow file-read*)\n")
+		sb.WriteString("(allow file-write*)\n")
+	}
 	sb.WriteString("(allow user-preference-read)\n")
 	sb.WriteString("(allow file-read-metadata)\n")
-
-	for _, path := range cfg.ReadPaths {
-		sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", path))
-	}
-	for _, path := range cfg.WritePaths {
-		sb.WriteString(fmt.Sprintf("(allow file-write* (subpath %q))\n", path))
-	}
 
 	// Network rules
 	resolvedIPs := cfg.AllowIPs
