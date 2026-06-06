@@ -21,10 +21,10 @@ jobs:
             runner: macos-15
           - os: linux
             arch: amd64
-            runner: ubuntu-22.04
+            runner: ubuntu-latest
           - os: linux
             arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
