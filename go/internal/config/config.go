@@ -23,7 +23,7 @@ type ExecConfig struct {
 
 	// WritePaths are filesystem paths the sandboxed process is allowed to
 	// write to. On Linux these become read-write bind mounts; on macOS
-	// they become (allow file-write*) rules.
+	// they become (allow file-read* and allow file-write*) rules.
 	WritePaths []string `json:"writePaths"`
 
 	// AllowHosts are hostname strings to resolve before execution.
