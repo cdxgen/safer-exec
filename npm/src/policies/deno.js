@@ -13,8 +13,6 @@
 import { join } from 'node:path';
 import { getSslPaths, isMac } from './sslhelper.js';
 
-
-
 function resolveDenoPaths() {
   if (isMac) {
     return {
@@ -28,11 +26,6 @@ function resolveDenoPaths() {
   };
 }
 
-/**
- * Return the Deno ecosystem policy object.
- *
- * @returns {Object} The policy configuration
- */
 export function denoPolicy() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
@@ -62,7 +55,16 @@ export function denoPolicy() {
     env: {
       DENO_INSTALL_ROOT: join(home, '.deno'),
       DENO_DIR: join(home, '.cache', 'deno'),
+      // CRITICAL: Prevent Deno from hanging on interactive prompts when it
+      // requests ungranted permissions (e.g., net/read/write) at runtime
+      DENO_NO_PROMPT: '1',
+      // Disable update checks
+      DENO_NO_UPDATE_CHECK: '1',
     },
+
+    /** Block all execution to prevent runtime escapes via Deno.Command / Deno.run */
+    blockFork: true,
+    blockExec: ['*'],
   };
 }
 

@@ -52,7 +52,8 @@
  */
 
 import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 import { resolveHosts } from './net.js';
 import { run as runBinary } from './runner.js';
 import { npmPolicy } from './policies/npm.js';
@@ -184,6 +185,9 @@ export class SaferExec {
 
     /** @type {boolean} Log every child process spawned */
     this._traceExec = options.traceExec || false;
+
+    /** @type {boolean} Output generated Seatbelt profile instead of running command */
+    this._dumpProfile = options.dumpProfile || false;
   }
 
   /**
@@ -556,6 +560,19 @@ export class SaferExec {
   }
 
   /**
+   * Output the generated Seatbelt profile instead of running the command.
+   *
+   * Returns the raw Seatbelt profile text in the result's `profile` property.
+   * Useful for testing and debugging profile generation.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  dumpProfile() {
+    this._dumpProfile = true;
+    return this;
+  }
+
+  /**
    * Execute the sandboxed command.
    *
    * Before spawning the Go binary, this method:
@@ -595,13 +612,30 @@ export class SaferExec {
         );
       }
     }
+    let effectiveReadPaths = [...this._readPaths];
+    if (process.platform === 'linux') {
+      if (this._workingDir && !effectiveReadPaths.includes(this._workingDir)) {
+        effectiveReadPaths.push(this._workingDir);
+      }
+      // These paths are required for dynamically linked binaries, shells,
+      // and basic system resolution to work inside an isolated tmpfs root.
+      const essentialLinuxPaths = [
+        '/bin', '/sbin', '/usr', '/lib', '/lib64', '/etc', '/dev', '/run',
+        '/tmp', '/var/tmp', '/proc', '/sys'
+      ];
+      for (const p of essentialLinuxPaths) {
+        if (!effectiveReadPaths.includes(p) && existsSync(p)) {
+          effectiveReadPaths.push(p);
+        }
+      }
+    }
 
     // Build the config object
     const config = {
       cmd,
       args,
       env: Object.keys(this._env).length > 0 ? this._env : undefined,
-      readPaths: this._readPaths,
+      readPaths: effectiveReadPaths,
       writePaths: this._writePaths,
       allowHosts: this._allowHosts,
       allowIPs: this._allowIPs,
@@ -619,6 +653,7 @@ export class SaferExec {
       blockExec: this._blockExec,
       blockFork: this._blockFork,
       traceExec: this._traceExec,
+      dumpProfile: this._dumpProfile,
     };
 
     // Determine effective timeout: use explicit timeout or default to 60s

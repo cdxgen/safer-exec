@@ -10,6 +10,29 @@ On macOS the Go binary generates Seatbelt profiles and runs commands through `sa
 npm install @cdxgen/safer-exec
 ```
 
+## Prerequisites
+
+**macOS:** Works out of the box using the built-in `sandbox-exec`.
+
+**Linux:**
+
+- Requires a modern kernel with **User Namespaces** enabled (enabled by default on almost all modern distributions like Ubuntu, Debian, Fedora, Arch).
+- **Learning Mode** requires `strace` to be installed (`sudo apt install strace`).
+
+**Linux Resource Limits (Cgroup v2):**
+By default, `systemd` does not allow unprivileged users to apply CPU, Memory, or PID limits. If you want to use `.maxMemory()`, `.maxCPUCores()`, or `.maxProcesses()` on Linux without running as `root`, you must enable `systemd` user delegation on your machine:
+
+```bash
+# Enable CPU, Memory, and PID delegation for user sessions
+sudo mkdir -p /etc/systemd/system/user@.service.d
+sudo sh -c 'echo -e "[Service]\nDelegate=cpu memory pids" > /etc/systemd/system/user@.service.d/delegate.conf'
+sudo systemctl daemon-reload
+
+# You may need to log out and log back in for changes to take effect.
+```
+
+_Note: If cgroup v2 delegation is not configured, `safer-exec` will gracefully skip the resource limits and print a warning, but will still enforce all other sandbox constraints (filesystem, network, syscalls)._
+
 ## Fluent API
 
 ```js

@@ -13,8 +13,6 @@
 import { join } from 'node:path';
 import { getSslPaths, isMac } from './sslhelper.js';
 
-
-
 function resolvePhpPaths() {
   if (isMac) {
     return {
@@ -30,11 +28,6 @@ function resolvePhpPaths() {
   };
 }
 
-/**
- * Return the PHP/Composer ecosystem policy object.
- *
- * @returns {Object} The policy configuration
- */
 export function composerPolicy() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
@@ -45,7 +38,7 @@ export function composerPolicy() {
       'packagist.org',
       'repo.packagist.org',
       'api.github.com',
-      'composer.github.com',
+      'codeload.github.com', // Required for GitHub zipball downloads via Composer
     ],
 
     readPaths: [
@@ -65,7 +58,19 @@ export function composerPolicy() {
 
     env: {
       COMPOSER_HOME: join(home, '.config', 'composer'),
+      // CRITICAL: Disable all custom composer lifecycle scripts
+      COMPOSER_DISABLE_SCRIPTS: '1',
+      // CRITICAL: Disable third-party plugins executing inside the Composer context
+      COMPOSER_NO_PLUGINS: '1',
+      // Prevent interactive prompt hangs in headless environments
+      COMPOSER_NO_INTERACTION: '1',
+      // Drop superuser usage warnings
+      COMPOSER_ALLOW_SUPERUSER: '0',
     },
+
+    /** OS-level blocking to prevent composer from spawning child processes */
+    blockFork: true,
+    blockExec: ['*'],
   };
 }
 

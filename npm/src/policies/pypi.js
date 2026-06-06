@@ -14,8 +14,6 @@
 import { join } from 'node:path';
 import { getSslPaths, isMac } from './sslhelper.js';
 
-
-
 function getPythonPaths() {
   if (isMac) {
     return {
@@ -29,11 +27,6 @@ function getPythonPaths() {
   };
 }
 
-/**
- * Return the Python/PyPI ecosystem policy object.
- *
- * @returns {Object} The policy configuration
- */
 export function pypiPolicy() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
@@ -43,7 +36,7 @@ export function pypiPolicy() {
     allowHosts: [
       'pypi.org',
       'files.pythonhosted.org',
-      'www.python.org',
+      // Removed www.python.org - completely unnecessary for pip installations
     ],
 
     readPaths: [
@@ -69,7 +62,14 @@ export function pypiPolicy() {
       PIP_NO_CACHE_DIR: '0',
       PIP_DISABLE_PIP_VERSION_CHECK: '1',
       PYTHONUNBUFFERED: '1',
+      // CRITICAL: Force Pip to only download pre-compiled Wheels.
+      // This categorically prevents arbitrary code execution from malicious `setup.py` scripts.
+      PIP_ONLY_BINARY: ':all:',
     },
+
+    /** OS-level blocking to prevent Python's `subprocess` or `os.system` */
+    blockFork: true,
+    blockExec: ['*'],
   };
 }
 

@@ -13,8 +13,6 @@
 import { join } from 'node:path';
 import { getSslPaths } from './sslhelper.js';
 
-
-
 function resolveGoPaths() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const goPath = process.env.GOPATH || join(home, 'go');
@@ -22,13 +20,7 @@ function resolveGoPaths() {
   return { goPath, goRoot };
 }
 
-/**
- * Return the Go modules ecosystem policy object.
- *
- * @returns {Object} The policy configuration
- */
 export function gomodPolicy() {
-  const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
   const { goPath, goRoot } = resolveGoPaths();
 
@@ -57,7 +49,17 @@ export function gomodPolicy() {
       GOPATH: goPath,
       GOROOT: goRoot,
       GOFLAGS: '-mod=mod',
+      // CRITICAL: Ensure Go fetches through the secure, checksummed official proxy.
+      GOPROXY: 'https://proxy.golang.org,direct',
+      GOSUMDB: 'sum.golang.org',
+      // CRITICAL: Disable CGO to prevent execution of local C/C++ compilers
+      // or malicious MAKE targets injected into go modules.
+      CGO_ENABLED: '0',
     },
+
+    /** Prevents `go generate`, `go test -exec`, or malicious `init()` functions from spawning shells */
+    blockFork: true,
+    blockExec: ['*'],
   };
 }
 

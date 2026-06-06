@@ -15,8 +15,6 @@
 import { join } from 'node:path';
 import { getSslPaths, isMac } from './sslhelper.js';
 
-
-
 function resolveJdkPath() {
   if (process.env.JAVA_HOME) {
     return process.env.JAVA_HOME;
@@ -27,11 +25,6 @@ function resolveJdkPath() {
   return '/usr/lib/jvm';
 }
 
-/**
- * Return the Java/Maven/Gradle ecosystem policy object.
- *
- * @returns {Object} The policy configuration
- */
 export function mavenPolicy() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
@@ -42,7 +35,7 @@ export function mavenPolicy() {
       'repo.maven.apache.org',
       'repo1.maven.org',
       'services.gradle.org',
-      'jcenter.bintray.com',
+      'jcenter.bintray.com', // Note: JCenter is sunsetting, consider dropping if not legacy
       'plugins.gradle.org',
     ],
 
@@ -54,6 +47,8 @@ export function mavenPolicy() {
       join(cwd, 'build.gradle.kts'),
       join(cwd, 'settings.gradle'),
       join(cwd, 'settings.gradle.kts'),
+      join(cwd, 'gradlew'),
+      join(cwd, 'mvnw'),
     ],
 
     writePaths: [
@@ -66,8 +61,14 @@ export function mavenPolicy() {
 
     env: {
       MAVEN_OPTS: '-Xmx512m',
-      GRADLE_OPTS: '-Xmx512m',
+      // CRITICAL: Disable the background daemon which frequently escapes sandboxing
+      // or causes processes to hang forever inside isolated containers.
+      GRADLE_OPTS: '-Xmx512m -Dorg.gradle.daemon=false -Dorg.gradle.welcome=never',
     },
+
+    /** OS-level blocking to prevent malicious maven-antrun-plugin or shell tasks */
+    blockFork: true,
+    blockExec: ['*'],
   };
 }
 
