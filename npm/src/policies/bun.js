@@ -13,8 +13,6 @@
 import { join } from 'node:path';
 import { getSslPaths, isMac } from './sslhelper.js';
 
-
-
 function resolveBunPaths() {
   if (isMac) {
     return {
@@ -28,11 +26,6 @@ function resolveBunPaths() {
   };
 }
 
-/**
- * Return the Bun ecosystem policy object.
- *
- * @returns {Object} The policy configuration
- */
 export function bunPolicy() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
@@ -62,7 +55,13 @@ export function bunPolicy() {
 
     env: {
       BUN_INSTALL: join(home, '.bun'),
+      // Disable telemetry and tracking
+      DO_NOT_TRACK: '1',
     },
+
+    /** OS-level blocking to violently catch and deny postinstall script executions */
+    blockFork: true,
+    blockExec: ['*'],
   };
 }
 

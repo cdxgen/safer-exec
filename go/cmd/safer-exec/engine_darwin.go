@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -43,6 +44,13 @@ const (
 // run generates a Seatbelt profile from the config, applies RLIMIT quotas,
 // and executes the command under sandbox-exec with the generated profile.
 func run(cfg config.ExecConfig) error {
+	// Handle dump profile mode: output profile and exit
+	if cfg.DumpProfile {
+		profile := buildSeatbeltProfile(cfg)
+		fmt.Printf("PROFILE:%s\n", profile)
+		return nil
+	}
+
 	// Handle learning mode separately
 	if cfg.EnableLearn {
 		return runLearn(cfg)
@@ -356,6 +364,18 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	// File read/write rules — use per-path subpath rules when paths are
 	// specified; fall back to blanket allows only when no paths given.
 	if len(cfg.ReadPaths) > 0 || len(cfg.WritePaths) > 0 {
+		systemReadPaths := []string{
+			"/System", "/usr/lib", "/usr/share", "/bin", "/sbin",
+			"/usr/bin", "/usr/sbin", "/private/etc", "/private/var",
+			"/dev", "/Library", "/opt/homebrew/",
+		}
+		for _, p := range systemReadPaths {
+			sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", p))
+		}
+		// Allow reading the specific command binary if it's an absolute path
+		if filepath.IsAbs(cfg.Cmd) {
+			sb.WriteString(fmt.Sprintf("(allow file-read* (literal %q))\n", cfg.Cmd))
+		}
 		for _, path := range cfg.ReadPaths {
 			sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", path))
 		}
@@ -445,45 +465,6 @@ func resolveIPs(hosts []string) []string {
 // runInit is a no-op on macOS (re-exec pattern is Linux-specific).
 func runInit(cfg config.ExecConfig) error {
 	return run(cfg)
-}
-
-// outputFSDiff computes and outputs the filesystem diff.
-func outputFSDiff(cfg config.ExecConfig) {
-	if !cfg.EnableDiff {
-		return
-	}
-
-	var writePaths []string
-	for _, p := range cfg.WritePaths {
-		if _, err := os.Stat(p); err == nil {
-			writePaths = append(writePaths, p)
-		}
-	}
-
-	if len(writePaths) == 0 {
-		return
-	}
-
-	afterSnap, err := fsdiff.SnapshotPath(writePaths...)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "safer-exec: warning: post-snapshot: %v\n", err)
-		return
-	}
-
-	beforeSnap, err := fsdiff.SnapshotPath(writePaths...)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "safer-exec: warning: pre-snapshot: %v\n", err)
-		return
-	}
-
-	diff := fsdiff.Diff(beforeSnap, afterSnap)
-
-	data, err := json.Marshal(diff)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "safer-exec: warning: marshal fsDiff: %v\n", err)
-		return
-	}
-	fmt.Printf("FSDIFF:%s\n", string(data))
 }
 
 // dedupPaths returns the minimal set of parent directories covering all paths.

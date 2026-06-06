@@ -14,8 +14,6 @@
 import { join } from 'node:path';
 import { getSslPaths } from './sslhelper.js';
 
-
-
 function resolveRustPaths() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const rustupHome = process.env.RUSTUP_HOME || join(home, '.rustup');
@@ -23,11 +21,6 @@ function resolveRustPaths() {
   return { rustupHome, cargoHome };
 }
 
-/**
- * Return the Rust/Cargo ecosystem policy object.
- *
- * @returns {Object} The policy configuration
- */
 export function cargoPolicy() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
@@ -37,8 +30,8 @@ export function cargoPolicy() {
     allowHosts: [
       'crates.io',
       'static.crates.io',
-      'docs.rs',
-      'rust-lang.github.io',
+      'index.crates.io',
+      'github.com', // Required if fetching git dependencies via libgit2
     ],
 
     readPaths: [
@@ -58,7 +51,16 @@ export function cargoPolicy() {
     env: {
       CARGO_TERM_COLOR: 'auto',
       RUSTUP_TOOLCHAIN: 'stable',
+      // CRITICAL: Force cargo to use internal libgit2 rather than spawning shell 'git' commands
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'false',
     },
+
+    /**
+     * Block all execution to prevent arbitrary code execution via build.rs
+     * Ensures this policy is safely used for metadata/lockfile fetching.
+     */
+    blockFork: true,
+    blockExec: ['*'],
   };
 }
 

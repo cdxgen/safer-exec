@@ -33,27 +33,53 @@ import (
 	"github.com/cdxgen/safer-exec/go/internal/config"
 )
 
+type ExitError struct {
+	Code int
+}
+
+func (e *ExitError) Error() string {
+	return fmt.Sprintf("sandboxed process exited with code %d", e.Code)
+}
+
+func init() {
+	// Handle the re-exec pattern for Linux sandboxing.
+	// When the binary re-executes itself with --init, it must act as the
+	// sandbox init process. We intercept this in init() so it works even
+	// when running under `go test` (where the test binary's generated main
+	// function would otherwise call flag.Parse() and fail on "--init").
+	if len(os.Args) > 1 && os.Args[1] == "--init" {
+		initMain()
+		os.Exit(0)
+	}
+}
+
 func main() {
-	// Check for --init flag (Linux re-exec pattern)
+	// Handle Linux re-exec pattern for namespace setup
 	if len(os.Args) > 1 && os.Args[1] == "--init" {
 		initMain()
 		return
 	}
 
-	// Check for --version flag
+	// Handle version flag
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
 		fmt.Println("safer-exec 0.1.0")
 		return
 	}
 
+	// Parse configuration from stdin
 	cfg, err := readConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "safer-exec: invalid config: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := run(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "safer-exec: %v\n", err)
+	// Delegate to the platform-specific engine
+	runErr := run(cfg)
+	if runErr != nil {
+		if exitErr, ok := runErr.(*ExitError); ok {
+			os.Exit(exitErr.Code)
+		}
+		fmt.Fprintf(os.Stderr, "safer-exec: %v\n", runErr)
 		os.Exit(1)
 	}
 }
@@ -64,6 +90,10 @@ func readConfig() (config.ExecConfig, error) {
 	raw, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return config.ExecConfig{}, fmt.Errorf("reading stdin: %w", err)
+	}
+
+	if len(raw) == 0 {
+		return config.ExecConfig{}, fmt.Errorf("empty config provided")
 	}
 
 	var cfg config.ExecConfig

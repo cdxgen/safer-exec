@@ -109,6 +109,11 @@ type ExecConfig struct {
 	// process spawned with the command line and parent PID. Works on
 	// both macOS (Seatbelt trace) and Linux (seccomp SIGSYS trap).
 	TraceExec bool `json:"traceExec"`
+
+	// DumpProfile, when true, outputs the generated Seatbelt profile
+	// to stdout as "PROFILE:<profile content>" and exits without
+	// running the command. Used for testing profile generation.
+	DumpProfile bool `json:"dumpProfile"`
 }
 
 // AuditEntry represents a single sandbox violation or event.

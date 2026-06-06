@@ -457,8 +457,9 @@ async function main() {
     if (!values.json) {
       if (result.exitCode === 0) {
         process.stderr.write('[safer-exec] Command finished successfully\n');
-      } else if (result.exitCode === 124) {
+      } else if (result.exitCode === 124 || result.timedOut) {
         process.stderr.write('[safer-exec] Command timed out\n');
+        result.exitCode = 124; // Force standard timeout exit code
       } else {
         process.stderr.write(
           `[safer-exec] Command exited with code ${result.exitCode}\n`

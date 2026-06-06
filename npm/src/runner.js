@@ -55,6 +55,7 @@ export async function run(config, options = {}) {
 
   const child = spawn(binaryPath, [], {
     stdio: ['pipe', 'pipe', 'pipe'],
+    detached: true,
   });
 
   const configJson = JSON.stringify(config);
@@ -67,7 +68,12 @@ export async function run(config, options = {}) {
   let timedOut = false;
   const timeoutId = setTimeout(() => {
     timedOut = true;
-    child.kill('SIGKILL');
+    try {
+      // Kill the entire process group, not just the unshare parent
+      process.kill(-child.pid, 'SIGKILL');
+    } catch (e) {
+      child.kill('SIGKILL');
+    }
   }, timeout);
 
   const { stdout, stderr, status } = await new Promise((resolve, reject) => {
@@ -91,7 +97,7 @@ export async function run(config, options = {}) {
   });
 
   // Parse structured output from stdout
-  const { fsDiff, learnedPolicy, cleanStdout } = parseStructuredOutput(stdout);
+  const { fsDiff, learnedPolicy, profile, cleanStdout } = parseStructuredOutput(stdout);
 
   // Parse audit log entries from stderr when enabled
   let auditLog = null;
@@ -107,22 +113,25 @@ export async function run(config, options = {}) {
     timedOut,
     ...(fsDiff !== null && { fsDiff }),
     ...(learnedPolicy !== null && { learnedPolicy }),
+    ...(profile !== null && { profile }),
   };
 }
 
 /**
- * Parse structured output lines (FSDIFF:..., LEARNED:...) from stdout.
+ * Parse structured output lines (FSDIFF:..., LEARNED:..., PROFILE:...) from stdout.
  *
  * The Go binary prefixes special output with markers:
  * - "FSDIFF:" followed by JSON for filesystem diff
  * - "LEARNED:" followed by JSON for learned policy
+ * - "PROFILE:" followed by the generated Seatbelt profile text
  *
  * @param {string} stdout - Raw stdout from the Go binary
- * @returns {{ fsDiff: object|null, learnedPolicy: object|null, cleanStdout: string }}
+ * @returns {{ fsDiff: object|null, learnedPolicy: object|null, profile: string|null, cleanStdout: string }}
  */
 export function parseStructuredOutput(stdout) {
   let fsDiff = null;
   let learnedPolicy = null;
+  let profile = null;
   const lines = stdout.split('\n');
   const cleanLines = [];
 
@@ -139,6 +148,11 @@ export function parseStructuredOutput(stdout) {
       } catch {
         cleanLines.push(line);
       }
+    } else if (line.startsWith('PROFILE:')) {
+      profile = line.slice(8);
+    } else if (profile !== null) {
+      // Continue collecting profile lines after PROFILE: prefix
+      profile = profile + '\n' + line;
     } else {
       cleanLines.push(line);
     }
@@ -147,6 +161,7 @@ export function parseStructuredOutput(stdout) {
   return {
     fsDiff,
     learnedPolicy,
+    profile,
     cleanStdout: cleanLines.join('\n'),
   };
 }

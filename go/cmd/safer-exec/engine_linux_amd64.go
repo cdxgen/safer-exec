@@ -3,24 +3,19 @@
 package main
 
 // Unified Landlock syscall numbers (x86_64).
+// These are referenced by engine_linux.go to populate the generic constants.
 const (
-	landlockCreateRuleset_unified = landlockCreateRuleset_x86_64
-	landlockRestrictSelf_unified  = landlockRestrictSelf_x86_64
-	landlockAddRules_unified      = landlockAddRules_x86_64
+	landlockCreateRuleset_unified = 438
+	landlockRestrictSelf_unified  = 439
+	landlockAddRules_unified      = 442
 )
 
-// Unified Landlock access flags (x86_64).
+// Landlock syscall numbers for x86_64 (used directly in RawSyscall).
 const (
-	landlockAccessNetTCPConnect_unified = landlockAccessNetTCPConnect_x86_64
-	landlockAccessNetTCPBind_unified    = landlockAccessNetTCPBind_x86_64
+	sysLandlockCreateRuleset = 438
+	sysLandlockRestrictSelf  = 439
+	sysLandlockAddRules      = 442
 )
 
 // Seccomp syscall number (x86_64).
 const sysSeccomp_unified = 317
-
-// Landlock syscall numbers for x86_64 (used in RawSyscall).
-const (
-	sysLandlockCreateRuleset = landlockCreateRuleset_x86_64
-	sysLandlockRestrictSelf  = landlockRestrictSelf_x86_64
-	sysLandlockAddRules      = landlockAddRules_x86_64
-)
