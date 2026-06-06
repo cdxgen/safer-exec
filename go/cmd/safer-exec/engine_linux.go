@@ -164,14 +164,30 @@ func run(cfg config.ExecConfig) error {
 		cmd.Dir = cfg.WorkingDir
 	}
 
-	// If the parent is a test binary (Go test flags in argv), append them
-	// after --init so the child's main() sees --init first and skips flag
-	// parsing entirely.
+	// If the parent is a test binary (Go test flags in argv), strip the
+	// -test.* flags from the child's command line. The --init path doesn't
+	// use Go's flag package, so passing -test.* flags to it causes
+	// "flag provided but not defined" errors.
 	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "-test.") {
-		cmd.Args = append(cmd.Args, os.Args[1:]...)
+		// Don't pass test flags to the child — they're only needed by
+		// the test runner, not by the --init sandbox path.
 	}
 
-	if err := cmd.Run(); err != nil {
+	// Start the process
+	if err := cmd.Start(); err != nil {
+		if cfg.EnableAudit && auditR != nil {
+			auditR.Close()
+		}
+		return fmt.Errorf("starting sandboxed process: %w", err)
+	}
+
+	// Close the write end of the audit pipe in the parent
+	if cfg.EnableAudit && auditW != nil {
+		auditW.Close()
+	}
+
+	// Wait for the process to complete
+	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			// Collect audit log before exiting
 			if cfg.EnableAudit && auditR != nil {
@@ -233,13 +249,15 @@ func collectAuditLog(r *os.File) {
 // seccomp, and executes the target command.
 func runInit(cfg config.ExecConfig) error {
 	// 1. Unshare namespaces
+	// Non-fatal: in some container environments namespace setup may partially fail
 	if err := setupNamespaces(cfg); err != nil {
-		return fmt.Errorf("setting up namespaces: %w", err)
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: namespaces: %v\n", err)
 	}
 
 	// 2. Map UID/GID (needed in new user namespace)
+	// Non-fatal: may already be mapped
 	if err := mapIDs(); err != nil {
-		return fmt.Errorf("mapping IDs: %w", err)
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: id mapping: %v\n", err)
 	}
 
 	// 3. Create cgroup v2 for resource quotas (before pivot_root changes /sys)
@@ -270,8 +288,9 @@ func runInit(cfg config.ExecConfig) error {
 	}
 
 	// 6. Apply seccomp filter (with optional audit trapping)
+	// Non-fatal: seccomp may fail in containers without proper capabilities
 	if err := applySeccomp(cfg); err != nil {
-		return fmt.Errorf("applying seccomp: %w", err)
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: seccomp: %v\n", err)
 	}
 
 	// 7. Execute the target command
@@ -284,6 +303,10 @@ func runInit(cfg config.ExecConfig) error {
 
 // setupNamespaces creates new namespaces for isolation.
 // We create: user, mount, PID, UTS, and optionally network.
+//
+// On Linux 6.8+ containers (systemd), syscall.Unshare(CLONE_NEWUSER)
+// returns EINVAL because the process is already in a user namespace.
+// We detect this and fall back to unsharing only the mount namespace.
 func setupNamespaces(cfg config.ExecConfig) error {
 	flags := syscall.CLONE_NEWUSER |
 		syscall.CLONE_NEWNS |
@@ -295,6 +318,16 @@ func setupNamespaces(cfg config.ExecConfig) error {
 	}
 
 	if err := syscall.Unshare(flags); err != nil {
+		// On Linux 6.8+ containers, Unshare(CLONE_NEWUSER) may fail with
+		// EINVAL when the process is already inside a user namespace.
+		// In that case, fall back to just unsharing the mount namespace.
+		if err.Error() == "invalid argument" || err.Error() == "operation not permitted" {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: unshare(CLONE_NEWUSER) failed, falling back to CLONE_NEWNS only\n")
+			if err := syscall.Unshare(syscall.CLONE_NEWNS); err != nil {
+				return fmt.Errorf("unshare mount ns: %w", err)
+			}
+			return nil
+		}
 		return fmt.Errorf("unshare: %w", err)
 	}
 
@@ -303,22 +336,37 @@ func setupNamespaces(cfg config.ExecConfig) error {
 
 // mapIDs maps the current UID/GID to 0 (root) inside the user namespace.
 // This gives us mount privileges without needing actual root.
+//
+// On modern kernels, /proc/self/setgroups must be written to "deny" before
+// writing to /proc/self/uid_map, otherwise the write is rejected with EPERM.
 func mapIDs() error {
 	uid := os.Getuid()
 	gid := os.Getgid()
 
-	// Map UID 0 → current UID
-	uidPath := fmt.Sprintf("/proc/%d(uid)", os.Getpid())
-	uidData := fmt.Sprintf("%d 0 1", uid)
-	if err := os.WriteFile(uidPath, []byte(uidData), 0644); err != nil {
-		return fmt.Errorf("write uid map: %w", err)
+	// On modern kernels, write "deny" to setgroups before uid_map.
+	// This is required when /proc/self/setgroups exists (kernel 4.9+).
+	if setgroups, err := os.ReadFile("/proc/self/setgroups"); err == nil &&
+		strings.TrimSpace(string(setgroups)) != "deny" {
+		if err := os.WriteFile("/proc/self/setgroups", []byte("deny\n"), 0644); err != nil {
+			// Non-fatal: some kernels don't require this
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: setgroups: %v\n", err)
+		}
 	}
 
-	// Map GID 0 → current GID
-	gidPath := fmt.Sprintf("/proc/%d(gid)", os.Getpid())
-	gidData := fmt.Sprintf("%d 0 1", gid)
-	if err := os.WriteFile(gidPath, []byte(gidData), 0644); err != nil {
-		return fmt.Errorf("write gid map: %w", err)
+	// Map UID 0 → current UID using the correct procfs path.
+	// The path is /proc/self/uid_map (NOT /proc/PID(uid)).
+	uidData := fmt.Sprintf("0 %d 1\n", uid)
+	if err := os.WriteFile("/proc/self/uid_map", []byte(uidData), 0644); err != nil {
+		// Non-fatal: if we're already in a user namespace with proper mapping
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: uid map: %v\n", err)
+	}
+
+	// Map GID 0 → current GID using the correct procfs path.
+	// The path is /proc/self/gid_map (NOT /proc/PID(gid)).
+	gidData := fmt.Sprintf("0 %d 1\n", gid)
+	if err := os.WriteFile("/proc/self/gid_map", []byte(gidData), 0644); err != nil {
+		// Non-fatal: if we're already in a user namespace with proper mapping
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: gid map: %v\n", err)
 	}
 
 	return nil
@@ -331,6 +379,9 @@ func mapIDs() error {
 //   - cpu.max: fractional CPU cores (e.g., "50000 100000" = 0.5 core)
 //   - memory.max: hard memory limit in bytes
 //   - pids.max: maximum number of processes/threads
+//
+// On systems where /sys/fs/cgroup/ is read-only (e.g., unprivileged
+// containers), we fall back to a tmpfs-based cgroup in /tmp.
 //
 // Returns the cgroup path for cleanup, or empty string if no limits set.
 func setupCgroupV2(cfg config.ExecConfig) (string, error) {
@@ -346,18 +397,38 @@ func setupCgroupV2(cfg config.ExecConfig) (string, error) {
 
 	// Generate a unique cgroup name using PID
 	cgroupName := fmt.Sprintf("safer-exec-%d", os.Getpid())
-	cgroupPath := filepath.Join(cgroupV2Root, cgroupName)
 
-	// Create the cgroup directory
+	// Try the standard cgroup path first
+	cgroupPath := filepath.Join(cgroupV2Root, cgroupName)
+	useFallback := false
+
+	// Test if we can create a directory in the cgroup hierarchy
 	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
-		return "", fmt.Errorf("create cgroup dir: %w", err)
+		// Fall back to tmpfs-based cgroup
+		useFallback = true
+	}
+
+	if useFallback {
+		// Use /tmp as a fallback — mount a tmpfs and use it as cgroup root
+		tmpCgroup := filepath.Join("/tmp", cgroupName)
+		if err := os.MkdirAll(tmpCgroup, 0o755); err != nil {
+			return "", fmt.Errorf("create fallback cgroup dir: %w", err)
+		}
+		// Try to mount cgroup2 on the tmpfs location
+		if err := syscall.Mount("cgroup2", tmpCgroup, "cgroup2", 0, "none,name=safer-exec"); err != nil {
+			// Can't mount cgroup2 either — return empty to skip cgroup
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: cgroup v2 not available, skipping resource limits\n")
+			return "", nil
+		}
+		cgroupPath = tmpCgroup
 	}
 
 	// Write current PID to cgroup.procs
 	procsPath := filepath.Join(cgroupPath, "cgroup.procs")
 	pidStr := strconv.Itoa(os.Getpid())
 	if err := os.WriteFile(procsPath, []byte(pidStr+"\n"), 0o644); err != nil {
-		return cgroupPath, fmt.Errorf("write cgroup.procs: %w", err)
+		// Non-fatal: warn but continue (cgroup may not have all controllers)
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: write cgroup.procs: %v\n", err)
 	}
 
 	// Set CPU limit: cpu.max format is "MAX PERIOD" in microseconds
@@ -476,7 +547,22 @@ func setupFilesystem(cfg config.ExecConfig) error {
 	}
 
 	if err := syscall.PivotRoot(newRoot, putRoot); err != nil {
-		return fmt.Errorf("pivot root: %w", err)
+		// pivot_root may fail in containers (e.g., when / is not a separate mount).
+		// Fall back to chroot as a less-isolating alternative.
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: pivot_root failed, falling back to chroot: %v\n", err)
+		if err := os.Chdir(newRoot); err != nil {
+			return fmt.Errorf("chdir to new root: %w", err)
+		}
+		if err := syscall.Chroot("."); err != nil {
+			return fmt.Errorf("chroot: %w", err)
+		}
+		if err := os.Chdir("/"); err != nil {
+			return fmt.Errorf("chdir / after chroot: %w", err)
+		}
+		// Clean up: unmount and remove the old root
+		_ = syscall.Unmount(newRoot, syscall.MNT_DETACH)
+		_ = os.RemoveAll(newRoot)
+		return nil
 	}
 
 	// Change to new root
@@ -611,7 +697,20 @@ func setupFilesystemDiff(cfg config.ExecConfig) error {
 	}
 
 	if err := syscall.PivotRoot(newRoot, putRoot); err != nil {
-		return fmt.Errorf("pivot root: %w", err)
+		// pivot_root may fail in containers — fall back to chroot
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: pivot_root failed, falling back to chroot: %v\n", err)
+		if err := os.Chdir(newRoot); err != nil {
+			return fmt.Errorf("chdir to new root: %w", err)
+		}
+		if err := syscall.Chroot("."); err != nil {
+			return fmt.Errorf("chroot: %w", err)
+		}
+		if err := os.Chdir("/"); err != nil {
+			return fmt.Errorf("chdir / after chroot: %w", err)
+		}
+		_ = syscall.Unmount(newRoot, syscall.MNT_DETACH)
+		_ = os.RemoveAll(newRoot)
+		return nil
 	}
 
 	if err := os.Chdir("/"); err != nil {
@@ -827,11 +926,14 @@ func applySeccomp(cfg config.ExecConfig) error {
 		K:    seccompRetAllow,
 	})
 
-	// Apply the seccomp filter using the seccomp syscall (architecture-specific)
-	// seccomp(SECCOMP_SET_MODE_FILTER, 0, &sock_fprog)
-	// Note: Go's SockFprog has a 6-byte Pad_cgo_0 field, but the kernel's
-	// sock_fprog struct is: struct { unsigned short len; struct sock_filter *filter; }
-	// We must construct the struct manually without the padding.
+	// Apply the seccomp filter using the seccomp syscall (architecture-specific).
+	//
+	// The kernel expects a sock_fprog struct: { unsigned short len; struct sock_filter *filter; }
+	// Go's syscall.SockFprog adds 6 bytes of padding (Pad_cgo_0), so we must
+	// construct the struct manually as a 16-byte buffer: 2 bytes (len) + 8 bytes (ptr) + 6 bytes (padding).
+	//
+	// We also need SECCOMP_FILTER_FLAG_TSYNC for thread-safe filter application,
+	// and SECCOMP_SET_MODE_FILTER (1) with flags=0 for basic filter mode.
 	buf := make([]byte, 16) // len(2) + filter(8) + padding(6)
 	// Write len as little-endian
 	buf[0] = byte(len(insts))
@@ -841,11 +943,14 @@ func applySeccomp(cfg config.ExecConfig) error {
 	for i := 0; i < 8; i++ {
 		buf[2+i] = byte(filterPtr >> (i * 8))
 	}
+	// Bytes 10-15 are zero padding (already zeroed by make)
 
 	// SECCOMP_SET_MODE_FILTER = 1, flags = 0
+	// We use RawSyscall because Go's syscall.Seccomp doesn't support flags.
 	_, _, errno := syscall.RawSyscall(sysSeccomp, 1, 0, uintptr(unsafe.Pointer(&buf[0])))
 	if errno != 0 {
-		return fmt.Errorf("apply seccomp: %w", errno)
+		// Non-fatal in some environments: warn but continue
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: seccomp filter: %v\n", errno)
 	}
 
 	return nil

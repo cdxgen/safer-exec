@@ -43,6 +43,13 @@ const (
 // run generates a Seatbelt profile from the config, applies RLIMIT quotas,
 // and executes the command under sandbox-exec with the generated profile.
 func run(cfg config.ExecConfig) error {
+	// Handle dump profile mode: output profile and exit
+	if cfg.DumpProfile {
+		profile := buildSeatbeltProfile(cfg)
+		fmt.Printf("PROFILE:%s\n", profile)
+		return nil
+	}
+
 	// Handle learning mode separately
 	if cfg.EnableLearn {
 		return runLearn(cfg)
