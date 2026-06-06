@@ -9,7 +9,7 @@ on:
 permissions: {}
 jobs:
   build-go:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
