@@ -398,7 +398,7 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	systemReadPaths := []string{
 		"/System", "/usr/lib", "/usr/share", "/bin", "/sbin",
 		"/usr/bin", "/usr/sbin", "/private/etc", "/private/var",
-		"/dev", "/Library", "/opt/homebrew/",
+		"/dev", "/Library", "/opt/homebrew/", "/usr/local/Cellar/",
 	}
 	for _, p := range systemReadPaths {
 		sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", p))
