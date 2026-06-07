@@ -596,7 +596,14 @@ func applySeccomp(cfg config.ExecConfig) error {
 		// SYS_CLONE is handled separately below with a flag check to allow thread creation.
 		blockCalls = append(blockCalls, sysFORK, sysVFORK)
 	}
-	if cfg.TraceExec {
+	hasBlockExecWildcard := false
+	for _, item := range cfg.BlockExec {
+		if item == "*" {
+			hasBlockExecWildcard = true
+			break
+		}
+	}
+	if cfg.TraceExec || hasBlockExecWildcard {
 		blockCalls = append(blockCalls, syscall.SYS_EXECVE)
 	}
 
@@ -678,11 +685,56 @@ func execCommand(cfg config.ExecConfig) error {
 	}
 	env := config.BuildEnv(cfg.Env)
 
-	err = syscall.Exec(cmdPath, append([]string{cfg.Cmd}, cfg.Args...), env)
+	// Try execveat to allow seccomp filtering to block standard execve
+	err = execveat(-100, cmdPath, append([]string{cfg.Cmd}, cfg.Args...), env, 0)
+	if err == syscall.ENOSYS {
+		err = syscall.Exec(cmdPath, append([]string{cfg.Cmd}, cfg.Args...), env)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "safer-exec: execCommand failed: %v\n", err)
 	}
 	return err
+}
+
+func execveat(dirfd int, pathname string, argv []string, envp []string, flags int) error {
+	pathnamePtr, err := syscall.BytePtrFromString(pathname)
+	if err != nil {
+		return err
+	}
+
+	argvPtrs, err := syscall.SlicePtrFromStrings(argv)
+	if err != nil {
+		return err
+	}
+
+	envpPtrs, err := syscall.SlicePtrFromStrings(envp)
+	if err != nil {
+		return err
+	}
+
+	var argv0p uintptr
+	if len(argvPtrs) > 0 {
+		argv0p = uintptr(unsafe.Pointer(&argvPtrs[0]))
+	}
+
+	var envp0p uintptr
+	if len(envpPtrs) > 0 {
+		envp0p = uintptr(unsafe.Pointer(&envpPtrs[0]))
+	}
+
+	_, _, errno := syscall.RawSyscall6(
+		syscall.SYS_EXECVEAT,
+		uintptr(dirfd),
+		uintptr(unsafe.Pointer(pathnamePtr)),
+		argv0p,
+		envp0p,
+		uintptr(flags),
+		0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 func dedupPaths(paths []string) []string {
