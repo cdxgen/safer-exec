@@ -69,7 +69,10 @@ export function npmPolicy() {
 
     /** Block all forking to strictly prevent OS-level shell spawning */
     blockFork: true,
-    blockExec: ['*'],
+    // '*' blocks SYS_EXECVE via seccomp for child processes.
+    // Compiler names block the initial command in execCommand (covers reduced-isolation mode
+    // where there is no filesystem namespace to prevent gcc/clang from being invoked directly).
+    blockExec: ['*', 'gcc', 'g++', 'clang', 'clang++', 'cc', 'c++', 'ld', 'as', 'make', 'cmake', 'ninja'],
   };
 }
 
