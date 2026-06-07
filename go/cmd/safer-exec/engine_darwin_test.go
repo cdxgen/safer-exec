@@ -314,15 +314,18 @@ func TestRun_MemoryLimit(t *testing.T) {
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 
-	done := make(chan struct{})
+	cancel := make(chan struct{})
 	go func() {
-		time.Sleep(3 * time.Second)
-		w.Close()
-		close(done)
+		select {
+		case <-time.After(3 * time.Second):
+			w.Close()
+		case <-cancel:
+		}
 	}()
 
 	err := run(cfg)
 
+	close(cancel)
 	w.Close()
 	os.Stdout = oldStdout
 
