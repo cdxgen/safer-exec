@@ -184,7 +184,7 @@ jobs:
                 "${cpu}"
               ]
             }
-            EOF
+EOF
             cd "publish-${platform}"
             npm publish --provenance --access public
             cd ..
