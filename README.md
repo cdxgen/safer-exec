@@ -273,6 +273,7 @@ Full help: `safer-exec --help`.
 | `blockExec`      | `string[]` | `[]`            | Executables to block from running         |
 | `blockFork`      | `boolean`  | `false`         | Prevent forking new processes             |
 | `traceExec`      | `boolean`  | `false`         | Log every child process spawned           |
+| `strict`         | `boolean`  | `false`         | Treat sandbox setup warnings as errors    |
 
 ### Instance Methods
 
@@ -300,6 +301,7 @@ All methods return `this` for chaining except `.run()`.
 | `.blockExec(...cmds)`   | Block specific executables from running        |
 | `.blockFork()`          | Prevent the command from forking new processes |
 | `.traceExec()`          | Log every child process spawned                |
+| `.strict()`             | Treat sandbox setup warnings as hard errors    |
 
 ### `.run(cmd, args?)`
 

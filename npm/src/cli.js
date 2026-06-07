@@ -86,6 +86,7 @@ Options:
   -l, --learn                Enable behavioral auto-profiling (learning mode)
       --learn-output=<file>  Write learned policy to file
   -a, --audit                Enable sandbox violation auditing
+  -s, --strict               Treat sandbox setup warnings as errors
 
   -j, --json                 Output results as JSON
   -h, --help                 Show this help message
@@ -207,6 +208,10 @@ function parseCliArgs() {
       },
       'learn-output': {
         type: 'string',
+      },
+      strict: {
+        type: 'boolean',
+        short: 's',
       },
       json: {
         type: 'boolean',
@@ -352,6 +357,9 @@ function buildExec(values, cmd, args) {
   }
   if (values.learn) {
     exec.enableLearn();
+  }
+  if (values.strict) {
+    exec.strict();
   }
 
   const options = {

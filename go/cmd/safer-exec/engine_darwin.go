@@ -96,20 +96,8 @@ func run(cfg config.ExecConfig) error {
 	fullArgs := append([]string{"-f", tmpFile.Name(), cmdPath}, cfg.Args...)
 	cmd := exec.Command("sandbox-exec", fullArgs...)
 
-	// Set environment
-	if len(cfg.Env) > 0 {
-		cmd.Env = []string{
-			fmt.Sprintf("PATH=%s", os.Getenv("PATH")),
-			fmt.Sprintf("HOME=%s", os.Getenv("HOME")),
-		}
-		for k, v := range cfg.Env {
-			if k != "PATH" && k != "HOME" {
-				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-			}
-		}
-	} else {
-		cmd.Env = os.Environ()
-	}
+	// Set environment securely using filtered environment
+	cmd.Env = config.BuildEnv(cfg.Env)
 
 	// Set working directory
 	if cfg.WorkingDir != "" {
@@ -209,19 +197,8 @@ func runLearn(cfg config.ExecConfig) error {
 	fullArgs := append([]string{"-f", profFile.Name(), cmdPath}, cfg.Args...)
 	cmd := exec.Command("sandbox-exec", fullArgs...)
 
-	if len(cfg.Env) > 0 {
-		cmd.Env = []string{
-			fmt.Sprintf("PATH=%s", os.Getenv("PATH")),
-			fmt.Sprintf("HOME=%s", os.Getenv("HOME")),
-		}
-		for k, v := range cfg.Env {
-			if k != "PATH" && k != "HOME" {
-				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-			}
-		}
-	} else {
-		cmd.Env = os.Environ()
-	}
+	// Set environment securely using filtered environment
+	cmd.Env = config.BuildEnv(cfg.Env)
 
 	if cfg.WorkingDir != "" {
 		cmd.Dir = cfg.WorkingDir
@@ -344,13 +321,67 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	}
 
 	// Exec control
+	resolvedCmd, err := exec.LookPath(cfg.Cmd)
+	if err == nil {
+		resolvedCmd, _ = filepath.Abs(resolvedCmd)
+	} else {
+		resolvedCmd = cfg.Cmd
+	}
+
 	if len(cfg.BlockExec) > 0 {
-		// Check for wildcard "*"
 		if hasWildcard(cfg.BlockExec) {
-			// Block all exec
-			sb.WriteString("(allow process-exec)\n")
+			// Wildcard blocks all subprocess execs, so we only allow the target command itself and common shell variants if it is a shell
+			if resolvedCmd != "" {
+				sb.WriteString(fmt.Sprintf("(allow process-exec (literal %q))\n", resolvedCmd))
+				if strings.HasSuffix(resolvedCmd, "/sh") || strings.HasSuffix(resolvedCmd, "/bash") || strings.HasSuffix(resolvedCmd, "/zsh") || strings.HasSuffix(resolvedCmd, "/fish") {
+					sb.WriteString("(allow process-exec (literal \"/bin/bash\"))\n")
+					sb.WriteString("(allow process-exec (literal \"/bin/zsh\"))\n")
+					sb.WriteString("(allow process-exec (literal \"/bin/sh\"))\n")
+					sb.WriteString("(allow process-exec (literal \"/usr/local/bin/fish\"))\n")
+					sb.WriteString("(allow process-exec (literal \"/opt/homebrew/bin/fish\"))\n")
+				}
+			}
 		} else {
 			sb.WriteString("(allow process-exec)\n")
+			for _, item := range cfg.BlockExec {
+				if filepath.IsAbs(item) {
+					sb.WriteString(fmt.Sprintf("(deny process-exec (literal %q))\n", item))
+					sb.WriteString(fmt.Sprintf("(deny process-exec (subpath %q))\n", item))
+				} else {
+					sb.WriteString(fmt.Sprintf("(deny process-exec (literal %q))\n", "/bin/"+item))
+					sb.WriteString(fmt.Sprintf("(deny process-exec (literal %q))\n", "/usr/bin/"+item))
+					sb.WriteString(fmt.Sprintf("(deny process-exec (literal %q))\n", "/usr/local/bin/"+item))
+				}
+			}
+		}
+	} else if len(cfg.AllowExec) > 0 {
+		// Only allow specified paths/names and the target command itself
+		if resolvedCmd != "" {
+			sb.WriteString(fmt.Sprintf("(allow process-exec (literal %q))\n", resolvedCmd))
+			if strings.HasSuffix(resolvedCmd, "/sh") || strings.HasSuffix(resolvedCmd, "/bash") || strings.HasSuffix(resolvedCmd, "/zsh") || strings.HasSuffix(resolvedCmd, "/fish") {
+				sb.WriteString("(allow process-exec (literal \"/bin/bash\"))\n")
+				sb.WriteString("(allow process-exec (literal \"/bin/zsh\"))\n")
+				sb.WriteString("(allow process-exec (literal \"/bin/sh\"))\n")
+				sb.WriteString("(allow process-exec (literal \"/usr/local/bin/fish\"))\n")
+				sb.WriteString("(allow process-exec (literal \"/opt/homebrew/bin/fish\"))\n")
+			}
+		}
+		for _, item := range cfg.AllowExec {
+			if filepath.IsAbs(item) {
+				sb.WriteString(fmt.Sprintf("(allow process-exec (literal %q))\n", item))
+				sb.WriteString(fmt.Sprintf("(allow process-exec (subpath %q))\n", item))
+			} else {
+				sb.WriteString(fmt.Sprintf("(allow process-exec (literal %q))\n", "/bin/"+item))
+				sb.WriteString(fmt.Sprintf("(allow process-exec (literal %q))\n", "/usr/bin/"+item))
+				sb.WriteString(fmt.Sprintf("(allow process-exec (literal %q))\n", "/usr/local/bin/"+item))
+			}
+			if item == "sh" || item == "bash" || item == "zsh" || item == "fish" {
+				sb.WriteString("(allow process-exec (literal \"/bin/bash\"))\n")
+				sb.WriteString("(allow process-exec (literal \"/bin/zsh\"))\n")
+				sb.WriteString("(allow process-exec (literal \"/bin/sh\"))\n")
+				sb.WriteString("(allow process-exec (literal \"/usr/local/bin/fish\"))\n")
+				sb.WriteString("(allow process-exec (literal \"/opt/homebrew/bin/fish\"))\n")
+			}
 		}
 	} else {
 		sb.WriteString("(allow process-exec)\n")
@@ -361,31 +392,42 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		sb.WriteString("(trace process-exec)\n")
 	}
 
-	// File read/write rules — use per-path subpath rules when paths are
-	// specified; fall back to blanket allows only when no paths given.
-	if len(cfg.ReadPaths) > 0 || len(cfg.WritePaths) > 0 {
-		systemReadPaths := []string{
-			"/System", "/usr/lib", "/usr/share", "/bin", "/sbin",
-			"/usr/bin", "/usr/sbin", "/private/etc", "/private/var",
-			"/dev", "/Library", "/opt/homebrew/",
-		}
-		for _, p := range systemReadPaths {
+	// File read/write rules — use per-path subpath rules.
+	// We no longer fall back to blanket allows. If no paths are specified,
+	// we allow standard system paths, the working directory, and temp directories.
+	systemReadPaths := []string{
+		"/System", "/usr/lib", "/usr/share", "/bin", "/sbin",
+		"/usr/bin", "/usr/sbin", "/private/etc", "/private/var",
+		"/dev", "/Library", "/opt/homebrew/",
+	}
+	for _, p := range systemReadPaths {
+		sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", p))
+	}
+	// Allow reading the specific command binary if it's an absolute path
+	if filepath.IsAbs(cfg.Cmd) {
+		sb.WriteString(fmt.Sprintf("(allow file-read* (literal %q))\n", cfg.Cmd))
+	}
+
+	// Always allow reading the working directory if specified
+	if cfg.WorkingDir != "" {
+		sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", cfg.WorkingDir))
+	}
+
+	// Always allow read/write to temp directories
+	tempDirs := []string{"/private/tmp", "/tmp", os.TempDir()}
+	for _, p := range tempDirs {
+		if p != "" {
 			sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", p))
+			sb.WriteString(fmt.Sprintf("(allow file-write* (subpath %q))\n", p))
 		}
-		// Allow reading the specific command binary if it's an absolute path
-		if filepath.IsAbs(cfg.Cmd) {
-			sb.WriteString(fmt.Sprintf("(allow file-read* (literal %q))\n", cfg.Cmd))
-		}
-		for _, path := range cfg.ReadPaths {
-			sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", path))
-		}
-		for _, path := range cfg.WritePaths {
-			sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", path))
-			sb.WriteString(fmt.Sprintf("(allow file-write* (subpath %q))\n", path))
-		}
-	} else {
-		sb.WriteString("(allow file-read*)\n")
-		sb.WriteString("(allow file-write*)\n")
+	}
+
+	for _, path := range cfg.ReadPaths {
+		sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", path))
+	}
+	for _, path := range cfg.WritePaths {
+		sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", path))
+		sb.WriteString(fmt.Sprintf("(allow file-write* (subpath %q))\n", path))
 	}
 	sb.WriteString("(allow user-preference-read)\n")
 	sb.WriteString("(allow file-read-metadata)\n")
@@ -397,20 +439,14 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	}
 
 	if cfg.DisableNetwork {
-		if len(resolvedIPs) > 0 {
-			if len(cfg.AllowPorts) > 0 {
-				for _, port := range cfg.AllowPorts {
-					sb.WriteString(fmt.Sprintf("(allow network-outbound (remote ip \"*:%d\"))\n", port))
-				}
-			} else {
-				sb.WriteString("(allow network-outbound)\n")
+		sb.WriteString("(deny network-outbound)\n")
+		if len(cfg.AllowPorts) > 0 {
+			for _, port := range cfg.AllowPorts {
+				sb.WriteString(fmt.Sprintf("(allow network-outbound (remote ip \"*:%d\"))\n", port))
 			}
 		} else {
 			if cfg.EnableAudit {
-				sb.WriteString("(allow network-outbound)\n")
 				sb.WriteString("(trace network-outbound)\n")
-			} else {
-				sb.WriteString("(allow network-outbound)\n")
 			}
 		}
 	} else {

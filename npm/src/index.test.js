@@ -540,6 +540,36 @@ describe('SaferExec', () => {
       strict.ok(result.stdout.includes('timed'), 'should capture output');
     });
   });
+
+  describe('Security Hardening', () => {
+    it('should filter environment variables by default to prevent credentials leak', async () => {
+      process.env.SECRET_API_TOKEN_XYZ = 'sensitive-token';
+      const result = await new SaferExec()
+        .run('sh', ['-c', 'echo "SECRET:${SECRET_API_TOKEN_XYZ}:SECRET"']);
+
+      delete process.env.SECRET_API_TOKEN_XYZ;
+
+      strict.equal(result.exitCode, 0);
+      strict.ok(!result.stdout.includes('sensitive-token'), 'should not contain the secret host env variable');
+    });
+
+    it('should support BlockExec wildcard preventing executions of other processes', async () => {
+      const result = await new SaferExec()
+        .blockExec('*')
+        .run('sh', ['-c', 'id']);
+      
+      strict.notEqual(result.exitCode, 0, 'wildcard BlockExec should deny shell sub-execution');
+    });
+
+    it('should support strict mode option', async () => {
+      const result = await new SaferExec()
+        .strict()
+        .run('echo', ['strict-test']);
+
+      strict.equal(result.exitCode, 0);
+      strict.ok(result.stdout.includes('strict-test'));
+    });
+  });
 });
 
 describe('saferExec convenience function', () => {

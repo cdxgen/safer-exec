@@ -222,6 +222,7 @@ export async function runPipe(config, options = {}) {
 
   const child = spawn(binaryPath, [], {
     stdio: ['pipe', 'pipe', 'pipe'],
+    detached: true,
   });
 
   const configJson = JSON.stringify(config);
@@ -246,7 +247,11 @@ export async function runPipe(config, options = {}) {
   let timedOut = false;
   const timeoutId = setTimeout(() => {
     timedOut = true;
-    child.kill('SIGKILL');
+    try {
+      process.kill(-child.pid, 'SIGKILL');
+    } catch (e) {
+      child.kill('SIGKILL');
+    }
   }, timeout);
 
   return new Promise((resolve, reject) => {

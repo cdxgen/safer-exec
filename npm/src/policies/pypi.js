@@ -14,17 +14,26 @@
 import { join } from 'node:path';
 import { getSslPaths, isMac } from './sslhelper.js';
 
+import { execSync } from 'node:child_process';
+
 function getPythonPaths() {
-  if (isMac) {
-    return {
-      pythonBin: '/usr/bin/python3',
-      pythonLib: '/usr/local/lib/python3.*',
-    };
+  let pythonBin = '/usr/bin/python3';
+  let pythonLib = isMac ? '/usr/local/lib/python3.*' : '/usr/lib/python3';
+
+  try {
+    const bin = execSync('which python3', { encoding: 'utf-8' }).trim();
+    if (bin) {
+      pythonBin = bin;
+      const lib = execSync(`${pythonBin} -c "import sys; print([p for p in sys.path if 'lib/python' in p][0])"`, { encoding: 'utf-8' }).trim();
+      if (lib) {
+        pythonLib = lib;
+      }
+    }
+  } catch (e) {
+    // Fall back to defaults if lookup fails
   }
-  return {
-    pythonBin: '/usr/bin/python3',
-    pythonLib: '/usr/lib/python3',
-  };
+
+  return { pythonBin, pythonLib };
 }
 
 export function pypiPolicy() {

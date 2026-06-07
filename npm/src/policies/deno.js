@@ -13,17 +13,22 @@
 import { join } from 'node:path';
 import { getSslPaths, isMac } from './sslhelper.js';
 
+import { execSync } from 'node:child_process';
+
 function resolveDenoPaths() {
-  if (isMac) {
-    return {
-      denoBin: '/usr/local/bin/deno',
-      denoLib: '/usr/local/lib',
-    };
+  let denoBin = isMac ? '/usr/local/bin/deno' : '/usr/bin/deno';
+  let denoLib = isMac ? '/usr/local/lib' : '/usr/lib';
+
+  try {
+    const bin = execSync('which deno', { encoding: 'utf-8' }).trim();
+    if (bin) {
+      denoBin = bin;
+    }
+  } catch (e) {
+    // Fall back to defaults if lookup fails
   }
-  return {
-    denoBin: '/usr/bin/deno',
-    denoLib: '/usr/lib',
-  };
+
+  return { denoBin, denoLib };
 }
 
 export function denoPolicy() {

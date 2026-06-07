@@ -114,6 +114,10 @@ type ExecConfig struct {
 	// to stdout as "PROFILE:<profile content>" and exits without
 	// running the command. Used for testing profile generation.
 	DumpProfile bool `json:"dumpProfile"`
+
+	// Strict, when true, treats sandbox initialization warnings as errors
+	// (e.g. cgroup, landlock, or seccomp errors) instead of bypassing them.
+	Strict bool `json:"strict"`
 }
 
 // AuditEntry represents a single sandbox violation or event.

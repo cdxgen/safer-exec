@@ -456,7 +456,7 @@ describe('Resource Exhaustion Tests', () => {
       const etc = realpathSync('/etc');
       const result = await createExec()
         .enableAudit()
-        .run('sh', ['-c', `echo "audit test" && cat ${etc}/hosts 2>/dev/null`]);
+        .run('sh', ['-c', `echo "audit test" && cat ${etc}/hosts`]);
 
       strict.equal(result.exitCode, 0, 'should exit cleanly');
       strict.ok(

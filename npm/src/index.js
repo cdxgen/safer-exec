@@ -188,6 +188,9 @@ export class SaferExec {
 
     /** @type {boolean} Output generated Seatbelt profile instead of running command */
     this._dumpProfile = options.dumpProfile || false;
+
+    /** @type {boolean} Treat sandbox setup warnings as errors */
+    this._strict = options.strict || false;
   }
 
   /**
@@ -573,6 +576,20 @@ export class SaferExec {
   }
 
   /**
+   * Enable strict sandboxing mode.
+   *
+   * In strict mode, any sandbox initialization failures or degraded security
+   * states (e.g. unavailable user namespaces, seccomp, or cgroups) will raise
+   * hard errors instead of falling back to degraded protection.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  strict() {
+    this._strict = true;
+    return this;
+  }
+
+  /**
    * Execute the sandboxed command.
    *
    * Before spawning the Go binary, this method:
@@ -613,10 +630,10 @@ export class SaferExec {
       }
     }
     let effectiveReadPaths = [...this._readPaths];
+    if (this._workingDir && !effectiveReadPaths.includes(this._workingDir)) {
+      effectiveReadPaths.push(this._workingDir);
+    }
     if (process.platform === 'linux') {
-      if (this._workingDir && !effectiveReadPaths.includes(this._workingDir)) {
-        effectiveReadPaths.push(this._workingDir);
-      }
       // These paths are required for dynamically linked binaries, shells,
       // and basic system resolution to work inside an isolated tmpfs root.
       const essentialLinuxPaths = [
@@ -654,6 +671,7 @@ export class SaferExec {
       blockFork: this._blockFork,
       traceExec: this._traceExec,
       dumpProfile: this._dumpProfile,
+      strict: this._strict,
     };
 
     // Determine effective timeout: use explicit timeout or default to 60s

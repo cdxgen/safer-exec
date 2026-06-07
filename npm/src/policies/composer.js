@@ -13,19 +13,27 @@
 import { join } from 'node:path';
 import { getSslPaths, isMac } from './sslhelper.js';
 
+import { execSync } from 'node:child_process';
+
 function resolvePhpPaths() {
-  if (isMac) {
-    return {
-      phpBin: '/usr/bin/php',
-      phpLib: '/usr/local/lib/php',
-      phpExtDir: '/usr/local/lib/php/extensions',
-    };
+  let phpBin = '/usr/bin/php';
+  let phpLib = isMac ? '/usr/local/lib/php' : '/usr/lib/php';
+  let phpExtDir = isMac ? '/usr/local/lib/php/extensions' : '/usr/lib/php/extensions';
+
+  try {
+    const bin = execSync('which php', { encoding: 'utf-8' }).trim();
+    if (bin) {
+      phpBin = bin;
+      const extDir = execSync(`${phpBin} -r "echo ini_get('extension_dir');"`, { encoding: 'utf-8' }).trim();
+      if (extDir) {
+        phpExtDir = extDir;
+      }
+    }
+  } catch (e) {
+    // Fall back to defaults if lookup fails
   }
-  return {
-    phpBin: '/usr/bin/php',
-    phpLib: '/usr/lib/php',
-    phpExtDir: '/usr/lib/php/extensions',
-  };
+
+  return { phpBin, phpLib, phpExtDir };
 }
 
 export function composerPolicy() {

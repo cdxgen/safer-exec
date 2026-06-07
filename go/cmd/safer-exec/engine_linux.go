@@ -113,6 +113,9 @@ func run(cfg config.ExecConfig) error {
 		if auditW != nil {
 			auditW.Close()
 		}
+		if cfg.Strict {
+			return fmt.Errorf("user namespaces unavailable")
+		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: user namespaces unavailable — running with reduced isolation (seccomp + landlock only; no filesystem, PID, or network namespace isolation). Install the safer-exec AppArmor profile for full isolation. See README for details.\n")
 		return runReduced(cfg, cfgJSON, selfPath)
 	}
@@ -125,7 +128,7 @@ func run(cfg config.ExecConfig) error {
 	unshareArgs = append(unshareArgs, "--", selfPath, "--init")
 
 	cmd := exec.Command("unshare", unshareArgs...)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON)))
+	cmd.Env = append(config.FilteredEnviron(), fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON)))
 	if cfg.EnableAudit {
 		cmd.Env = append(cmd.Env, "SAFER_EXEC_AUDIT_FD=3")
 	}
@@ -220,7 +223,7 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string) error {
 	}
 
 	cmd := exec.Command(selfPath, "--init-reduced")
-	cmd.Env = append(os.Environ(), fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON)))
+	cmd.Env = append(config.FilteredEnviron(), fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON)))
 	if cfg.EnableAudit {
 		cmd.Env = append(cmd.Env, "SAFER_EXEC_AUDIT_FD=3")
 	}
@@ -278,10 +281,16 @@ func runInitReduced(cfg config.ExecConfig) error {
 	}
 
 	if err := applyLandlockNetwork(cfg); err != nil {
+		if cfg.Strict {
+			return fmt.Errorf("landlock network: %w", err)
+		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock network: %v\n", err)
 	}
 
 	if err := applySeccomp(cfg); err != nil {
+		if cfg.Strict {
+			return fmt.Errorf("seccomp: %w", err)
+		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: seccomp: %v\n", err)
 	}
 
@@ -325,10 +334,16 @@ func runInit(cfg config.ExecConfig) error {
 	}
 
 	if err := applyLandlockNetwork(cfg); err != nil {
+		if cfg.Strict {
+			return fmt.Errorf("landlock network: %w", err)
+		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock network: %v\n", err)
 	}
 
 	if err := applySeccomp(cfg); err != nil {
+		if cfg.Strict {
+			return fmt.Errorf("seccomp: %w", err)
+		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: seccomp: %v\n", err)
 	}
 
@@ -372,6 +387,9 @@ func setupCgroupV2(cfg config.ExecConfig) (string, error) {
 	if err := os.Mkdir(cgroupPath, 0o755); err != nil {
 		// If we still don't have permission (e.g. systemd delegation is disabled),
 		// gracefully skip cgroup limits instead of failing the sandbox.
+		if cfg.Strict {
+			return "", fmt.Errorf("cgroup v2 not available: %w", err)
+		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: cgroup v2 not available (mkdir %s: %v), skipping resource limits\n", cgroupPath, err)
 		return "", nil
 	}
@@ -414,6 +432,9 @@ func setupFilesystem(cfg config.ExecConfig) error {
 			// Linux requires bind mount and read-only remount to be separate steps.
 			// Using MS_REC ensures sub-mounts (like /run/systemd) are included.
 			if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+				if cfg.Strict {
+					return fmt.Errorf("bind mount %s: %w", path, err)
+				}
 				fmt.Fprintf(os.Stderr, "safer-exec: warning: bind mount %s: %v\n", path, err)
 			} else {
 				_ = syscall.Mount("none", target, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY, "")
@@ -424,6 +445,9 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		target := filepath.Join(newRoot, path)
 		if err := os.MkdirAll(target, 0o755); err == nil {
 			if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+				if cfg.Strict {
+					return fmt.Errorf("bind mount %s: %w", path, err)
+				}
 				fmt.Fprintf(os.Stderr, "safer-exec: warning: bind mount %s: %v\n", path, err)
 			}
 		}
@@ -652,14 +676,7 @@ func execCommand(cfg config.ExecConfig) error {
 	if cfg.WorkingDir != "" {
 		_ = os.Chdir(cfg.WorkingDir)
 	}
-	var env []string
-	if len(cfg.Env) > 0 {
-		for k, v := range cfg.Env {
-			env = append(env, fmt.Sprintf("%s=%s", k, v))
-		}
-	} else {
-		env = os.Environ()
-	}
+	env := config.BuildEnv(cfg.Env)
 
 	err = syscall.Exec(cmdPath, append([]string{cfg.Cmd}, cfg.Args...), env)
 	if err != nil {

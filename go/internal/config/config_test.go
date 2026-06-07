@@ -3,6 +3,8 @@ package config
 
 import (
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -25,6 +27,7 @@ func TestExecConfigJSONRoundtrip(t *testing.T) {
 		EnableAudit:    true,
 		EnableDiff:     true,
 		EnableLearn:    false,
+		Strict:         true,
 	}
 
 	data, err := json.Marshal(original)
@@ -69,6 +72,9 @@ func TestExecConfigJSONRoundtrip(t *testing.T) {
 	}
 	if len(decoded.AllowPorts) != 2 {
 		t.Errorf("AllowPorts length: got %d, want 2", len(decoded.AllowPorts))
+	}
+	if !decoded.Strict {
+		t.Error("Strict: got false, want true")
 	}
 }
 
@@ -416,5 +422,56 @@ func TestExecResultJSON(t *testing.T) {
 		t.Error("LearnedPolicy should not be nil")
 	} else if decoded.LearnedPolicy.Cmd != "echo" {
 		t.Errorf("LearnedPolicy.Cmd: got %q, want 'echo'", decoded.LearnedPolicy.Cmd)
+	}
+}
+
+func TestFilteredEnviron(t *testing.T) {
+	os.Setenv("SECRET_LEAK_TEST_VAR", "super-secret-value")
+	defer os.Unsetenv("SECRET_LEAK_TEST_VAR")
+
+	filtered := FilteredEnviron()
+	for _, env := range filtered {
+		if strings.HasPrefix(env, "SECRET_LEAK_TEST_VAR=") {
+			t.Errorf("secret var leaked into filtered environ: %s", env)
+		}
+	}
+}
+
+func TestBuildEnv(t *testing.T) {
+	os.Setenv("SECRET_LEAK_TEST_VAR", "super-secret-value")
+	defer os.Unsetenv("SECRET_LEAK_TEST_VAR")
+
+	// Empty config env should return filtered environment
+	built := BuildEnv(nil)
+	foundSecret := false
+	for _, env := range built {
+		if strings.HasPrefix(env, "SECRET_LEAK_TEST_VAR=") {
+			foundSecret = true
+		}
+	}
+	if foundSecret {
+		t.Error("BuildEnv with nil/empty map leaked secret host env variable")
+	}
+
+	// Custom config env should preserve path/home defaults and custom vars
+	custom := map[string]string{
+		"MY_CUSTOM_VAR": "custom-val",
+	}
+	builtCustom := BuildEnv(custom)
+	foundCustom := false
+	foundPath := false
+	for _, env := range builtCustom {
+		if strings.HasPrefix(env, "MY_CUSTOM_VAR=custom-val") {
+			foundCustom = true
+		}
+		if strings.HasPrefix(env, "PATH=") {
+			foundPath = true
+		}
+	}
+	if !foundCustom {
+		t.Error("custom variable was not found in built environment")
+	}
+	if !foundPath {
+		t.Error("default PATH was not found in built environment")
 	}
 }

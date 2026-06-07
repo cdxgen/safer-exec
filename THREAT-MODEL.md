@@ -50,6 +50,7 @@ The Node.js layer serializes an `ExecConfig` object to JSON. The Go struct expec
 | `blockExec`      | string[] | Executables to block              |
 | `blockFork`      | boolean  | Prevent forking                   |
 | `traceExec`      | boolean  | Log child processes               |
+| `strict`         | boolean  | Treat warnings as hard errors     |
 
 ## 2. Sandbox Mechanisms
 
@@ -104,16 +105,7 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 - **Linux:** A tmpfs root is mounted. Read paths are bind-mounted read-only. Write paths are bind-mounted read-write. The process only sees mounted paths plus `/proc` and `/sys`.
 - **macOS:** The Seatbelt profile allows file reads and writes for all paths by default, then adds explicit subpath rules for the specified paths. The base `system.sb` profile is imported.
 
-**Residual risk:** The default allow rules in the Seatbelt profile mean macOS allows reading and writing all files, then the subpath rules are additive rather than restrictive. The profile structure is:
-
-```
-(allow file-read*)
-(allow file-write*)
-(allow file-read* (subpath "/usr"))
-(allow file-write* (subpath "/tmp/output"))
-```
-
-This means the command can read and write any file on macOS. The subpath rules are redundant with the blanket allows. The Linux path is stricter since it uses a tmpfs root with explicit bind mounts.
+**Mitigation:** By default, `safer-exec` avoids blanket allows and instead restricts macOS file operations to a standard minimal set. When no custom paths are specified, the sandbox profile generates rules allowing reading of standard system directories and the working directory, and restricts write access exclusively to temporary directories (e.g. `/tmp`, `/private/tmp`). If explicit read/write paths are supplied, only those paths (plus system directories) are permitted.
 
 ### 3.3 Network Escapes
 

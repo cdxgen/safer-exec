@@ -47,15 +47,8 @@ func (l *Learner) Learn(cfg config.ExecConfig) (*config.LearnedPolicy, error) {
 	// Try strace first (Linux), fall back to proc-based tracing
 	cmd, args := cfg.Cmd, cfg.Args
 
-	// Build env
-	var env []string
-	if len(cfg.Env) > 0 {
-		for k, v := range cfg.Env {
-			env = append(env, fmt.Sprintf("%s=%s", k, v))
-		}
-	} else {
-		env = os.Environ()
-	}
+	// Build env securely using filtered environment
+	env := config.BuildEnv(cfg.Env)
 
 	// Try strace for comprehensive tracing
 	if stracePath, err := exec.LookPath("strace"); err == nil {

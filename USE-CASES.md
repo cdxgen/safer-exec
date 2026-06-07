@@ -1,0 +1,126 @@
+# `@cdxgen/safer-exec` Use Cases: Mitigating Supply-Chain Attacks
+
+This document details secure patterns and configurations for using `@cdxgen/safer-exec` to prevent, mitigate, and contain supply-chain attacks when installing or executing dependencies in the **NPM** and **PyPI** ecosystems.
+
+---
+
+## The Threat Landscape: Supply-Chain Vectors
+
+Modern supply-chain attacks target developer environments and build pipelines via compromised or malicious packages. The most common vectors include:
+
+### 1. NPM Lifecycle Scripts (pre/postinstall)
+
+- **Attack Vector**: When `npm install` runs, a dependency specifies a `preinstall`, `install`, or `postinstall` script in its `package.json`. These scripts execute arbitrary shell code.
+- **Malicious Behavior**: Reading sensitive host environment variables (e.g. `AWS_ACCESS_KEY_ID`, `NPM_TOKEN`), stealing private keys (`~/.ssh`), writing persistent malware (autostart files), or downloading second-stage executors (e.g. `bun` or custom binaries).
+- **Mitigation**: Categorically block execution of arbitrary scripts and enforce zero-leakage policies on the system environment.
+
+### 2. PyPI Malicious setup.py & .pth Imports
+
+- **Attack Vector**: PyPI packages executing via source distributions run `setup.py` (arbitrary Python script) during installation. Additionally, malicious packages can drop `.pth` (Path Configuration) files into Python's `site-packages`, which are executed automatically every time the Python interpreter starts.
+- **Malicious Behavior**: Reading secrets, establishing persistence via `.bashrc` modifications, or initiating reverse shells.
+- **Mitigation**: Limit package installation to pre-compiled binaries (Wheels only) to prevent compilation-stage script execution, and lock down filesystem write access and socket connections.
+
+---
+
+## Mitigating Supply-Chain Attacks using the CLI
+
+The `@cdxgen/safer-exec` CLI allows wrapping package managers in hardened, platform-native sandboxes.
+
+### Secure NPM / Yarn / PNPM Execution
+
+To safely install npm packages without allowing malicious lifecycle scripts to steal environment credentials, exfiltrate data, or spawn malware:
+
+```bash
+# Apply the pre-built npm policy and disable outbound network access after fetching
+node npm/src/cli.js --policy=npm --disable-network -- npm install
+```
+
+**What this does under the hood:**
+
+- **Filters Environment Variables**: Automatically strips out credentials like `AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN`, and `NPM_TOKEN` so they cannot be read by dependencies.
+- **Blocks Spawning Shells**: Uses `--block-fork` to deny the generation of subprocesses or execution of unauthorized shells.
+- **Overrides Configurations**: Automatically sets `npm_config_ignore_scripts=true` to instruct npm directly not to run lifecycle hooks.
+
+---
+
+### Secure PyPI / pip Execution
+
+To install Python dependencies securely:
+
+```bash
+# Apply the PyPI policy to enforce Wheel-only downloads and block system-level subprocess forks
+node npm/src/cli.js --policy=pypi -- pip install -r requirements.txt
+```
+
+**What this does under the hood:**
+
+- **Forces Wheel-Only Installation**: Injects `PIP_ONLY_BINARY=:all:` to prevent downloading source packages (`.tar.gz`) that execute code via `setup.py`.
+- **Restricts Workspace Mutations**: Allows writes only to the designated virtual environment directory (`.venv`) and caches, protecting user profiles (`~/.bashrc`, etc.) from persistent edits.
+- **Prevents Execution Escapes**: Denies executing arbitrary external utilities (`blockExec: ['*']`) and blocks system forks (`blockFork: true`).
+
+---
+
+## Programmatic Library API Usage
+
+You can embed `@cdxgen/safer-exec` directly in your dev tools, task runners, or automation servers.
+
+### Safe NPM Execution
+
+```javascript
+import { SaferExec } from "@cdxgen/safer-exec";
+
+// Execute a clean package installation
+const runner = new SaferExec()
+  .applyPolicy("npm")
+  .disableNetwork() // categorical network block
+  .workingDir(process.cwd());
+
+const result = await runner.run("npm", ["install"]);
+
+if (result.exitCode === 0) {
+  console.log("Dependencies installed securely.");
+} else {
+  console.error(
+    "Installation aborted or sandbox blocked execution:",
+    result.stderr,
+  );
+}
+```
+
+### Safe PyPI/Python Run
+
+```javascript
+import { SaferExec } from "@cdxgen/safer-exec";
+import { join } from "node:path";
+
+const runner = new SaferExec()
+  .applyPolicy("pypi")
+  .workingDir(process.cwd())
+  // Custom workspace restrictions
+  .readPaths(join(process.cwd(), "pyproject.toml"))
+  .writePaths(join(process.cwd(), ".venv"));
+
+// Run pip install
+const result = await runner.run("pip", ["install", "-r", "requirements.txt"]);
+
+if (result.exitCode !== 0) {
+  console.error(
+    "pip install failed or was blocked. System integrity preserved!",
+  );
+}
+```
+
+### Advanced Isolation: Zero-Trust Wildcard Execution Control
+
+To guarantee a process can _never_ spawn secondary compilers, curl exfiltrators, or scripting runtimes:
+
+```javascript
+import { SaferExec } from "@cdxgen/safer-exec";
+
+const runner = new SaferExec()
+  .blockFork() // Block all process forks
+  .blockExec("*") // Deny execution of all external programs
+  .run("node", ["app.js"]);
+```
+
+This forces the process to run entirely within its single initial memory space and denies any `child_process` execution attempts.

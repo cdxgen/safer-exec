@@ -204,7 +204,7 @@ describe('Integration Tests', () => {
       const result = await new SaferExec()
         .applyPolicy('npm')
         .env('CUSTOM_VAR', 'custom_value')
-        .run('sh', ['-c', 'echo $CUSTOM_VAR']);
+        .run('printenv', ['CUSTOM_VAR']);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
       strict.ok(
