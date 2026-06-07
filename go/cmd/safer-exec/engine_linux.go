@@ -677,6 +677,13 @@ func logAuditEntry(entryType, target string) {
 }
 
 func execCommand(cfg config.ExecConfig) error {
+	cmdBase := filepath.Base(cfg.Cmd)
+	for _, blocked := range cfg.BlockExec {
+		if blocked == cmdBase || blocked == cfg.Cmd {
+			return fmt.Errorf("command %s is blocked by blockExec policy", cfg.Cmd)
+		}
+	}
+
 	cmdPath, err := exec.LookPath(cfg.Cmd)
 	if err != nil {
 		cmdPath = cfg.Cmd
@@ -688,7 +695,7 @@ func execCommand(cfg config.ExecConfig) error {
 
 	// Try execveat to allow seccomp filtering to block standard execve
 	err = execveat(-100, cmdPath, append([]string{cfg.Cmd}, cfg.Args...), env, 0)
-	if err == syscall.ENOSYS {
+	if err == syscall.ENOSYS || err == syscall.EPERM || err == syscall.EACCES {
 		err = syscall.Exec(cmdPath, append([]string{cfg.Cmd}, cfg.Args...), env)
 	}
 	if err != nil {
@@ -713,22 +720,19 @@ func execveat(dirfd int, pathname string, argv []string, envp []string, flags in
 		return err
 	}
 
-	var argv0p uintptr
-	if len(argvPtrs) > 0 {
-		argv0p = uintptr(unsafe.Pointer(&argvPtrs[0]))
+	if len(argvPtrs) == 0 {
+		argvPtrs = []*byte{nil}
 	}
-
-	var envp0p uintptr
-	if len(envpPtrs) > 0 {
-		envp0p = uintptr(unsafe.Pointer(&envpPtrs[0]))
+	if len(envpPtrs) == 0 {
+		envpPtrs = []*byte{nil}
 	}
 
 	_, _, errno := syscall.RawSyscall6(
 		uintptr(sysEXECVEAT),
 		uintptr(dirfd),
 		uintptr(unsafe.Pointer(pathnamePtr)),
-		argv0p,
-		envp0p,
+		uintptr(unsafe.Pointer(&argvPtrs[0])),
+		uintptr(unsafe.Pointer(&envpPtrs[0])),
 		uintptr(flags),
 		0,
 	)
