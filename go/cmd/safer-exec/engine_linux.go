@@ -40,10 +40,42 @@ const sysSeccomp = sysSeccomp_unified
 const (
 	bpfLoadWordAbsolute = 0x20 // BPF_LD | BPF_W | BPF_ABS
 	bpfJmpEq            = 0x15 // BPF_JMP | BPF_JEQ | BPF_K
+	bpfJmpSet           = 0x45 // BPF_JMP | BPF_JSET | BPF_K
 	bpfJmpReturn        = 0x06 // BPF_RET | BPF_K
 )
 
+// cloneThreadFlag is CLONE_THREAD: set when clone creates a thread, not a child process.
+// On arm64, glibc and Node.js use clone() for thread creation (not clone3), so blocking
+// SYS_CLONE unconditionally kills the sandboxed process. We only block forks (no CLONE_THREAD).
+const cloneThreadFlag = 0x00010000
+
+// isUserNamespaceRestricted returns true when the kernel or security policy
+// prevents unprivileged processes from creating user namespaces. Covers the
+// three common Linux mechanisms:
+//   - Ubuntu 24.04+ AppArmor restriction (apparmor_restrict_unprivileged_userns)
+//   - Debian/some-kernel explicit disable (unprivileged_userns_clone)
+//   - Kernel compiled with user namespaces disabled (max_user_namespaces = 0)
+func isUserNamespaceRestricted() bool {
+	sysctls := []struct {
+		path      string
+		killValue string
+	}{
+		{"/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "1"},
+		{"/proc/sys/kernel/unprivileged_userns_clone", "0"},
+		{"/proc/sys/user/max_user_namespaces", "0"},
+	}
+	for _, s := range sysctls {
+		if data, err := os.ReadFile(s.path); err == nil {
+			if strings.TrimSpace(string(data)) == s.killValue {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // run forks the Go binary using the system 'unshare' to bypass Go's multi-threading EINVAL issues.
+// If user namespaces are unavailable it falls back to reduced isolation (seccomp + landlock only).
 func run(cfg config.ExecConfig) error {
 	if cfg.EnableLearn {
 		return runLearn(cfg)
@@ -69,6 +101,20 @@ func run(cfg config.ExecConfig) error {
 		if err != nil {
 			return fmt.Errorf("creating audit pipe: %w", err)
 		}
+	}
+
+	// Fall back to reduced isolation when user namespaces are blocked by kernel policy.
+	// Reduced mode skips mount/PID/network/UTS namespace isolation and filesystem pivot,
+	// but still applies seccomp-bpf syscall filtering and Landlock network confinement.
+	if isUserNamespaceRestricted() {
+		if auditR != nil {
+			auditR.Close()
+		}
+		if auditW != nil {
+			auditW.Close()
+		}
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: user namespaces unavailable — running with reduced isolation (seccomp + landlock only; no filesystem, PID, or network namespace isolation). Install the safer-exec AppArmor profile for full isolation. See README for details.\n")
+		return runReduced(cfg, cfgJSON, selfPath)
 	}
 
 	// Use system unshare to create namespaces before Go starts
@@ -153,6 +199,96 @@ func runLearn(cfg config.ExecConfig) error {
 	data, _ := json.Marshal(policy)
 	fmt.Printf("LEARNED:%s\n", string(data))
 	return nil
+}
+
+// runReduced executes the target command with reduced isolation when user namespaces
+// are unavailable. It spawns self with --init-reduced, which applies seccomp-bpf and
+// Landlock network confinement without any namespace or filesystem isolation.
+func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string) error {
+	// Filesystem diffing requires OverlayFS (mount namespace). Skip and warn.
+	if cfg.EnableDiff {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: --diff requires mount namespace isolation; skipped in reduced isolation mode\n")
+	}
+
+	var auditR, auditW *os.File
+	if cfg.EnableAudit {
+		var err error
+		auditR, auditW, err = os.Pipe()
+		if err != nil {
+			return fmt.Errorf("creating audit pipe: %w", err)
+		}
+	}
+
+	cmd := exec.Command(selfPath, "--init-reduced")
+	cmd.Env = append(os.Environ(), fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON)))
+	if cfg.EnableAudit {
+		cmd.Env = append(cmd.Env, "SAFER_EXEC_AUDIT_FD=3")
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.ExtraFiles = []*os.File{auditW}
+
+	if cfg.WorkingDir != "" {
+		cmd.Dir = cfg.WorkingDir
+	}
+
+	if err := cmd.Start(); err != nil {
+		if auditR != nil {
+			auditR.Close()
+		}
+		return fmt.Errorf("starting reduced sandbox: %w", err)
+	}
+
+	if auditW != nil {
+		auditW.Close()
+	}
+
+	if err := cmd.Wait(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if auditR != nil {
+				collectAuditLog(auditR)
+			}
+			code := exitErr.ExitCode()
+			if code == 132 || code == 137 || code == 153 {
+				return nil
+			}
+			if code == -1 {
+				fmt.Fprintf(os.Stderr, "safer-exec: process killed by signal: %v\n", exitErr.ProcessState.String())
+			}
+			return &ExitError{Code: code}
+		}
+		return fmt.Errorf("reduced sandbox: %w", err)
+	}
+
+	if auditR != nil {
+		collectAuditLog(auditR)
+	}
+	return nil
+}
+
+// runInitReduced is the inner init for reduced isolation mode. It skips namespace
+// and filesystem setup, applying only seccomp-bpf and Landlock network confinement.
+func runInitReduced(cfg config.ExecConfig) error {
+	cgroupPath, err := setupCgroupV2(cfg)
+	if err != nil {
+		return fmt.Errorf("setting up cgroup v2: %w", err)
+	}
+	if cgroupPath != "" {
+		defer cleanupCgroup(cgroupPath)
+	}
+
+	if err := applyLandlockNetwork(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock network: %v\n", err)
+	}
+
+	if err := applySeccomp(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: seccomp: %v\n", err)
+	}
+
+	if cfg.TraceExec && cfg.EnableAudit {
+		logAuditEntry("process-exec", cfg.Cmd)
+	}
+	return execCommand(cfg)
 }
 
 func collectAuditLog(r *os.File) {
@@ -433,7 +569,8 @@ func applySeccomp(cfg config.ExecConfig) error {
 
 	blockCalls := []int{syscall.SYS_PTRACE, sysKCMP, syscall.SYS_UNSHARE, syscall.SYS_MOUNT, syscall.SYS_PIVOT_ROOT, sysSYSCALL}
 	if cfg.BlockFork {
-		blockCalls = append(blockCalls, syscall.SYS_CLONE, sysFORK, sysVFORK)
+		// SYS_CLONE is handled separately below with a flag check to allow thread creation.
+		blockCalls = append(blockCalls, sysFORK, sysVFORK)
 	}
 	if cfg.TraceExec {
 		blockCalls = append(blockCalls, syscall.SYS_EXECVE)
@@ -449,6 +586,32 @@ func applySeccomp(cfg config.ExecConfig) error {
 
 	var insts []syscall.SockFilter
 	insts = append(insts, syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0})
+
+	if cfg.BlockFork {
+		// For SYS_CLONE, only block process forks (CLONE_THREAD flag absent).
+		// Thread creation (CLONE_THREAD set) must be allowed so the sandboxed binary's
+		// internal threads (glibc, Node.js libuv, etc.) can start on arm64 where
+		// clone() is used for threads instead of clone3().
+		//
+		// BPF layout (A = syscall nr at entry):
+		//   JEQ SYS_CLONE, Jt=0, Jf=3   → if NOT clone: skip 3, jump to reload
+		//   LOAD args[0] (offset 16)      → A = clone flags
+		//   JSET CLONE_THREAD, Jt=1, Jf=0 → if thread: skip 1 (jump to reload)
+		//   RET KILL                       → process fork: kill
+		//   LOAD syscall nr (offset 0)    → reload for subsequent checks
+		retKillOrTrap := uint32(seccompRetKill)
+		if cfg.EnableAudit {
+			trapVal := uint16(6 | (syscall.SYS_CLONE&0xFF)<<8)
+			retKillOrTrap = uint32(seccompRetTrap) | uint32(trapVal)
+		}
+		insts = append(insts,
+			syscall.SockFilter{Code: bpfJmpEq, Jf: 3, K: uint32(syscall.SYS_CLONE)},
+			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 16},
+			syscall.SockFilter{Code: bpfJmpSet, Jt: 1, K: cloneThreadFlag},
+			syscall.SockFilter{Code: bpfJmpReturn, K: retKillOrTrap},
+			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0},
+		)
+	}
 
 	for _, call := range actualBlockCalls {
 		insts = append(insts, syscall.SockFilter{Code: bpfJmpEq, Jf: 1, K: uint32(call)})

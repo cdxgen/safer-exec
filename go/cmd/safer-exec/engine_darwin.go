@@ -467,6 +467,11 @@ func runInit(cfg config.ExecConfig) error {
 	return run(cfg)
 }
 
+// runInitReduced is a no-op on macOS (re-exec pattern is Linux-specific).
+func runInitReduced(cfg config.ExecConfig) error {
+	return run(cfg)
+}
+
 // dedupPaths returns the minimal set of parent directories covering all paths.
 func dedupPaths(paths []string) []string {
 	sort.Strings(paths)

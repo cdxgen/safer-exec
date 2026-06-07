@@ -38,3 +38,4 @@ coverage/
 
 # Core dumps
 core
+go/safer-exec

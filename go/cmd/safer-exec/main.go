@@ -7,13 +7,19 @@
 //
 //	echo '{"cmd":"npm","args":["install"],...}' | safer-exec
 //
-// Re-exec mode (Linux only):
+// Re-exec modes (Linux only):
 //
 //	safer-exec --init
 //
 //	When --init is passed, the binary skips stdin parsing and
-//	re-reads config from an environment variable to set up
-//	namespaces in the child process.
+//	re-reads config from SAFER_EXEC_CONFIG to set up namespaces
+//	and execute the target command inside the new namespace.
+//
+//	safer-exec --init-reduced
+//
+//	Reduced isolation fallback used when user namespaces are
+//	unavailable. Applies seccomp-bpf and Landlock only; skips
+//	filesystem, PID, and network namespace isolation.
 //
 // Output modes:
 //
@@ -42,22 +48,33 @@ func (e *ExitError) Error() string {
 }
 
 func init() {
-	// Handle the re-exec pattern for Linux sandboxing.
-	// When the binary re-executes itself with --init, it must act as the
-	// sandbox init process. We intercept this in init() so it works even
-	// when running under `go test` (where the test binary's generated main
-	// function would otherwise call flag.Parse() and fail on "--init").
-	if len(os.Args) > 1 && os.Args[1] == "--init" {
-		initMain()
-		os.Exit(0)
+	// Handle the re-exec patterns for Linux sandboxing.
+	// We intercept in init() so it works even when running under `go test`
+	// (where the test binary's generated main would otherwise call flag.Parse()
+	// and fail on "--init" / "--init-reduced").
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--init":
+			initMain()
+			os.Exit(0)
+		case "--init-reduced":
+			initReducedMain()
+			os.Exit(0)
+		}
 	}
 }
 
 func main() {
-	// Handle Linux re-exec pattern for namespace setup
-	if len(os.Args) > 1 && os.Args[1] == "--init" {
-		initMain()
-		return
+	// Handle Linux re-exec patterns for namespace setup
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--init":
+			initMain()
+			return
+		case "--init-reduced":
+			initReducedMain()
+			return
+		}
 	}
 
 	// Handle version flag
@@ -127,6 +144,28 @@ func initMain() {
 
 	if err := runInit(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "safer-exec: init: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// initReducedMain is called when the binary re-executes itself with --init-reduced.
+// It applies only seccomp-bpf and Landlock (no namespace or filesystem isolation)
+// and executes the target command directly.
+func initReducedMain() {
+	cfgJSON := os.Getenv("SAFER_EXEC_CONFIG")
+	if cfgJSON == "" {
+		fmt.Fprintln(os.Stderr, "safer-exec: SAFER_EXEC_CONFIG not set")
+		os.Exit(1)
+	}
+
+	var cfg config.ExecConfig
+	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: init-reduced config parse: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := runInitReduced(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: init-reduced: %v\n", err)
 		os.Exit(1)
 	}
 }

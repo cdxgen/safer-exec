@@ -16,8 +16,9 @@ npm install @cdxgen/safer-exec
 
 **Linux:**
 
-- Requires a modern kernel with **User Namespaces** enabled (enabled by default on almost all modern distributions like Ubuntu, Debian, Fedora, Arch).
 - **Learning Mode** requires `strace` to be installed (`sudo apt install strace`).
+- On most distributions (Debian, Fedora, Arch, Ubuntu ≤ 23.10) safer-exec works out of the box with full namespace isolation.
+- On **Ubuntu 24.04+** user namespace creation is restricted by AppArmor by default. safer-exec automatically detects this and falls back to **reduced isolation mode** (seccomp-bpf + Landlock only; no filesystem, PID, or network namespace isolation). A warning is printed. See [Full Isolation on Ubuntu 24.04+](#full-isolation-on-ubuntu-2404) below to restore full isolation with an AppArmor profile.
 
 **Linux Resource Limits (Cgroup v2):**
 By default, `systemd` does not allow unprivileged users to apply CPU, Memory, or PID limits. If you want to use `.maxMemory()`, `.maxCPUCores()`, or `.maxProcesses()` on Linux without running as `root`, you must enable `systemd` user delegation on your machine:
@@ -32,6 +33,81 @@ sudo systemctl daemon-reload
 ```
 
 _Note: If cgroup v2 delegation is not configured, `safer-exec` will gracefully skip the resource limits and print a warning, but will still enforce all other sandbox constraints (filesystem, network, syscalls)._
+
+## Linux Isolation Modes
+
+safer-exec runs in one of two modes on Linux, chosen automatically at startup:
+
+| Mode                   | Filesystem isolation      | PID namespace | Network namespace          | Seccomp | Landlock | Cgroup limits |
+| ---------------------- | ------------------------- | ------------- | -------------------------- | ------- | -------- | ------------- |
+| **Full** (default)     | ✓ bind-mount + pivot_root | ✓             | ✓ (if `--disable-network`) | ✓       | ✓        | ✓             |
+| **Reduced** (fallback) | ✗                         | ✗             | ✗                          | ✓       | ✓        | ✓             |
+
+Full mode requires the ability to create unprivileged user namespaces (`unshare -U`). Reduced mode is used automatically when this is unavailable, and a warning is printed to stderr:
+
+```
+safer-exec: warning: user namespaces unavailable — running with reduced isolation (seccomp + landlock only; no filesystem, PID, or network namespace isolation). Install the safer-exec AppArmor profile for full isolation.
+```
+
+In reduced mode, seccomp-bpf syscall filtering and Landlock network confinement still apply, so fork/exec blocking, syscall restrictions, and per-host network allow-lists remain effective. Filesystem isolation (restricting visible paths via bind mounts) and `--diff` are not available.
+
+## Full Isolation on Ubuntu 24.04+
+
+Ubuntu 24.04 (and later) restricts unprivileged user namespace creation by default via AppArmor (`kernel.apparmor_restrict_unprivileged_userns=1`). The restriction is per-binary: you can grant safer-exec permission without changing the system-wide setting.
+
+### Install the AppArmor profile
+
+```bash
+sudo tee /etc/apparmor.d/safer-exec > /dev/null << 'EOF'
+# AppArmor profile for safer-exec — grants permission to create
+# unprivileged user namespaces required for full sandbox isolation.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile safer-exec /usr/local/bin/safer-exec flags=(unconfined) {
+  userns,
+}
+EOF
+
+sudo apparmor_parser -r /etc/apparmor.d/safer-exec
+```
+
+Adjust the path (`/usr/local/bin/safer-exec`) to wherever the binary is installed. When using the npm package, the binary lives inside `node_modules/@cdxgen/safer-exec-linux-*/bin/safer-exec` — you can use a glob pattern:
+
+```bash
+sudo tee /etc/apparmor.d/safer-exec > /dev/null << 'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile safer-exec /** {
+  userns,
+}
+EOF
+
+sudo apparmor_parser -r /etc/apparmor.d/safer-exec
+```
+
+The profile takes effect immediately (no reboot required). Verify with:
+
+```bash
+# Should show the profile loaded
+sudo aa-status | grep safer-exec
+```
+
+### Alternative: system-wide sysctl (not recommended)
+
+If installing an AppArmor profile is not an option (e.g., in ephemeral CI environments), you can disable the restriction globally:
+
+```bash
+# Temporary (lost on reboot)
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+# Permanent
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/99-userns.conf
+sudo sysctl -p /etc/sysctl.d/99-userns.conf
+```
+
+This weakens a system-wide security policy. Prefer the AppArmor profile for production systems.
 
 ## Fluent API
 
@@ -264,17 +340,26 @@ The Node.js layer handles policy resolution, DNS lookups, and config serializati
 2. Apply RLIMIT quotas (memory via `RLIMIT_AS`, CPU via `RLIMIT_CPU`, process count via `RLIMIT_NPROC`)
 3. Execute `sandbox-exec -f <profile> <cmd> <args...>`
 
-**Linux path:**
+**Linux path (full isolation):**
 
-1. Fork self with `--init` flag and config in `SAFER_EXEC_CONFIG` env var
-2. Unshare namespaces (user, mount, PID, UTS, network)
-3. Map UID/GID to root inside the user namespace for mount privileges
-4. Create cgroup v2 hierarchy for resource quotas
-5. Mount tmpfs root, bind-mount read/write paths, mount proc and sysfs
-6. Apply Landlock v2 network confinement rules
-7. Apply seccomp-bpf filter blocking ptrace, kcmp, unshare, mount, pivot_root
-8. `pivot_root` to the new filesystem tree
-9. `execve` the target command
+1. Probe for user namespace availability; fall back to reduced mode if restricted
+2. Fork self with `--init` flag and config in `SAFER_EXEC_CONFIG` env var
+3. Unshare namespaces (user, mount, PID, UTS, network)
+4. Map UID/GID to root inside the user namespace for mount privileges
+5. Create cgroup v2 hierarchy for resource quotas
+6. Mount tmpfs root, bind-mount read/write paths, mount proc and sysfs
+7. Apply Landlock v2 network confinement rules
+8. Apply seccomp-bpf filter blocking ptrace, kcmp, unshare, mount, pivot_root
+9. `pivot_root` to the new filesystem tree
+10. `execve` the target command
+
+**Linux path (reduced isolation — user namespaces unavailable):**
+
+1. Fork self with `--init-reduced` flag (no unshare)
+2. Create cgroup v2 hierarchy for resource quotas
+3. Apply Landlock v2 network confinement rules
+4. Apply seccomp-bpf syscall filter
+5. `execve` the target command (host filesystem fully visible)
 
 Communication between layers uses marker-prefixed JSON on stdout:
 
