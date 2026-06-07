@@ -127,7 +127,7 @@ jobs:
   publish:
     needs: [build-go, test-go, test-node]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       id-token: write
@@ -151,9 +151,18 @@ jobs:
         run: |
           # Extract version from npm/package.json
           version=$(jq -r '.version' npm/package.json)
+
+          # Determine dry-run options
+          publish_opts=(--provenance --access public)
+          if [[ ! "$GITHUB_REF" =~ ^refs/tags/v ]]; then
+            echo "Non-tag execution: running npm publish in dry-run mode"
+            publish_opts=(--dry-run --access public)
+          fi
+
           # Package each binary into its own npm package
           for binary in binaries/safer-exec-*/safer-exec-*; do
-            platform=$(echo "$binary" | grep -oP '(?<=safer-exec-)\w+-\w+')
+            binary_name=$(basename "$binary")
+            platform=$(echo "$binary_name" | cut -d- -f3,4)
             pkg_name="@cdxgen/safer-exec-${platform}"
             os_name=$(echo "$platform" | cut -d- -f1)
             case "$platform" in
@@ -185,8 +194,8 @@ jobs:
                 cpu: [$cpu]
               }' > "publish-${platform}/package.json"
             cd "publish-${platform}"
-            npm publish --provenance --access public
+            npm publish "${publish_opts[@]}"
             cd ..
           done
           cd npm
-          npm publish --provenance --access public
+          npm publish "${publish_opts[@]}"
