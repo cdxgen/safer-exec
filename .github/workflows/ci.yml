@@ -162,29 +162,28 @@ jobs:
             esac
             mkdir -p "publish-${platform}/bin"
             cp "$binary" "publish-${platform}/bin/safer-exec"
-            cat > "publish-${platform}/package.json" << EOF
-            {
-              "name": "${pkg_name}",
-              "version": "${version}",
-              "main": "bin/safer-exec",
-              "files": ["bin/"],
-              "license": "MIT",
-              "repository": {
-                "type": "git",
-                "url": "git+https://github.com/cdxgen/safer-exec.git"
-              },
-              "bugs": {
-                "url": "https://github.com/cdxgen/safer-exec/issues"
-              },
-              "homepage": "https://github.com/cdxgen/safer-exec#readme",
-              "os": [
-                "${os_name}"
-              ],
-              "cpu": [
-                "${cpu}"
-              ]
-            }
-EOF
+            jq -n \
+              --arg name "$pkg_name" \
+              --arg version "$version" \
+              --arg os "$os_name" \
+              --arg cpu "$cpu" \
+              '{
+                name: $name,
+                version: $version,
+                main: "bin/safer-exec",
+                files: ["bin/"],
+                license: "MIT",
+                repository: {
+                  type: "git",
+                  url: "git+https://github.com/cdxgen/safer-exec.git"
+                },
+                bugs: {
+                  url: "https://github.com/cdxgen/safer-exec/issues"
+                },
+                homepage: "https://github.com/cdxgen/safer-exec#readme",
+                os: [$os],
+                cpu: [$cpu]
+              }' > "publish-${platform}/package.json"
             cd "publish-${platform}"
             npm publish --provenance --access public
             cd ..
