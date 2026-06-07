@@ -23,10 +23,11 @@ import (
 const cgroupV2Root = "/sys/fs/cgroup"
 
 const (
-	sysKCMP    = sysKCMP_unified
-	sysSYSCALL = sysSYSCALL_unified
-	sysFORK    = sysFORK_unified
-	sysVFORK   = sysVFORK_unified
+	sysKCMP     = sysKCMP_unified
+	sysSYSCALL  = sysSYSCALL_unified
+	sysFORK     = sysFORK_unified
+	sysVFORK    = sysVFORK_unified
+	sysEXECVEAT = sysEXECVEAT_unified
 )
 
 const (
@@ -723,7 +724,7 @@ func execveat(dirfd int, pathname string, argv []string, envp []string, flags in
 	}
 
 	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_EXECVEAT,
+		uintptr(sysEXECVEAT),
 		uintptr(dirfd),
 		uintptr(unsafe.Pointer(pathnamePtr)),
 		argv0p,
