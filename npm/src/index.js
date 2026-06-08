@@ -52,7 +52,7 @@
  */
 
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, join } from 'node:path';
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import { resolveHosts } from './net.js';
 import { run as runBinary } from './runner.js';
@@ -70,6 +70,19 @@ import { bunPolicy } from './policies/bun.js';
 import { pokuPolicy } from './policies/poku.js';
 import { cdxgenPolicy } from './policies/cdxgen.js';
 import { pnpmInstallPolicy } from './policies/pnpmInstall.js';
+function findInPath(cmd) {
+  if (cmd.includes('/') || cmd.includes('\\')) {
+    return cmd;
+  }
+  const paths = (process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':');
+  for (const p of paths) {
+    const fullPath = join(p, cmd);
+    if (existsSync(fullPath)) {
+      return fullPath;
+    }
+  }
+  return cmd;
+}
 
 // Resolve the path to the npm package root directory.
 // This is used to resolve relative binary paths relative to the package,
@@ -130,6 +143,7 @@ export class SaferExec {
    * @param {number[]} [options.allowPorts] - TCP ports to allow (default: [80, 443])
    * @param {boolean} [options.enableDiff] - Enable filesystem mutation diffing
    * @param {boolean} [options.enableLearn] - Enable behavioral auto-profiling (learning mode)
+   * @param {boolean} [options.resolveSymlinks] - Resolve target command symlink in PATH
    */
   constructor(options = {}) {
     /** @type {string[]} */
@@ -203,6 +217,9 @@ export class SaferExec {
 
     /** @type {string} Path to the policy file if loaded or merging */
     this._policyFilePath = options.policyFilePath || '';
+
+    /** @type {boolean} Opt-in to resolve target command symlink */
+    this._resolveSymlinks = options.resolveSymlinks || false;
   }
 
   /**
@@ -252,6 +269,9 @@ export class SaferExec {
     }
     if (policy.allowLoopback) {
       this._allowLoopback = true;
+    }
+    if (policy.resolveSymlinks) {
+      this._resolveSymlinks = true;
     }
 
     return this;
@@ -364,6 +384,9 @@ export class SaferExec {
     }
     if (raw.timeoutMs) {
       this.timeout(raw.timeoutMs);
+    }
+    if (raw.resolveSymlinks) {
+      this.resolveSymlinks();
     }
 
     return this;
@@ -713,6 +736,17 @@ export class SaferExec {
   }
 
   /**
+   * Enable symlink resolution of the target command.
+   *
+   * @param {boolean} [enable=true] - Whether to enable symlink resolution
+   * @returns {SaferExec} This instance for chaining
+   */
+  resolveSymlinks(enable = true) {
+    this._resolveSymlinks = enable;
+    return this;
+  }
+
+  /**
    * Enable strict sandboxing mode.
    *
    * In strict mode, any sandbox initialization failures or degraded security
@@ -792,10 +826,17 @@ export class SaferExec {
     effectiveReadPaths = Array.from(new Set(effectiveReadPaths));
     effectiveWritePaths = Array.from(new Set(effectiveWritePaths));
 
+    let executionCmd = cmd;
+    if (this._resolveSymlinks) {
+      try {
+        const located = findInPath(cmd);
+        executionCmd = realpathSync(located);
+      } catch {}
+    }
 
     // Build the config object
     const config = {
-      cmd,
+      cmd: executionCmd,
       args,
       env: Object.keys(this._env).length > 0 ? this._env : undefined,
       readPaths: effectiveReadPaths,

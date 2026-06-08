@@ -344,6 +344,7 @@ All methods return `this` for chaining except `.run()`.
 | `.blockFork()`          | Prevent the command from forking new processes |
 | `.traceExec()`          | Log every child process spawned                |
 | `.strict()`             | Treat sandbox setup warnings as hard errors    |
+| `.resolveSymlinks()`    | Resolve target command symlink in PATH         |
 
 ### `.run(cmd, args?)`
 

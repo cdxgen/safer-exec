@@ -444,6 +444,9 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		}
 	}
 
+	cfg.ReadPaths = dedupPaths(cfg.ReadPaths)
+	cfg.WritePaths = dedupPaths(cfg.WritePaths)
+
 	newRoot, err := os.MkdirTemp("", "safer-exec-root-*")
 	if err != nil {
 		return fmt.Errorf("mkdir temp root: %w", err)
@@ -459,18 +462,27 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		if err != nil {
 			continue
 		}
-		if fi.IsDir() {
-			err = os.MkdirAll(target, 0o755)
-		} else {
-			err = os.MkdirAll(filepath.Dir(target), 0o755)
-			if err == nil {
-				var f *os.File
-				f, err = os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
+
+		_, statErr := os.Stat(target)
+		targetExists := statErr == nil
+
+		if !targetExists {
+			if fi.IsDir() {
+				err = os.MkdirAll(target, 0o755)
+			} else {
+				err = os.MkdirAll(filepath.Dir(target), 0o755)
 				if err == nil {
-					f.Close()
+					var f *os.File
+					f, err = os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
+					if err == nil {
+						f.Close()
+					}
 				}
 			}
+		} else {
+			err = nil
 		}
+
 		if err == nil {
 			// Linux requires bind mount and read-only remount to be separate steps.
 			// Using MS_REC ensures sub-mounts (like /run/systemd) are included.
@@ -490,18 +502,27 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		if err != nil {
 			continue
 		}
-		if fi.IsDir() {
-			err = os.MkdirAll(target, 0o755)
-		} else {
-			err = os.MkdirAll(filepath.Dir(target), 0o755)
-			if err == nil {
-				var f *os.File
-				f, err = os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
+
+		_, statErr := os.Stat(target)
+		targetExists := statErr == nil
+
+		if !targetExists {
+			if fi.IsDir() {
+				err = os.MkdirAll(target, 0o755)
+			} else {
+				err = os.MkdirAll(filepath.Dir(target), 0o755)
 				if err == nil {
-					f.Close()
+					var f *os.File
+					f, err = os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
+					if err == nil {
+						f.Close()
+					}
 				}
 			}
+		} else {
+			err = nil
 		}
+
 		if err == nil {
 			if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
 				if cfg.Strict {

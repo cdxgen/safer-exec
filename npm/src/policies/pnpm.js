@@ -88,6 +88,8 @@ export function pnpmPolicy() {
   const temp = tmpdir();
 
   return {
+    resolveSymlinks: true,
+
     // 1. NETWORK RESTRICTIONS
     allowHosts: [
       'registry.npmjs.org',
