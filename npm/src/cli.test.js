@@ -81,7 +81,7 @@ describe('CLI E2E', () => {
     it('should print version with --version', async () => {
       const res = await runCli('--version');
       strict.equal(res.exitCode, 0);
-      strict.ok(res.stdout.includes('0.4.0'), 'version should include 0.4.0');
+      strict.ok(res.stdout.includes('0.5.0'), 'version should include 0.5.0');
     });
   });
 
@@ -149,10 +149,15 @@ describe('CLI E2E', () => {
       const res = await runCli(...basePaths, '--env', 'LONG_ENV_VAR=long_value', '--', nodeCmd, '-e', 'console.log(process.env.LONG_ENV_VAR)');
       assertSuccess(res, 'long_value');
     });
+
+    it('should accept --allow-loopback', async () => {
+      const res = await runEcho(['--allow-loopback'], 'loopback-test');
+      assertSuccess(res, 'loopback-test');
+    });
   });
 
   describe('Policy presets', () => {
-    const policies = ['npm', 'pypi', 'maven', 'cargo', 'rubygems', 'composer', 'deno', 'gomod', 'bun'];
+    const policies = ['npm', 'pypi', 'maven', 'cargo', 'rubygems', 'composer', 'deno', 'gomod', 'bun', 'poku', 'cdxgen'];
 
     for (const policy of policies) {
       it(`should accept policy preset: ${policy}`, async () => {

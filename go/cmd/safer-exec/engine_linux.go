@@ -316,6 +316,12 @@ func collectAuditLog(r *os.File) {
 }
 
 func runInit(cfg config.ExecConfig) error {
+	// Bring up loopback interface if network is disabled but loopback is allowed (Bug #7)
+	if cfg.DisableNetwork && cfg.AllowLoopback {
+		cmd := exec.Command("ip", "link", "set", "lo", "up")
+		_ = cmd.Run()
+	}
+
 	cgroupPath, err := setupCgroupV2(cfg)
 	if err != nil {
 		return fmt.Errorf("setting up cgroup v2: %w", err)
@@ -418,6 +424,26 @@ func setupCgroupV2(cfg config.ExecConfig) (string, error) {
 func cleanupCgroup(cgroupPath string) { _ = os.Remove(cgroupPath) }
 
 func setupFilesystem(cfg config.ExecConfig) error {
+	// Make working directory writable by default to match macOS behavior (Bug #6)
+	cwd := cfg.WorkingDir
+	if cwd == "" {
+		if d, err := os.Getwd(); err == nil {
+			cwd = d
+		}
+	}
+	if cwd != "" {
+		alreadyInWrite := false
+		for _, w := range cfg.WritePaths {
+			if w == cwd {
+				alreadyInWrite = true
+				break
+			}
+		}
+		if !alreadyInWrite {
+			cfg.WritePaths = append(cfg.WritePaths, cwd)
+		}
+	}
+
 	newRoot, err := os.MkdirTemp("", "safer-exec-root-*")
 	if err != nil {
 		return fmt.Errorf("mkdir temp root: %w", err)
@@ -526,6 +552,12 @@ const (
 func applyLandlockNetwork(cfg config.ExecConfig) error {
 	// Prevent unit tests from accidentally poisoning the Go test runner.
 	if os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
+		return nil
+	}
+
+	// If loopback is allowed and network is disabled, CLONE_NEWNET isolates everything.
+	// We don't need Landlock to restrict loopback ports.
+	if cfg.DisableNetwork && cfg.AllowLoopback {
 		return nil
 	}
 

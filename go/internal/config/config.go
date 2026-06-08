@@ -47,6 +47,9 @@ type ExecConfig struct {
 	// only for resolved IPs.
 	DisableNetwork bool `json:"disableNetwork"`
 
+	// AllowLoopback, when true, permits localhost/loopback connections.
+	AllowLoopback bool `json:"allowLoopback"`
+
 	// MaxMemoryMB caps the sandboxed process memory in megabytes.
 	// 0 means no limit. Applied via cgroup v2 memory.max on Linux;
 	// RLIMIT_AS on macOS.
@@ -191,6 +194,7 @@ type PolicyFile struct {
 
 	// Network
 	DisableNetwork bool     `json:"disableNetwork,omitempty"`
+	AllowLoopback  bool     `json:"allowLoopback,omitempty"`
 	AllowHosts     []string `json:"allowHosts,omitempty"`
 	AllowIPs       []string `json:"allowIPs,omitempty"`
 	AllowPorts     []int    `json:"allowPorts,omitempty"`

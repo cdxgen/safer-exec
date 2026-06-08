@@ -92,6 +92,11 @@ func run(cfg config.ExecConfig) error {
 		cmdPath = cfg.Cmd
 	}
 
+	// Show warning if resolved path is a symlink (Bug #1)
+	if realCmdPath, err := filepath.EvalSymlinks(cmdPath); err == nil && realCmdPath != cmdPath {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: %q is a symlink resolving to %q. macOS Seatbelt enforces rules against the real path. Please pass the real path directly or use 'readlink -f' to resolve it.\n", cmdPath, realCmdPath)
+	}
+
 	// Build the full command: sandbox-exec -f <profile> <cmd> <args...>
 	fullArgs := append([]string{"-f", tmpFile.Name(), cmdPath}, cfg.Args...)
 	cmd := exec.Command("sandbox-exec", fullArgs...)
@@ -191,6 +196,11 @@ func runLearn(cfg config.ExecConfig) error {
 	cmdPath, err := exec.LookPath(cfg.Cmd)
 	if err != nil {
 		cmdPath = cfg.Cmd
+	}
+
+	// Show warning if resolved path is a symlink (Bug #1)
+	if realCmdPath, err := filepath.EvalSymlinks(cmdPath); err == nil && realCmdPath != cmdPath {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: %q is a symlink resolving to %q. macOS Seatbelt enforces rules against the real path. Please pass the real path directly or use 'readlink -f' to resolve it.\n", cmdPath, realCmdPath)
 	}
 
 	// Run under sandbox-exec with trace profile
@@ -422,6 +432,16 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	// Always allow reading the working directory if specified
 	if cfg.WorkingDir != "" {
 		sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", cfg.WorkingDir))
+		// Add parent dirs of WorkingDir for getcwd() resolution (Bug #3)
+		dir := cfg.WorkingDir
+		for {
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break // reached root
+			}
+			sb.WriteString(fmt.Sprintf("(allow file-read* (literal %q))\n", parent))
+			dir = parent
+		}
 	}
 
 	// Always allow read/write to temp directories
@@ -430,6 +450,16 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		if p != "" {
 			sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", p))
 			sb.WriteString(fmt.Sprintf("(allow file-write* (subpath %q))\n", p))
+			// Add parent dirs of temp directories as literal read allows so getcwd() works (Bug #3)
+			dir := p
+			for {
+				parent := filepath.Dir(dir)
+				if parent == dir {
+					break
+				}
+				sb.WriteString(fmt.Sprintf("(allow file-read* (literal %q))\n", parent))
+				dir = parent
+			}
 		}
 	}
 
@@ -449,8 +479,18 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		resolvedIPs = append(resolvedIPs, resolveIPs(cfg.AllowHosts)...)
 	}
 
+	if cfg.AllowLoopback {
+		sb.WriteString("(allow network-bind (local ip \"localhost:*\"))\n")
+		sb.WriteString("(allow network-inbound (local ip \"localhost:*\"))\n")
+		sb.WriteString("(allow network-outbound (remote ip \"localhost:*\"))\n")
+	}
+
 	if cfg.DisableNetwork {
 		sb.WriteString("(deny network-outbound)\n")
+		// Re-allow loopback outbound specifically if loopback is permitted
+		if cfg.AllowLoopback {
+			sb.WriteString("(allow network-outbound (remote ip \"localhost:*\"))\n")
+		}
 		if len(cfg.AllowPorts) > 0 {
 			for _, port := range cfg.AllowPorts {
 				sb.WriteString(fmt.Sprintf("(allow network-outbound (remote ip \"*:%d\"))\n", port))

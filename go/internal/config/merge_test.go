@@ -209,6 +209,16 @@ func TestMergePolicies_DisableNetworkOR(t *testing.T) {
 	}
 }
 
+func TestMergePolicies_AllowLoopbackOR(t *testing.T) {
+	base := &PolicyFile{AllowLoopback: true}
+	observed := &PolicyFile{AllowLoopback: false}
+
+	merged := MergePolicies(base, observed)
+	if !merged.AllowLoopback {
+		t.Error("AllowLoopback should be true (OR)")
+	}
+}
+
 func TestMergePolicies_ResourceLimitBaseWins(t *testing.T) {
 	base := &PolicyFile{MaxMemoryMB: 512}
 	observed := &PolicyFile{MaxMemoryMB: 256}

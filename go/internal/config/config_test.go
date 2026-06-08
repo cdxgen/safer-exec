@@ -19,6 +19,7 @@ func TestExecConfigJSONRoundtrip(t *testing.T) {
 		AllowIPs:       []string{"93.184.216.34", "8.8.8.8"},
 		AllowPorts:     []int{80, 443},
 		DisableNetwork: false,
+		AllowLoopback:  true,
 		MaxMemoryMB:    512,
 		MaxCPUCores:    0.5,
 		MaxProcesses:   100,
@@ -51,6 +52,9 @@ func TestExecConfigJSONRoundtrip(t *testing.T) {
 	}
 	if decoded.DisableNetwork != original.DisableNetwork {
 		t.Errorf("DisableNetwork: got %v, want %v", decoded.DisableNetwork, original.DisableNetwork)
+	}
+	if decoded.AllowLoopback != original.AllowLoopback {
+		t.Errorf("AllowLoopback: got %v, want %v", decoded.AllowLoopback, original.AllowLoopback)
 	}
 	if decoded.MaxCPUCores != original.MaxCPUCores {
 		t.Errorf("MaxCPUCores: got %f, want %f", decoded.MaxCPUCores, original.MaxCPUCores)

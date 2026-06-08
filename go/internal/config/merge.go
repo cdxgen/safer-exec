@@ -53,6 +53,7 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	merged.AllowIPs = unionStrings(base.AllowIPs, observed.AllowIPs)
 	merged.AllowPorts = unionInts(base.AllowPorts, observed.AllowPorts)
 	merged.DisableNetwork = base.DisableNetwork || observed.DisableNetwork
+	merged.AllowLoopback = base.AllowLoopback || observed.AllowLoopback
 
 	// Environment — merge maps; observed keys overwrite base keys
 	if len(base.Env) > 0 || len(observed.Env) > 0 {

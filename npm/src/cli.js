@@ -69,6 +69,7 @@ Options:
   -t, --timeout=<ms>         Hard kill timeout in milliseconds
 
   -n, --disable-network      Disable all network access
+      --allow-loopback       Allow localhost/loopback connections
   -H, --allow-host=<host>    Allow network access to specific host (repeatable)
       --port=<port>          Allow network access to specific TCP port (repeatable)
 
@@ -139,6 +140,9 @@ function parseCliArgs() {
       'disable-network': {
         type: 'boolean',
         short: 'n',
+      },
+      'allow-loopback': {
+        type: 'boolean',
       },
       'max-memory': {
         type: 'string',
@@ -317,6 +321,9 @@ function buildExec(values, cmd, args) {
   // Network
   if (values['disable-network']) {
     exec.disableNetwork();
+  }
+  if (values['allow-loopback']) {
+    exec.allowLoopback();
   }
   if (values['allow-host'] && values['allow-host'].length > 0) {
     exec.allowHosts(...values['allow-host']);

@@ -1,6 +1,6 @@
 {
   "name": "@cdxgen/safer-exec",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "main": "./src/index.js",
   "bin": {
@@ -41,10 +41,10 @@
   },
   "homepage": "https://github.com/cdxgen/safer-exec#readme",
   "optionalDependencies": {
-    "@cdxgen/safer-exec-darwin-arm64": "0.4.0",
-    "@cdxgen/safer-exec-darwin-x64": "0.4.0",
-    "@cdxgen/safer-exec-linux-x64": "0.4.0",
-    "@cdxgen/safer-exec-linux-arm64": "0.4.0"
+    "@cdxgen/safer-exec-darwin-arm64": "0.5.0",
+    "@cdxgen/safer-exec-darwin-x64": "0.5.0",
+    "@cdxgen/safer-exec-linux-x64": "0.5.0",
+    "@cdxgen/safer-exec-linux-arm64": "0.5.0"
   },
   "engines": {
     "node": ">=20.0.0"

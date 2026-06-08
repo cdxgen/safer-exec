@@ -67,6 +67,8 @@ import { composerPolicy } from './policies/composer.js';
 import { denoPolicy } from './policies/deno.js';
 import { gomodPolicy } from './policies/gomod.js';
 import { bunPolicy } from './policies/bun.js';
+import { pokuPolicy } from './policies/poku.js';
+import { cdxgenPolicy } from './policies/cdxgen.js';
 
 // Resolve the path to the npm package root directory.
 // This is used to resolve relative binary paths relative to the package,
@@ -88,6 +90,8 @@ const POLICIES = {
   deno: denoPolicy,
   gomod: gomodPolicy,
   bun: bunPolicy,
+  poku: pokuPolicy,
+  cdxgen: cdxgenPolicy,
 };
 
 /**
@@ -140,6 +144,9 @@ export class SaferExec {
 
     /** @type {boolean} */
     this._disableNetwork = options.disableNetwork || false;
+
+    /** @type {boolean} */
+    this._allowLoopback = options.allowLoopback || false;
 
     /** @type {number} */
     this._maxMemoryMB = options.maxMemoryMB || 0;
@@ -241,6 +248,9 @@ export class SaferExec {
     if (policy.traceExec) {
       this._traceExec = true;
     }
+    if (policy.allowLoopback) {
+      this._allowLoopback = true;
+    }
 
     return this;
   }
@@ -294,6 +304,9 @@ export class SaferExec {
     // Network
     if (raw.disableNetwork) {
       this.disableNetwork();
+    }
+    if (raw.allowLoopback) {
+      this.allowLoopback();
     }
     if (Array.isArray(raw.allowHosts) && raw.allowHosts.length > 0) {
       this.allowHosts(...raw.allowHosts);
@@ -423,6 +436,16 @@ export class SaferExec {
    */
   disableNetwork() {
     this._disableNetwork = true;
+    return this;
+  }
+
+  /**
+   * Allow loopback/localhost connections.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  allowLoopback() {
+    this._allowLoopback = true;
     return this;
   }
 
@@ -770,6 +793,7 @@ export class SaferExec {
       allowIPs: this._allowIPs,
       allowPorts: this._allowPorts,
       disableNetwork: this._disableNetwork,
+      allowLoopback: this._allowLoopback,
       maxMemoryMB: this._maxMemoryMB,
       maxCPUCores: this._maxCPUCores,
       maxProcesses: this._maxProcesses,

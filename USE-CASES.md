@@ -147,7 +147,7 @@ jobs:
 
       - name: Download & Verify safer-exec Standalone Binary
         run: |
-          VERSION="0.4.0"
+          VERSION="0.5.0"
           # Download standalone binary and SHA checksum
           curl -L -O "https://github.com/cdxgen/safer-exec/releases/download/v${VERSION}/safer-exec-linux-amd64"
           curl -L -O "https://github.com/cdxgen/safer-exec/releases/download/v${VERSION}/safer-exec-linux-amd64.sha256"
@@ -178,7 +178,7 @@ steps:
   - checkout: self
 
   - script: |
-      VERSION="0.4.0"
+      VERSION="0.5.0"
       curl -L -o safer-exec "https://github.com/cdxgen/safer-exec/releases/download/v$(VERSION)/safer-exec-linux-amd64"
       curl -L -o safer-exec.sha256 "https://github.com/cdxgen/safer-exec/releases/download/v$(VERSION)/safer-exec-linux-amd64.sha256"
       sha256sum -c safer-exec.sha256

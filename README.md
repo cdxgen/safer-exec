@@ -32,7 +32,7 @@ You can download and verify the integrity of the standalone binaries using `curl
 OS="linux" # or "darwin"
 ARCH="amd64" # or "arm64"
 LIBC="" # or "-musl" for alpine/musl distributions
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 # Download binary and checksum files
 curl -L -O "https://github.com/cdxgen/safer-exec/releases/download/v${VERSION}/safer-exec-${OS}-${ARCH}${LIBC}"

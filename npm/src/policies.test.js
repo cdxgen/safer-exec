@@ -16,6 +16,8 @@ import { composerPolicy } from './policies/composer.js';
 import { denoPolicy } from './policies/deno.js';
 import { gomodPolicy } from './policies/gomod.js';
 import { bunPolicy } from './policies/bun.js';
+import { pokuPolicy } from './policies/poku.js';
+import { cdxgenPolicy } from './policies/cdxgen.js';
 
 describe('policies', () => {
   describe('npmPolicy', () => {
@@ -34,9 +36,28 @@ describe('policies', () => {
     });
   });
 
+  describe('pokuPolicy', () => {
+    it('should allow loopback but have blockFork false', () => {
+      const policy = pokuPolicy();
+      strict.equal(policy.allowLoopback, true);
+      strict.equal(policy.blockFork, false);
+      strict.deepEqual(policy.blockExec, []);
+    });
+  });
+
+  describe('cdxgenPolicy', () => {
+    it('should allow hosts, loopback, and blockFork false', () => {
+      const policy = cdxgenPolicy();
+      strict.ok(policy.allowHosts.length > 0);
+      strict.equal(policy.allowLoopback, true);
+      strict.equal(policy.blockFork, false);
+      strict.deepEqual(policy.blockExec, []);
+    });
+  });
+
   describe('policy defaults', () => {
-    it('all policies should have non-empty allowHosts', () => {
-      const policies = [npmPolicy, pypiPolicy, mavenPolicy, cargoPolicy, rubygemsPolicy, composerPolicy, denoPolicy, gomodPolicy, bunPolicy];
+    it('all standard ecosystem policies should have non-empty allowHosts', () => {
+      const policies = [npmPolicy, pypiPolicy, mavenPolicy, cargoPolicy, rubygemsPolicy, composerPolicy, denoPolicy, gomodPolicy, bunPolicy, cdxgenPolicy];
       for (const policyFn of policies) {
         strict.ok(policyFn().allowHosts.length > 0, `${policyFn.name} should have allowHosts`);
       }

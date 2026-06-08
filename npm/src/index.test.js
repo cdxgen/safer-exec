@@ -296,6 +296,13 @@ describe('SaferExec', () => {
       exec.enableLearn();
       strict.equal(exec._enableLearn, true);
     });
+
+    it('allowLoopback should be idempotent', () => {
+      const exec = new SaferExec();
+      exec.allowLoopback();
+      exec.allowLoopback();
+      strict.equal(exec._allowLoopback, true);
+    });
   });
 
   describe('applyPolicy', () => {
@@ -342,15 +349,20 @@ describe('SaferExec', () => {
       strict.ok(exec._readPaths.length > 0, 'should have readPaths');
     });
 
-    it('should apply all 11 policies without error', () => {
+    it('should apply all 13 policies without error', () => {
       const policies = [
         'npm', 'yarn', 'pnpm', 'pypi', 'maven',
-        'cargo', 'rubygems', 'composer', 'deno', 'gomod', 'bun'
+        'cargo', 'rubygems', 'composer', 'deno', 'gomod', 'bun',
+        'poku', 'cdxgen'
       ];
       for (const policy of policies) {
         const exec = new SaferExec();
         exec.applyPolicy(policy);
-        strict.ok(exec._allowHosts.length > 0, `${policy} should have hosts`);
+        if (policy !== 'poku') {
+          strict.ok(exec._allowHosts.length > 0, `${policy} should have hosts`);
+        } else {
+          strict.equal(exec._allowLoopback, true, 'poku should have allowLoopback');
+        }
       }
     });
 
