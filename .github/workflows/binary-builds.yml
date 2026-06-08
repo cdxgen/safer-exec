@@ -110,7 +110,15 @@ jobs:
           chmod +x "./${bin_name}"
           
           echo "Testing version flag..."
-          ./${bin_name} --version
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            docker run --rm \
+              -v "${{ github.workspace }}:${{ github.workspace }}" \
+              -w "${{ github.workspace }}" \
+              alpine:3.21 \
+              ./${bin_name} --version
+          else
+            ./${bin_name} --version
+          fi
           
           echo "Testing network sandboxing (should fail to resolve host)..."
           if [[ "${{ matrix.libc }}" == "musl" ]]; then
