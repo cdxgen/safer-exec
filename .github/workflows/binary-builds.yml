@@ -92,7 +92,7 @@ jobs:
             -v "${{ github.workspace }}:${{ github.workspace }}" \
             -w "${{ github.workspace }}" \
             alpine:3.21 \
-            sh -c "apk add --no-cache curl xz bash && \
+            sh -c "apk add --no-cache curl xz bash libstdc++ && \
                    NODE_ARCH=\$(if [ '${{ matrix.arch }}' = 'amd64' ]; then echo 'x64'; else echo 'arm64'; fi) && \
                    curl -fsSL -O https://unofficial-builds.nodejs.org/download/release/v22.11.0/node-v22.11.0-linux-\${NODE_ARCH}-musl.tar.xz && \
                    tar -xJf node-v22.11.0-linux-\${NODE_ARCH}-musl.tar.xz && \
@@ -122,7 +122,7 @@ jobs:
               -v "${{ github.workspace }}:${{ github.workspace }}" \
               -w "${{ github.workspace }}" \
               alpine:3.21 \
-              ./${bin_name} --version
+              sh -c "apk add --no-cache libstdc++ && ./${bin_name} --version"
           else
             ./${bin_name} --version
           fi
@@ -134,7 +134,7 @@ jobs:
               -v "${{ github.workspace }}:${{ github.workspace }}" \
               -w "${{ github.workspace }}" \
               alpine:3.21 \
-              sh -c "apk add --no-cache curl && ./${bin_name} --disable-network -- curl -I -m 2 https://api.github.com" && (echo "Error: Sandbox did not restrict network!" && exit 1) || echo "Network sandbox blocked request successfully!"
+              sh -c "apk add --no-cache curl libstdc++ && ./${bin_name} --disable-network -- curl -I -m 2 https://api.github.com" && (echo "Error: Sandbox did not restrict network!" && exit 1) || echo "Network sandbox blocked request successfully!"
           else
             ./${bin_name} --disable-network -- curl -I -m 2 https://api.github.com && (echo "Error: Sandbox did not restrict network!" && exit 1) || echo "Network sandbox blocked request successfully!"
           fi
