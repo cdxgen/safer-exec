@@ -204,6 +204,15 @@ Policies are plain JavaScript functions that return config objects. They are pla
 - On macOS, inspect generated Seatbelt profiles (temp `.sb` files)
 - On Linux, check `/proc/self/ns/` for namespace state
 
+### Policy Files in Agentic Workflows
+
+AI agents working with `safer-exec` can leverage policy files (`--policy-file`) to dynamically build and refine permissions:
+
+1. **Discover**: Execute commands with `--learn` and `--learn-output=policy.json` to observe necessary file and network access paths.
+2. **Refine**: Inspect the output policy JSON. Prune unnecessary paths or narrow broad directories to specific sub-paths (avoid blanket rules).
+3. **Iterate**: Run subsequent workflow steps with `--learn --policy-file=policy.json` to merge new operations into the existing policy.
+4. **Deploy**: Enforce the generated policy in production using `--policy-file=policy.json` (CLI) or `applyPolicyFile(path)` (Node.js API).
+
 ---
 
 ## Threat Model

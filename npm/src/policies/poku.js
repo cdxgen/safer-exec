@@ -61,6 +61,7 @@ export function pokuPolicy() {
       NODE_ENV: process.env.NODE_ENV || 'test',
       CI: process.env.CI || '',
       PNPM_HOME: process.env.PNPM_HOME || '',
+      SAFER_EXEC: 'true',
     },
 
     // 5. EXECUTION CONTROLS

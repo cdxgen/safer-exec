@@ -76,6 +76,7 @@ export function cdxgenPolicy() {
     env: {
       NODE_ENV: process.env.NODE_ENV || 'production',
       PATH: process.env.PATH || '',
+      SAFER_EXEC: 'true',
     },
 
     // 5. EXECUTION CONTROLS
