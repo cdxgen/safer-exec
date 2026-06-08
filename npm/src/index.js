@@ -53,7 +53,7 @@
 
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import { resolveHosts } from './net.js';
 import { run as runBinary } from './runner.js';
 import { npmPolicy } from './policies/npm.js';
@@ -783,6 +783,15 @@ export class SaferExec {
         }
       }
     }
+    
+    // Filter non-existent paths to prevent Go bind mount warnings/errors
+    effectiveReadPaths = effectiveReadPaths.filter(p => existsSync(p));
+    let effectiveWritePaths = [...this._writePaths].filter(p => existsSync(p));
+
+    // Deduplicate
+    effectiveReadPaths = Array.from(new Set(effectiveReadPaths));
+    effectiveWritePaths = Array.from(new Set(effectiveWritePaths));
+
 
     // Build the config object
     const config = {
@@ -790,7 +799,7 @@ export class SaferExec {
       args,
       env: Object.keys(this._env).length > 0 ? this._env : undefined,
       readPaths: effectiveReadPaths,
-      writePaths: this._writePaths,
+      writePaths: effectiveWritePaths,
       allowHosts: this._allowHosts,
       allowIPs: this._allowIPs,
       allowPorts: this._allowPorts,

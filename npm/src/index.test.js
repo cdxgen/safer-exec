@@ -676,6 +676,29 @@ describe('SaferExec', () => {
       strict.equal(result.exitCode, 0, 'should exit with code 0');
       strict.ok(result.stdout.includes('timed'), 'should capture output');
     });
+
+    it('should filter out non-existent paths centrally', async () => {
+      const exec = new SaferExec()
+        .readPaths('/nonexistent/path/to/read')
+        .writePaths('/nonexistent/path/to/write');
+
+      const result = await exec.run('echo', ['hello']);
+      strict.equal(result.exitCode, 0);
+    });
+
+    it('should handle direct file paths in read and write paths', async () => {
+      const tmpFile = join(tmpdir(), `safer-exec-file-test-${Date.now()}.txt`);
+      writeFileSync(tmpFile, 'hello file content');
+      try {
+        const result = await new SaferExec()
+          .readPaths(tmpFile)
+          .run('cat', [tmpFile]);
+        strict.equal(result.exitCode, 0);
+        strict.ok(result.stdout.includes('hello file content'));
+      } finally {
+        try { unlinkSync(tmpFile); } catch {}
+      }
+    });
   });
 
   describe('Security Hardening', () => {

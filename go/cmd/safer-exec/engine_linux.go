@@ -455,7 +455,23 @@ func setupFilesystem(cfg config.ExecConfig) error {
 
 	for _, path := range cfg.ReadPaths {
 		target := filepath.Join(newRoot, path)
-		if err := os.MkdirAll(target, 0o755); err == nil {
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if fi.IsDir() {
+			err = os.MkdirAll(target, 0o755)
+		} else {
+			err = os.MkdirAll(filepath.Dir(target), 0o755)
+			if err == nil {
+				var f *os.File
+				f, err = os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
+				if err == nil {
+					f.Close()
+				}
+			}
+		}
+		if err == nil {
 			// Linux requires bind mount and read-only remount to be separate steps.
 			// Using MS_REC ensures sub-mounts (like /run/systemd) are included.
 			if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
@@ -470,7 +486,23 @@ func setupFilesystem(cfg config.ExecConfig) error {
 	}
 	for _, path := range cfg.WritePaths {
 		target := filepath.Join(newRoot, path)
-		if err := os.MkdirAll(target, 0o755); err == nil {
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if fi.IsDir() {
+			err = os.MkdirAll(target, 0o755)
+		} else {
+			err = os.MkdirAll(filepath.Dir(target), 0o755)
+			if err == nil {
+				var f *os.File
+				f, err = os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
+				if err == nil {
+					f.Close()
+				}
+			}
+		}
+		if err == nil {
 			if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
 				if cfg.Strict {
 					return fmt.Errorf("bind mount %s: %w", path, err)
@@ -493,7 +525,7 @@ func setupFilesystemDiff(cfg config.ExecConfig) error {
 
 	var lowerDirs []string
 	for _, path := range append(cfg.ReadPaths, cfg.WritePaths...) {
-		if _, err := os.Stat(path); err == nil {
+		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
 			lowerDirs = append(lowerDirs, path)
 		}
 	}

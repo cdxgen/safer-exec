@@ -56,6 +56,22 @@ function getPnpmPaths() {
         extraPaths.push(dirname(realPath));
         extraPaths.push(realPath);
       }
+
+      // Whitelist the parent package root if pnpm is installed in a local node_modules layout (e.g. on CI)
+      const nmIdx = pnpmPath.indexOf('node_modules');
+      if (nmIdx !== -1) {
+        const rootDir = pnpmPath.substring(0, nmIdx);
+        if (rootDir) {
+          extraPaths.push(rootDir);
+        }
+      }
+      const realNmIdx = realPath.indexOf('node_modules');
+      if (realNmIdx !== -1) {
+        const realRootDir = realPath.substring(0, realNmIdx);
+        if (realRootDir) {
+          extraPaths.push(realRootDir);
+        }
+      }
     } catch {}
   }
   return extraPaths;
@@ -82,12 +98,7 @@ export function pnpmPolicy() {
       getNodeDir(),
       getNodeLibDir(),
       ...getSslPaths(),
-      join(cwd, 'package.json'),
-      join(cwd, 'package-lock.json'),
-      join(cwd, 'pnpm-lock.yaml'),
-      join(cwd, 'pnpm-workspace.yaml'), // Added: Essential for PNPM monorepos
-      join(cwd, '.npmrc'),
-      join(cwd, '.pnpmfile.cjs'),
+      cwd,
       join(home, '.npmrc'),             // Added: PNPM often requires global auth tokens
       join(home, '.config', 'pnpm'),    // Added: Global PNPM config path
       ...(process.platform === 'darwin' ? [join(home, 'Library', 'Preferences', 'pnpm')] : []),
