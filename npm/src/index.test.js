@@ -11,7 +11,8 @@ import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { SaferExec, saferExec } from './index.js';
 import { tmpdir } from 'node:os';
-import { realpathSync } from 'node:fs';
+import { join } from 'node:path';
+import { realpathSync, writeFileSync, unlinkSync } from 'node:fs';
 
 describe('SaferExec', () => {
   describe('constructor', () => {
@@ -438,6 +439,130 @@ describe('SaferExec', () => {
       const exec = new SaferExec();
       const result = exec.applyPolicy('npm');
       strict.equal(result, exec, 'applyPolicy should return this');
+    });
+  });
+
+  describe('applyPolicyFile', () => {
+    const tempPolicyPath = join(tmpdir(), `safer-exec-test-policy-${Date.now()}.json`);
+
+    it('should load a policy file and apply all fields correctly', () => {
+      const policyContent = {
+        name: 'test-policy',
+        version: '1',
+        description: 'test description',
+        readPaths: ['/tmp/read-test'],
+        writePaths: ['/tmp/write-test'],
+        disableNetwork: true,
+        allowHosts: ['example.com'],
+        allowIPs: ['127.0.0.1'],
+        allowPorts: [8080],
+        env: { TEST_ENV_VAR: 'test-value' },
+        allowExec: ['/bin/ls'],
+        blockExec: ['/bin/sh'],
+        blockFork: true,
+        traceExec: true,
+        enableAudit: true,
+        maxMemoryMB: 128,
+        maxCPUCores: 1.5,
+        maxProcesses: 10,
+        timeoutMs: 5000
+      };
+
+      writeFileSync(tempPolicyPath, JSON.stringify(policyContent));
+
+      try {
+        const exec = new SaferExec();
+        exec.applyPolicyFile(tempPolicyPath);
+
+        strict.equal(exec._policyFilePath, tempPolicyPath);
+        strict.deepEqual(exec._readPaths, ['/tmp/read-test']);
+        strict.deepEqual(exec._writePaths, ['/tmp/write-test']);
+        strict.equal(exec._disableNetwork, true);
+        strict.deepEqual(exec._allowHosts, ['example.com']);
+        strict.deepEqual(exec._allowIPs, ['127.0.0.1']);
+        strict.deepEqual(exec._allowPorts, [8080]);
+        strict.equal(exec._env.TEST_ENV_VAR, 'test-value');
+        strict.deepEqual(exec._allowExec, ['/bin/ls']);
+        strict.deepEqual(exec._blockExec, ['/bin/sh']);
+        strict.equal(exec._blockFork, true);
+        strict.equal(exec._traceExec, true);
+        strict.equal(exec._enableAudit, true);
+        strict.equal(exec._maxMemoryMB, 128);
+        strict.equal(exec._maxCPUCores, 1.5);
+        strict.equal(exec._maxProcesses, 10);
+        strict.equal(exec._timeoutMs, 5000);
+      } finally {
+        try { unlinkSync(tempPolicyPath); } catch {}
+      }
+    });
+
+    it('should merge policy with existing user settings (does not overwrite)', () => {
+      const policyContent = {
+        readPaths: ['/tmp/policy-read'],
+        allowHosts: ['policy.com']
+      };
+
+      writeFileSync(tempPolicyPath, JSON.stringify(policyContent));
+
+      try {
+        const exec = new SaferExec();
+        exec.readPaths('/tmp/user-read');
+        exec.allowHosts('user.com');
+        exec.applyPolicyFile(tempPolicyPath);
+
+        strict.ok(exec._readPaths.includes('/tmp/user-read'));
+        strict.ok(exec._readPaths.includes('/tmp/policy-read'));
+        strict.ok(exec._allowHosts.includes('user.com'));
+        strict.ok(exec._allowHosts.includes('policy.com'));
+      } finally {
+        try { unlinkSync(tempPolicyPath); } catch {}
+      }
+    });
+
+    it('should throw with clear error message for invalid JSON', () => {
+      writeFileSync(tempPolicyPath, 'not-a-json');
+
+      try {
+        const exec = new SaferExec();
+        strict.throws(() => {
+          exec.applyPolicyFile(tempPolicyPath);
+        }, /Invalid policy file|SyntaxError/);
+      } finally {
+        try { unlinkSync(tempPolicyPath); } catch {}
+      }
+    });
+
+    it('should not call disableNetwork if disableNetwork is false', () => {
+      const policyContent = {
+        disableNetwork: false
+      };
+
+      writeFileSync(tempPolicyPath, JSON.stringify(policyContent));
+
+      try {
+        const exec = new SaferExec();
+        exec.applyPolicyFile(tempPolicyPath);
+        strict.equal(exec._disableNetwork, false);
+      } finally {
+        try { unlinkSync(tempPolicyPath); } catch {}
+      }
+    });
+
+    it('should fall back to envVars from process.env if env map is not present', () => {
+      const policyContent = {
+        envVars: ['PATH', 'NON_EXISTENT_VAR_12345']
+      };
+
+      writeFileSync(tempPolicyPath, JSON.stringify(policyContent));
+
+      try {
+        const exec = new SaferExec();
+        exec.applyPolicyFile(tempPolicyPath);
+        strict.equal(exec._env.PATH, process.env.PATH);
+        strict.equal(exec._env.NON_EXISTENT_VAR_12345, undefined);
+      } finally {
+        try { unlinkSync(tempPolicyPath); } catch {}
+      }
     });
   });
 

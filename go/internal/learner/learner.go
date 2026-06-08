@@ -41,9 +41,12 @@ func New() *Learner {
 	}
 }
 
-// Learn runs the given command and returns a LearnedPolicy based on
-// observed behavior. It uses strace on Linux and Seatbelt trace on macOS.
-func (l *Learner) Learn(cfg config.ExecConfig) (*config.LearnedPolicy, error) {
+// Learn runs the given command and returns a PolicyFile based on
+// observed behavior. It uses strace on Linux and proc-based tracing as fallback.
+//
+// When cfg.PolicyFilePath is non-empty, the result is merged with the
+// existing file on disk and written back atomically.
+func (l *Learner) Learn(cfg config.ExecConfig) (*config.PolicyFile, error) {
 	// Try strace first (Linux), fall back to proc-based tracing
 	cmd, args := cfg.Cmd, cfg.Args
 
@@ -52,15 +55,15 @@ func (l *Learner) Learn(cfg config.ExecConfig) (*config.LearnedPolicy, error) {
 
 	// Try strace for comprehensive tracing
 	if stracePath, err := exec.LookPath("strace"); err == nil {
-		return l.learnWithStrace(stracePath, cmd, args, env, cfg.WorkingDir)
+		return l.learnWithStrace(cfg, stracePath, cmd, args, env, cfg.WorkingDir)
 	}
 
 	// Fall back to basic tracing (pre/post snapshot + network scan)
-	return l.learnBasic(cmd, args, env, cfg.WorkingDir)
+	return l.learnBasic(cfg, cmd, args, env, cfg.WorkingDir)
 }
 
 // learnWithStrace uses strace to capture all syscalls.
-func (l *Learner) learnWithStrace(stracePath, cmd string, args, env []string, workDir string) (*config.LearnedPolicy, error) {
+func (l *Learner) learnWithStrace(cfg config.ExecConfig, stracePath, cmd string, args, env []string, workDir string) (*config.PolicyFile, error) {
 	// strace flags:
 	// -e trace=openat,open,readlink,connect,recvfrom: trace file opens and network connects
 	// -o: output to file
@@ -96,7 +99,8 @@ func (l *Learner) learnWithStrace(stracePath, cmd string, args, env []string, wo
 		return nil, fmt.Errorf("parse strace log: %w", err)
 	}
 
-	return l.buildPolicy(cmd, args), nil
+	policy := l.buildPolicy(cmd, args)
+	return l.mergeAndWrite(cfg, policy), nil
 }
 
 // parseStraceLog parses the strace output file.
@@ -153,7 +157,7 @@ func (l *Learner) parseStraceLine(line string) {
 }
 
 // learnBasic falls back to pre/post snapshot comparison and network scanning.
-func (l *Learner) learnBasic(cmd string, args, env []string, workDir string) (*config.LearnedPolicy, error) {
+func (l *Learner) learnBasic(cfg config.ExecConfig, cmd string, args, env []string, workDir string) (*config.PolicyFile, error) {
 	// Capture pre-execution network state
 	preConns := getNetworkConnections()
 
@@ -193,13 +197,43 @@ func (l *Learner) learnBasic(cmd string, args, env []string, workDir string) (*c
 		}
 	}
 
-	return l.buildPolicy(cmd, args), nil
+	policy := l.buildPolicy(cmd, args)
+	return l.mergeAndWrite(cfg, policy), nil
 }
 
-// buildPolicy converts collected observations into a LearnedPolicy.
-func (l *Learner) buildPolicy(cmd string, args []string) *config.LearnedPolicy {
+// mergeAndWrite merges the observed policy with an existing file on disk
+// when cfg.PolicyFilePath is set, and writes the merged result back atomically.
+// Returns the (possibly merged) policy.
+func (l *Learner) mergeAndWrite(cfg config.ExecConfig, observed *config.PolicyFile) *config.PolicyFile {
+	if cfg.PolicyFilePath == "" {
+		return observed
+	}
+
+	// Read existing policy file
+	base, err := config.ReadPolicyFile(cfg.PolicyFilePath)
+	if err != nil {
+		// File doesn't exist yet or is unreadable — treat observed as the full policy
+		if err := config.WritePolicyFile(cfg.PolicyFilePath, observed); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: write policy file: %v\n", err)
+		}
+		return observed
+	}
+
+	// Merge observed into base
+	merged := config.MergePolicies(base, observed)
+
+	// Write merged policy back atomically
+	if err := config.WritePolicyFile(cfg.PolicyFilePath, merged); err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: write merged policy file: %v\n", err)
+	}
+
+	return merged
+}
+
+// buildPolicy converts collected observations into a PolicyFile.
+func (l *Learner) buildPolicy(cmd string, args []string) *config.PolicyFile {
 	// Initialize all slices to empty arrays (not nil) so JSON serializes as [] not null
-	policy := &config.LearnedPolicy{
+	policy := &config.PolicyFile{
 		Cmd:        cmd,
 		Args:       args,
 		ReadPaths:  []string{},

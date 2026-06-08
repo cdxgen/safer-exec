@@ -53,7 +53,7 @@
 
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolveHosts } from './net.js';
 import { run as runBinary } from './runner.js';
 import { npmPolicy } from './policies/npm.js';
@@ -191,6 +191,9 @@ export class SaferExec {
 
     /** @type {boolean} Treat sandbox setup warnings as errors */
     this._strict = options.strict || false;
+
+    /** @type {string} Path to the policy file if loaded or merging */
+    this._policyFilePath = options.policyFilePath || '';
   }
 
   /**
@@ -237,6 +240,115 @@ export class SaferExec {
     }
     if (policy.traceExec) {
       this._traceExec = true;
+    }
+
+    return this;
+  }
+
+  /**
+   * Load a policy file (JSON) and apply it to this instance.
+   *
+   * The policy file format matches the output of `--learn --learn-output`.
+   * All fields are optional; zero values mean "no restriction".
+   *
+   * This method is applied AFTER `applyPolicy()` (named preset) and BEFORE
+   * per-flag CLI overrides. A policy file augments a named preset, and
+   * explicit CLI flags always win.
+   *
+   * When combined with `--learn`, the policy file is used as the base for
+   * merging newly observed behavior. The merged result is written back
+   * to the file atomically.
+   *
+   * @param {string} filePath - Path to the JSON policy file
+   * @returns {SaferExec} This instance for chaining
+   * @throws {Error} If the file cannot be read or parsed
+   *
+   * @example
+   * // Load a saved policy file
+   * const result = await new SaferExec()
+   *   .applyPolicyFile('./my-policy.json')
+   *   .run('npm', ['install']);
+   *
+   * @example
+   * // Combine a named preset with a custom policy file
+   * const result = await new SaferExec()
+   *   .applyPolicy('npm')
+   *   .applyPolicyFile('./extra-paths.json')
+   *   .run('npm', ['install']);
+   */
+  applyPolicyFile(filePath) {
+    this._policyFilePath = filePath;
+    const raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new Error(`Invalid policy file: ${filePath}`);
+    }
+
+    // Filesystem paths
+    if (Array.isArray(raw.readPaths) && raw.readPaths.length > 0) {
+      this.readPaths(...raw.readPaths);
+    }
+    if (Array.isArray(raw.writePaths) && raw.writePaths.length > 0) {
+      this.writePaths(...raw.writePaths);
+    }
+
+    // Network
+    if (raw.disableNetwork) {
+      this.disableNetwork();
+    }
+    if (Array.isArray(raw.allowHosts) && raw.allowHosts.length > 0) {
+      this.allowHosts(...raw.allowHosts);
+    }
+    if (Array.isArray(raw.allowIPs) && raw.allowIPs.length > 0) {
+      this._allowIPs = [...new Set([...(this._allowIPs ?? []), ...raw.allowIPs])];
+    }
+    if (Array.isArray(raw.allowPorts) && raw.allowPorts.length > 0) {
+      this.allowPorts(...raw.allowPorts);
+    }
+
+    // Environment — prefer env map; fall back to envVars list
+    if (raw.env && typeof raw.env === 'object' && !Array.isArray(raw.env)) {
+      for (const [k, v] of Object.entries(raw.env)) {
+        this.env(k, v);
+      }
+    } else if (Array.isArray(raw.envVars)) {
+      for (const name of raw.envVars) {
+        if (typeof name === 'string' && process.env[name] !== undefined) {
+          this.env(name, process.env[name]);
+        }
+      }
+    }
+
+    // Exec / fork controls
+    if (Array.isArray(raw.allowExec) && raw.allowExec.length > 0) {
+      this.allowExec(...raw.allowExec);
+    }
+    if (Array.isArray(raw.blockExec) && raw.blockExec.length > 0) {
+      this.blockExec(...raw.blockExec);
+    }
+    if (raw.blockFork) {
+      this.blockFork();
+    }
+
+    // Observability
+    if (raw.traceExec) {
+      this.traceExec();
+    }
+    if (raw.enableAudit) {
+      this.enableAudit();
+    }
+
+    // Resource limits
+    if (raw.maxMemoryMB) {
+      this.maxMemory(raw.maxMemoryMB);
+    }
+    if (raw.maxCPUCores) {
+      this.maxCPUCores(raw.maxCPUCores);
+    }
+    if (raw.maxProcesses) {
+      this.maxProcesses(raw.maxProcesses);
+    }
+    if (raw.timeoutMs) {
+      this.timeout(raw.timeoutMs);
     }
 
     return this;
@@ -672,6 +784,7 @@ export class SaferExec {
       traceExec: this._traceExec,
       dumpProfile: this._dumpProfile,
       strict: this._strict,
+      policyFilePath: this._policyFilePath,
     };
 
     // Determine effective timeout: use explicit timeout or default to 60s

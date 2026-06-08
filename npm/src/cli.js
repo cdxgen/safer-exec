@@ -133,6 +133,9 @@ function parseCliArgs() {
         type: 'string',
         short: 'p',
       },
+      'policy-file': {
+        type: 'string',
+      },
       'disable-network': {
         type: 'boolean',
         short: 'n',
@@ -228,6 +231,7 @@ function parseCliArgs() {
     },
     withValue: [
       'policy',
+      'policy-file',
       'max-memory',
       'max-cpu',
       'max-processes',
@@ -282,6 +286,16 @@ function buildExec(values, cmd, args) {
       exec.applyPolicy(values.policy);
     } catch (err) {
       process.stderr.write(`[safer-exec] Error: ${err.message}\n`);
+      process.exit(1);
+    }
+  }
+
+  // Apply policy file (after named preset; CLI flags still override)
+  if (values['policy-file']) {
+    try {
+      exec.applyPolicyFile(values['policy-file']);
+    } catch (err) {
+      process.stderr.write(`[safer-exec] Error loading policy file: ${err.message}\n`);
       process.exit(1);
     }
   }

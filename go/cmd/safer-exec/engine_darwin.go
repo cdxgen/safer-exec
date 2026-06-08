@@ -217,6 +217,17 @@ func runLearn(cfg config.ExecConfig) error {
 
 	policy := parser.BuildPolicy(cfg.Cmd, cfg.Args)
 
+	// If --policy-file was also given, merge with existing file and write back
+	if cfg.PolicyFilePath != "" {
+		base, err := config.ReadPolicyFile(cfg.PolicyFilePath)
+		if err == nil {
+			policy = config.MergePolicies(base, policy)
+		}
+		if err := config.WritePolicyFile(cfg.PolicyFilePath, policy); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: write merged policy file: %v\n", err)
+		}
+	}
+
 	// Output the learned policy — prepend newline to ensure it's on its own line
 	// even if the command output doesn't end with a newline
 	data, err := json.Marshal(policy)

@@ -118,6 +118,11 @@ type ExecConfig struct {
 	// Strict, when true, treats sandbox initialization warnings as errors
 	// (e.g. cgroup, landlock, or seccomp errors) instead of bypassing them.
 	Strict bool `json:"strict"`
+
+	// PolicyFilePath is the path to a policy file on disk. When both
+	// EnableLearn and PolicyFilePath are set, the learner merges newly
+	// observed behavior into the existing file and writes it back atomically.
+	PolicyFilePath string `json:"policyFilePath,omitempty"`
 }
 
 // AuditEntry represents a single sandbox violation or event.
@@ -167,33 +172,57 @@ type FSDiff struct {
 	Deleted []FSDiffEntry `json:"deleted,omitempty"`
 }
 
-// LearnedPolicy is the auto-generated policy from learning mode.
-// It represents a strict, minimal policy based on observed behavior.
-type LearnedPolicy struct {
-	// ReadPaths are filesystem paths the process actually read.
-	ReadPaths []string `json:"readPaths"`
+// PolicyFile is the portable, round-trippable sandbox policy format.
+// It is both the output of --learn (written to --learn-output) and
+// the input to --policy-file. All fields are optional; zero values mean
+// "no restriction" or "inherit from other config".
+//
+// Schema version "1" is the current format. Future breaking changes
+// increment the version string.
+type PolicyFile struct {
+	// Metadata (informational only, preserved during merges)
+	Name        string `json:"name,omitempty"`
+	Version     string `json:"version,omitempty"`
+	Description string `json:"description,omitempty"`
 
-	// WritePaths are filesystem paths the process actually wrote.
-	WritePaths []string `json:"writePaths"`
+	// Filesystem
+	ReadPaths  []string `json:"readPaths,omitempty"`
+	WritePaths []string `json:"writePaths,omitempty"`
 
-	// AllowHosts are hostnames the process connected to.
-	AllowHosts []string `json:"allowHosts"`
+	// Network
+	DisableNetwork bool     `json:"disableNetwork,omitempty"`
+	AllowHosts     []string `json:"allowHosts,omitempty"`
+	AllowIPs       []string `json:"allowIPs,omitempty"`
+	AllowPorts     []int    `json:"allowPorts,omitempty"`
 
-	// AllowIPs are IP addresses the process connected to.
-	AllowIPs []string `json:"allowIPs"`
+	// Environment — prefer Env map; EnvVars is legacy (list of names only)
+	Env     map[string]string `json:"env,omitempty"`
+	EnvVars []string          `json:"envVars,omitempty"`
 
-	// AllowPorts are TCP ports the process connected to.
-	AllowPorts []int `json:"allowPorts"`
+	// Exec / fork controls
+	AllowExec []string `json:"allowExec,omitempty"`
+	BlockExec []string `json:"blockExec,omitempty"`
+	BlockFork bool     `json:"blockFork,omitempty"`
 
-	// EnvVars are environment variables the process accessed.
-	EnvVars []string `json:"envVars,omitempty"`
+	// Resource limits (0 = no limit)
+	MaxMemoryMB  int     `json:"maxMemoryMB,omitempty"`
+	MaxCPUCores  float64 `json:"maxCPUCores,omitempty"`
+	MaxProcesses int     `json:"maxProcesses,omitempty"`
+	TimeoutMs    int     `json:"timeoutMs,omitempty"`
 
-	// Cmd is the command that was learned.
-	Cmd string `json:"cmd"`
+	// Observability
+	TraceExec   bool `json:"traceExec,omitempty"`
+	EnableAudit bool `json:"enableAudit,omitempty"`
 
-	// Args are the arguments used during learning.
-	Args []string `json:"args"`
+	// Informational — set by learner, ignored when loading as policy-file
+	Cmd  string   `json:"cmd,omitempty"`
+	Args []string `json:"args,omitempty"`
 }
+
+// LearnedPolicy is a type alias for backward compatibility.
+// New code should use PolicyFile directly.
+// Deprecated: use PolicyFile instead.
+type LearnedPolicy = PolicyFile
 
 // ExecResult is the output returned to the JS runner after execution.
 // It contains stdout, stderr, exit code, and optional additional data.

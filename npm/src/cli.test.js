@@ -11,6 +11,7 @@ import { execFile } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
+import { writeFileSync, unlinkSync, readFileSync } from 'node:fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, 'cli.js');
@@ -261,6 +262,61 @@ describe('CLI E2E', () => {
     it('should accept --audit flag', async () => {
       const res = await runEcho(['--audit'], 'audit-test');
       assertSuccess(res, 'audit-test');
+    });
+  });
+
+  describe('Policy file flag', () => {
+    it('should fail when policy file does not exist', async () => {
+      const res = await runCli('--policy-file', 'nonexistent-policy-file-12345.json', '--', 'echo', 'test');
+      strict.notEqual(res.exitCode, 0);
+      strict.ok(res.stderr.includes('Error loading policy file') || res.stderr.includes('ENOENT'));
+    });
+
+    it('should load a valid policy file and run command', async () => {
+      const tempPolicy = join(tmpdir(), `cli-test-policy-${Date.now()}.json`);
+      writeFileSync(tempPolicy, JSON.stringify({
+        readPaths: [tmpdir()]
+      }));
+
+      try {
+        const res = await runEcho(['--policy-file', tempPolicy], 'policy-file-test');
+        assertSuccess(res, 'policy-file-test');
+      } finally {
+        try { unlinkSync(tempPolicy); } catch {}
+      }
+    });
+
+    it('should support combining --policy-file with other CLI options', async () => {
+      const tempPolicy = join(tmpdir(), `cli-test-policy-combine-${Date.now()}.json`);
+      writeFileSync(tempPolicy, JSON.stringify({
+        readPaths: [tmpdir()]
+      }));
+
+      try {
+        const res = await runEcho(['--policy-file', tempPolicy, '--read-path', '/etc'], 'policy-file-combine-test');
+        assertSuccess(res, 'policy-file-combine-test');
+      } finally {
+        try { unlinkSync(tempPolicy); } catch {}
+      }
+    });
+
+    it('should merge new observations into the policy file with --learn', async () => {
+      const tempPolicy = join(tmpdir(), `cli-test-policy-learn-${Date.now()}.json`);
+      // Start with a valid policy file
+      writeFileSync(tempPolicy, JSON.stringify({
+        readPaths: ['/etc']
+      }));
+
+      try {
+        const res = await runEcho(['--learn', '--policy-file', tempPolicy], 'policy-file-learn-test');
+        assertSuccess(res, 'policy-file-learn-test');
+
+        // Check if the policy file was written back and contains some entries
+        const content = JSON.parse(readFileSync(tempPolicy, 'utf8'));
+        strict.ok(content.readPaths && content.readPaths.length > 0);
+      } finally {
+        try { unlinkSync(tempPolicy); } catch {}
+      }
     });
   });
 });

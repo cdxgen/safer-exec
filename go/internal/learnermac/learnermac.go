@@ -90,10 +90,10 @@ func (p *TraceParser) parseLine(line string) {
 	}
 }
 
-// BuildPolicy converts the parsed trace into a LearnedPolicy.
-func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.LearnedPolicy {
+// BuildPolicy converts the parsed trace into a PolicyFile.
+func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.PolicyFile {
 	// Initialize all slices to empty arrays (not nil) so JSON serializes as [] not null
-	policy := &config.LearnedPolicy{
+	policy := &config.PolicyFile{
 		Cmd:        cmd,
 		Args:       args,
 		ReadPaths:  []string{},
