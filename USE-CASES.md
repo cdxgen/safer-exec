@@ -124,3 +124,71 @@ const runner = new SaferExec()
 ```
 
 This forces the process to run entirely within its single initial memory space and denies any `child_process` execution attempts.
+
+---
+
+## Standalone Binary in CI/CD Pipelines (Zero-Dependency Sandboxing)
+
+In CI/CD environments (like GitHub Actions or Azure Pipelines), you can use the pre-built standalone binaries to execute untrusted scripts or package installers (e.g. `npm install`, `pip install`) with zero dependencies on Node.js or global package installations.
+
+### 1. GitHub Actions Integration
+
+Use this pattern to securely install dependencies during a workflow run:
+
+```yaml
+name: Secure Build
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download & Verify safer-exec Standalone Binary
+        run: |
+          VERSION="0.4.0"
+          # Download standalone binary and SHA checksum
+          curl -L -O "https://github.com/cdxgen/safer-exec/releases/download/v${VERSION}/safer-exec-linux-amd64"
+          curl -L -O "https://github.com/cdxgen/safer-exec/releases/download/v${VERSION}/safer-exec-linux-amd64.sha256"
+
+          # Verify checksum integrity
+          sha256sum -c safer-exec-linux-amd64.sha256
+          chmod +x safer-exec-linux-amd64
+          mv safer-exec-linux-amd64 /usr/local/bin/safer-exec
+
+      - name: Secure dependency installation
+        run: |
+          # Run npm install using the pre-built npm policy preset
+          safer-exec --policy=npm -- npm install
+```
+
+### 2. Azure Pipelines Integration
+
+Apply the same protection inside Azure Pipelines:
+
+```yaml
+trigger:
+  - main
+
+pool:
+  vmImage: "ubuntu-latest"
+
+steps:
+  - checkout: self
+
+  - script: |
+      VERSION="0.4.0"
+      curl -L -o safer-exec "https://github.com/cdxgen/safer-exec/releases/download/v$(VERSION)/safer-exec-linux-amd64"
+      curl -L -o safer-exec.sha256 "https://github.com/cdxgen/safer-exec/releases/download/v$(VERSION)/safer-exec-linux-amd64.sha256"
+      sha256sum -c safer-exec.sha256
+      chmod +x safer-exec
+      sudo mv safer-exec /usr/local/bin/
+    displayName: "Install safer-exec Standalone"
+
+  - script: |
+      safer-exec --policy=npm -- npm install
+    displayName: "Secure npm install"
+```
+
+Using the standalone binary ensures that even if Node.js or other tools are not yet configured on the runner, process sandboxing works out of the box.

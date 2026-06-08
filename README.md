@@ -10,6 +10,46 @@ On macOS the Go binary generates Seatbelt profiles and runs commands through `sa
 npm install @cdxgen/safer-exec
 ```
 
+## Standalone SEA Binaries
+
+For environments without Node.js, or when you want to execute sandboxed commands directly using a standalone binary, pre-built Single Executable Application (SEA) binaries are published to GitHub Releases.
+
+These binaries are fully self-contained, wrapping Node.js and the statically compiled Go engine into a single executable.
+
+### Supported Platforms and Architectures
+
+- **macOS Intel (`darwin-amd64`)**
+- **macOS Apple Silicon (`darwin-arm64`)**
+- **Linux GNU (`linux-amd64`, `linux-arm64`)**
+- **Linux Musl (`linux-amd64-musl`, `linux-arm64-musl`)**
+
+### Download and Verification
+
+You can download and verify the integrity of the standalone binaries using `curl` and `sha256`:
+
+```bash
+# Set parameters
+OS="linux" # or "darwin"
+ARCH="amd64" # or "arm64"
+LIBC="" # or "-musl" for alpine/musl distributions
+VERSION="0.4.0"
+
+# Download binary and checksum files
+curl -L -O "https://github.com/cdxgen/safer-exec/releases/download/v${VERSION}/safer-exec-${OS}-${ARCH}${LIBC}"
+curl -L -O "https://github.com/cdxgen/safer-exec/releases/download/v${VERSION}/safer-exec-${OS}-${ARCH}${LIBC}.sha256"
+
+# Verify checksum
+if [[ "$OS" == "darwin" ]]; then
+  shasum -a 256 -c "safer-exec-${OS}-${ARCH}${LIBC}.sha256"
+else
+  sha256sum -c "safer-exec-${OS}-${ARCH}${LIBC}.sha256"
+fi
+
+# Make binary executable and run
+chmod +x "safer-exec-${OS}-${ARCH}${LIBC}"
+./safer-exec-${OS}-${ARCH}${LIBC} --version
+```
+
 ## Prerequisites
 
 **macOS:** Works out of the box using the built-in `sandbox-exec`.
@@ -17,11 +57,11 @@ npm install @cdxgen/safer-exec
 **Linux:**
 
 - **Learning Mode** requires `strace` to be installed (`sudo apt install strace`).
-- On most distributions (Debian, Fedora, Arch, Ubuntu ≤ 23.10) safer-exec works out of the box with full namespace isolation.
+- On most distributions (Debian, Fedora, Arch, Alpine/Musl, Ubuntu ≤ 23.10) safer-exec works out of the box with full namespace isolation.
 - On **Ubuntu 24.04+** user namespace creation is restricted by AppArmor by default. safer-exec automatically detects this and falls back to **reduced isolation mode** (seccomp-bpf + Landlock only; no filesystem, PID, or network namespace isolation). A warning is printed. See [Full Isolation on Ubuntu 24.04+](#full-isolation-on-ubuntu-2404) below to restore full isolation with an AppArmor profile.
 
 **Linux Resource Limits (Cgroup v2):**
-By default, `systemd` does not allow unprivileged users to apply CPU, Memory, or PID limits. If you want to use `.maxMemory()`, `.maxCPUCores()`, or `.maxProcesses()` on Linux without running as `root`, you must enable `systemd` user delegation on your machine:
+By default, `systemd`-based distributions do not allow unprivileged users to apply CPU, Memory, or PID limits. If you want to use `.maxMemory()`, `.maxCPUCores()`, or `.maxProcesses()` on systemd distributions without running as `root`, you must enable `systemd` user delegation on your machine:
 
 ```bash
 # Enable CPU, Memory, and PID delegation for user sessions
@@ -32,7 +72,9 @@ sudo systemctl daemon-reload
 # You may need to log out and log back in for changes to take effect.
 ```
 
-_Note: If cgroup v2 delegation is not configured, `safer-exec` will gracefully skip the resource limits and print a warning, but will still enforce all other sandbox constraints (filesystem, network, syscalls)._
+*Note on Alpine Linux (OpenRC):* Alpine Linux uses OpenRC as the init system instead of systemd. OpenRC mounts cgroup v2 automatically at `/sys/fs/cgroup`. The systemd user delegation configuration above is not required; resource limits will be applied directly to the cgroup hierarchy.
+
+_Note: If cgroup v2 delegation is not configured or available (e.g. inside restricted Docker containers), `safer-exec` will gracefully skip the resource limits and print a warning, but will still enforce all other sandbox constraints (filesystem, network, syscalls)._
 
 ## Linux Isolation Modes
 

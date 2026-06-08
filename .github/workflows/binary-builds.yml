@@ -1,0 +1,151 @@
+name: Standalone Binary Builds
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/**'
+      - '.github/workflows/binary-builds.yml'
+      - 'npm/**'
+      - 'go/**'
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ darwin, linux ]
+        arch: [ amd64, arm64 ]
+        libc: [ gnu, musl ]
+        exclude:
+          - os: darwin
+            libc: musl
+        include:
+          - os: darwin
+            arch: amd64
+            runner: macos-15-intel
+            ext: ''
+          - os: darwin
+            arch: arm64
+            runner: macos-15
+            ext: ''
+          - os: linux
+            arch: amd64
+            runner: ubuntu-24.04
+            ext: ''
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            ext: ''
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version: "1.26"
+
+      - name: Use Node.js
+        if: ${{ matrix.libc != 'musl' }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Build for Darwin or Linux GNU
+        if: ${{ matrix.libc != 'musl' }}
+        run: |
+          TARGET_OS="${{ matrix.os }}" TARGET_ARCH="${{ matrix.arch }}" OUTPUT_BINARY="safer-exec-${{ matrix.os }}-${{ matrix.arch }}" bash .github/scripts/build-standalone.sh
+
+      - name: Build for Linux Musl (Alpine Docker)
+        if: ${{ matrix.libc == 'musl' }}
+        run: |
+          # First compile Go binary on the host runner to avoid installing Go inside Docker
+          echo "Compiling static Go binary on host for Linux ${{ matrix.arch }}..."
+          (cd go && CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/)
+
+          # Now run caxa inside an Alpine container which has a musl Node.js
+          echo "Packaging standalone binary inside Alpine Docker..."
+          docker run --rm \
+            -v "${{ github.workspace }}:${{ github.workspace }}" \
+            -w "${{ github.workspace }}" \
+            alpine:3.21 \
+            sh -c "apk add --no-cache nodejs npm bash && TARGET_OS=linux TARGET_ARCH=${{ matrix.arch }} OUTPUT_BINARY=safer-exec-linux-${{ matrix.arch }}-musl bash .github/scripts/build-standalone.sh"
+
+      - name: Allow unprivileged user namespaces (ubuntu-24.04)
+        if: ${{ matrix.os == 'linux' }}
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Verify Standalone Sandbox Behavior
+        shell: bash
+        run: |
+          suffix=""
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            suffix="-musl"
+          fi
+          bin_name="safer-exec-${{ matrix.os }}-${{ matrix.arch }}${suffix}"
+          
+          chmod +x "./${bin_name}"
+          
+          echo "Testing version flag..."
+          ./${bin_name} --version
+          
+          echo "Testing network sandboxing (should fail to resolve host)..."
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            docker run --rm \
+              --privileged \
+              -v "${{ github.workspace }}:${{ github.workspace }}" \
+              -w "${{ github.workspace }}" \
+              alpine:3.21 \
+              sh -c "apk add --no-cache curl && ./${bin_name} --disable-network -- curl -I -m 2 https://api.github.com" && (echo "Error: Sandbox did not restrict network!" && exit 1) || echo "Network sandbox blocked request successfully!"
+          else
+            ./${bin_name} --disable-network -- curl -I -m 2 https://api.github.com && (echo "Error: Sandbox did not restrict network!" && exit 1) || echo "Network sandbox blocked request successfully!"
+          fi
+
+      - name: Generate Checksums
+        shell: bash
+        run: |
+          # Locate output binary
+          suffix=""
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            suffix="-musl"
+          fi
+          bin_name="safer-exec-${{ matrix.os }}-${{ matrix.arch }}${suffix}"
+          
+          if [[ "${{ matrix.os }}" == "darwin" ]]; then
+            shasum -a 256 "$bin_name" > "${bin_name}.sha256"
+          else
+            sha256sum "$bin_name" > "${bin_name}.sha256"
+          fi
+          cat "${bin_name}.sha256"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: safer-exec-standalone-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.libc }}
+          path: |
+            safer-exec-${{ matrix.os }}-${{ matrix.arch }}*
+          if-no-files-found: error
+
+      - name: Release standalone binary
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            safer-exec-${{ matrix.os }}-${{ matrix.arch }}*

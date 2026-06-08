@@ -80,7 +80,11 @@ func TestSetupCgroupV2_Memory(t *testing.T) {
 	}
 	defer cleanupCgroup(path)
 	data, _ := os.ReadFile(filepath.Join(path, "memory.max"))
-	if strings.TrimSpace(string(data)) != "268435456" {
+	val := strings.TrimSpace(string(data))
+	if val == "" {
+		t.Skip("memory controller not enabled in cgroup subtree_control")
+	}
+	if val != "268435456" {
 		t.Errorf("got %s", data)
 	}
 }
@@ -91,7 +95,11 @@ func TestSetupCgroupV2_CPU(t *testing.T) {
 	}
 	defer cleanupCgroup(path)
 	data, _ := os.ReadFile(filepath.Join(path, "cpu.max"))
-	if strings.TrimSpace(string(data)) != "50000 100000" {
+	val := strings.TrimSpace(string(data))
+	if val == "" {
+		t.Skip("cpu controller not enabled in cgroup subtree_control")
+	}
+	if val != "50000 100000" {
 		t.Errorf("got %s", data)
 	}
 }
@@ -102,7 +110,11 @@ func TestSetupCgroupV2_PIDs(t *testing.T) {
 	}
 	defer cleanupCgroup(path)
 	data, _ := os.ReadFile(filepath.Join(path, "pids.max"))
-	if strings.TrimSpace(string(data)) != "12" {
+	val := strings.TrimSpace(string(data))
+	if val == "" {
+		t.Skip("pids controller not enabled in cgroup subtree_control")
+	}
+	if val != "12" {
 		t.Errorf("got %s", data)
 	}
 }
