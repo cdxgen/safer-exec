@@ -9,6 +9,7 @@
 
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { statSync, realpathSync } from 'node:fs';
 import { getSslPaths } from './sslhelper.js';
 
 function getNodeDir() {
@@ -18,6 +19,46 @@ function getNodeDir() {
 function getNodeLibDir() {
   const nodeDir = getNodeDir();
   return nodeDir.replace(/bin$/, 'lib');
+}
+
+function getPnpmPaths() {
+  const extraPaths = [];
+  const paths = (process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':');
+
+  let pnpmPath = null;
+  for (const p of paths) {
+    const fullPath = join(p, 'pnpm');
+    try {
+      if (statSync(fullPath).isFile()) {
+        pnpmPath = fullPath;
+        break;
+      }
+    } catch {}
+    if (process.platform === 'win32') {
+      for (const ext of ['.exe', '.cmd', '.bat']) {
+        try {
+          if (statSync(fullPath + ext).isFile()) {
+            pnpmPath = fullPath + ext;
+            break;
+          }
+        } catch {}
+      }
+      if (pnpmPath) break;
+    }
+  }
+
+  if (pnpmPath) {
+    try {
+      const realPath = realpathSync(pnpmPath);
+      extraPaths.push(dirname(pnpmPath));
+      extraPaths.push(pnpmPath);
+      if (realPath !== pnpmPath) {
+        extraPaths.push(dirname(realPath));
+        extraPaths.push(realPath);
+      }
+    } catch {}
+  }
+  return extraPaths;
 }
 
 /**
@@ -51,6 +92,7 @@ export function pnpmPolicy() {
       join(home, '.config', 'pnpm'),    // Added: Global PNPM config path
       ...(process.platform === 'darwin' ? [join(home, 'Library', 'Preferences', 'pnpm')] : []),
       temp,                             // Added: Temp dir is required for staging tarballs
+      ...getPnpmPaths(),
     ],
 
     // 3. WRITE PATHS
