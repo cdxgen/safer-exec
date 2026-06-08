@@ -73,6 +73,12 @@ jobs:
         run: |
           TARGET_OS="${{ matrix.os }}" TARGET_ARCH="${{ matrix.arch }}" OUTPUT_BINARY="safer-exec-${{ matrix.os }}-${{ matrix.arch }}" bash .github/scripts/build-standalone.sh
 
+      - name: Get user info
+        id: user_info
+        if: ${{ matrix.os == 'linux' }}
+        run: |
+          echo "user=$(id -u):$(id -g)" >> $GITHUB_OUTPUT
+
       - name: Build for Linux Musl (Alpine Docker)
         if: ${{ matrix.libc == 'musl' }}
         run: |
@@ -86,7 +92,7 @@ jobs:
             -v "${{ github.workspace }}:${{ github.workspace }}" \
             -w "${{ github.workspace }}" \
             alpine:3.21 \
-            sh -c "apk add --no-cache nodejs npm bash && TARGET_OS=linux TARGET_ARCH=${{ matrix.arch }} OUTPUT_BINARY=safer-exec-linux-${{ matrix.arch }}-musl bash .github/scripts/build-standalone.sh"
+            sh -c "apk add --no-cache nodejs npm bash && TARGET_OS=linux TARGET_ARCH=${{ matrix.arch }} OUTPUT_BINARY=safer-exec-linux-${{ matrix.arch }}-musl bash .github/scripts/build-standalone.sh && chown -R ${{ steps.user_info.outputs.user }} ."
 
       - name: Allow unprivileged user namespaces (ubuntu-24.04)
         if: ${{ matrix.os == 'linux' }}
