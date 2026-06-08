@@ -94,9 +94,9 @@ jobs:
             alpine:3.21 \
             sh -c "apk add --no-cache curl xz bash libstdc++ && \
                    NODE_ARCH=\$(if [ '${{ matrix.arch }}' = 'amd64' ]; then echo 'x64'; else echo 'arm64'; fi) && \
-                   curl -fsSL -O https://unofficial-builds.nodejs.org/download/release/v22.11.0/node-v22.11.0-linux-\${NODE_ARCH}-musl.tar.xz && \
-                   tar -xJf node-v22.11.0-linux-\${NODE_ARCH}-musl.tar.xz && \
-                   export PATH=\"\$(pwd)/node-v22.11.0-linux-\${NODE_ARCH}-musl/bin:\$PATH\" && \
+                   curl -fsSL -O https://unofficial-builds.nodejs.org/download/release/v24.14.1/node-v24.14.1-linux-\${NODE_ARCH}-musl.tar.xz && \
+                   tar -xJf node-v24.14.1-linux-\${NODE_ARCH}-musl.tar.xz && \
+                   export PATH=\"\$(pwd)/node-v24.14.1-linux-\${NODE_ARCH}-musl/bin:\$PATH\" && \
                    node --version && \
                    TARGET_OS=linux TARGET_ARCH=${{ matrix.arch }} OUTPUT_BINARY=safer-exec-linux-${{ matrix.arch }}-musl bash .github/scripts/build-standalone.sh && \
                    chown -R ${{ steps.user_info.outputs.user }} ."
