@@ -81,7 +81,7 @@ describe('CLI E2E', () => {
     it('should print version with --version', async () => {
       const res = await runCli('--version');
       strict.equal(res.exitCode, 0);
-      strict.ok(res.stdout.includes('0.5.0'), 'version should include 0.5.0');
+      strict.ok(res.stdout.includes('0.6.0'), 'version should include 0.6.0');
     });
   });
 

@@ -10,10 +10,15 @@
 
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { realpathSync } from 'node:fs';
 import { getSslPaths } from './sslhelper.js';
 
 function getNodeDir() {
-  return dirname(process.execPath);
+  try {
+    return dirname(realpathSync(process.execPath));
+  } catch {
+    return dirname(process.execPath);
+  }
 }
 
 function getNodeLibDir() {
@@ -42,7 +47,6 @@ export function cdxgenPolicy() {
       'crates.io',
       'proxy.golang.org',
       'goproxy.io',
-      'goproxy.cn',
     ],
     allowLoopback: true,      // Allow local localhost binding/connecting
 
@@ -58,8 +62,9 @@ export function cdxgenPolicy() {
       join(home, '.cargo'),
       join(home, '.npm'),
       join(home, '.config', 'pnpm'),
-      '/Users/prabhu/work/cdxgen/cdxgen',
-      '/Users/prabhu/work/cdxgen/safer-exec',
+      '/usr',
+      '/opt',
+      '/etc',
     ],
 
     // 3. WRITE PATHS
@@ -74,13 +79,12 @@ export function cdxgenPolicy() {
 
     // 4. ENVIRONMENT CONTROLS
     env: {
-      NODE_ENV: process.env.NODE_ENV || 'production',
       PATH: process.env.PATH || '',
       SAFER_EXEC: 'true',
     },
 
     // 5. EXECUTION CONTROLS
-    blockFork: false,          // SCA needs to spawn package managers
+    blockFork: false,          // Needs to spawn package managers
     blockExec: [],             // Allow execution of child processes (mvn, gradle, npm, pip, go, cargo, etc.)
   };
 }

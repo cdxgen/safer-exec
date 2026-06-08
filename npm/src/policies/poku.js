@@ -58,7 +58,6 @@ export function pokuPolicy() {
 
     // 4. ENVIRONMENT CONTROLS
     env: {
-      NODE_ENV: process.env.NODE_ENV || 'test',
       CI: process.env.CI || '',
       PNPM_HOME: process.env.PNPM_HOME || '',
       SAFER_EXEC: 'true',

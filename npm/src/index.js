@@ -69,6 +69,7 @@ import { gomodPolicy } from './policies/gomod.js';
 import { bunPolicy } from './policies/bun.js';
 import { pokuPolicy } from './policies/poku.js';
 import { cdxgenPolicy } from './policies/cdxgen.js';
+import { pnpmInstallPolicy } from './policies/pnpmInstall.js';
 
 // Resolve the path to the npm package root directory.
 // This is used to resolve relative binary paths relative to the package,
@@ -92,6 +93,7 @@ const POLICIES = {
   bun: bunPolicy,
   poku: pokuPolicy,
   cdxgen: cdxgenPolicy,
+  pnpmInstall: pnpmInstallPolicy,
 };
 
 /**

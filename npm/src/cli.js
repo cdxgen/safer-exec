@@ -384,7 +384,7 @@ function buildExec(values, cmd, args) {
   }
 
   const options = {
-    timeout: values.timeout ? parseNumeric(values.timeout, 'timeout') + 2000 : 62000,
+    timeout: values.timeout ? parseNumeric(values.timeout, 'timeout') + 2000 : 0,
     enableAudit: values.audit || values['trace-exec'],
   };
 

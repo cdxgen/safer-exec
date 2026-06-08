@@ -49,6 +49,7 @@ export function pnpmPolicy() {
       join(cwd, '.pnpmfile.cjs'),
       join(home, '.npmrc'),             // Added: PNPM often requires global auth tokens
       join(home, '.config', 'pnpm'),    // Added: Global PNPM config path
+      ...(process.platform === 'darwin' ? [join(home, 'Library', 'Preferences', 'pnpm')] : []),
       temp,                             // Added: Temp dir is required for staging tarballs
     ],
 
