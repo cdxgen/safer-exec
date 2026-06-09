@@ -24,7 +24,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, platform, arch } from 'node:os';
+import { createRequire } from 'node:module';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -34,7 +35,8 @@ const __dirname = dirname(__filename);
  *
  * Tries the following in order:
  * 1. A locally compiled binary in the go/bin directory
- * 2. The 'safer-exec' command in PATH
+ * 2. Platform-specific optional dependency package
+ * 3. The 'safer-exec' command in PATH
  *
  * @returns {string} The absolute path to the Go binary
  * @throws {Error} If no binary can be found for the current platform
@@ -47,6 +49,39 @@ export function resolveBinaryPath() {
     return localBinary;
   } catch {
     // Not compiled yet
+  }
+
+  // Try to resolve from platform-specific optional dependencies
+  const currentPlatform = platform();
+  const currentArch = arch();
+  let pkgName = '';
+
+  if (currentPlatform === 'darwin') {
+    if (currentArch === 'arm64') {
+      pkgName = '@cdxgen/safer-exec-darwin-arm64';
+    } else if (currentArch === 'x64') {
+      pkgName = '@cdxgen/safer-exec-darwin-amd64';
+    }
+  } else if (currentPlatform === 'linux') {
+    if (currentArch === 'x64') {
+      pkgName = '@cdxgen/safer-exec-linux-amd64';
+    } else if (currentArch === 'arm64') {
+      pkgName = '@cdxgen/safer-exec-linux-arm64';
+    }
+  }
+
+  if (pkgName) {
+    try {
+      const require = createRequire(import.meta.url);
+      const pkgJsonPath = require.resolve(`${pkgName}/package.json`);
+      const pkgDir = dirname(pkgJsonPath);
+      const binaryPath = join(pkgDir, 'bin', 'safer-exec');
+      if (existsSync(binaryPath)) {
+        return binaryPath;
+      }
+    } catch (_err) {
+      // Package not installed
+    }
   }
 
   // Try PATH
