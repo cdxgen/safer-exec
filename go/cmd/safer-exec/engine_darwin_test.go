@@ -471,3 +471,78 @@ func TestReadConfig_InvalidJSON(t *testing.T) {
 		t.Error("should error on invalid JSON")
 	}
 }
+
+func TestCheckSensitiveEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		env      map[string]string
+		expected []string // expected strings in the stderr output
+		none     bool     // if true, expect no warning output
+	}{
+		{
+			name: "no sensitive vars",
+			env: map[string]string{
+				"PATH": "/usr/bin",
+				"HOME": "/home/user",
+			},
+			none: true,
+		},
+		{
+			name: "single sensitive var token suffix",
+			env: map[string]string{
+				"GITHUB_TOKEN": "secret123",
+				"PATH":         "/usr/bin",
+			},
+			expected: []string{"GITHUB_TOKEN"},
+		},
+		{
+			name: "multiple sensitive vars sorted",
+			env: map[string]string{
+				"MY_SECRET":   "abc",
+				"API_KEY":     "def",
+				"COOKIE_DATA": "ghi",
+				"NORMAL_VAR":  "jkl",
+			},
+			expected: []string{"API_KEY", "COOKIE_DATA", "MY_SECRET"},
+		},
+		{
+			name: "case insensitive match",
+			env: map[string]string{
+				"my_auth_token": "xyz",
+				"normal":        "123",
+			},
+			expected: []string{"my_auth_token"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			oldStderr := os.Stderr
+			r, w, _ := os.Pipe()
+			os.Stderr = w
+
+			checkSensitiveEnv(tc.env)
+			w.Close()
+			os.Stderr = oldStderr
+
+			outBytes, _ := io.ReadAll(r)
+			out := string(outBytes)
+
+			if tc.none {
+				if out != "" {
+					t.Errorf("expected no warning output, got: %q", out)
+				}
+			} else {
+				prefix := "safer-exec: warning: sensitive environment variables detected:"
+				if !strings.HasPrefix(out, prefix) {
+					t.Errorf("expected output to start with %q, got: %q", prefix, out)
+				}
+				for _, exp := range tc.expected {
+					if !strings.Contains(out, exp) {
+						t.Errorf("expected warning to mention %q, got: %q", exp, out)
+					}
+				}
+			}
+		})
+	}
+}

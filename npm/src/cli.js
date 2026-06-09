@@ -148,6 +148,21 @@ function parseCliArgs() {
         type: 'string',
         short: 'm',
       },
+      'allow-crypto': {
+        type: 'boolean',
+      },
+      'block-crypto': {
+        type: 'boolean',
+      },
+      'block-crypto-entropy': {
+        type: 'boolean',
+      },
+      'detect-fips': {
+        type: 'boolean',
+      },
+      'strict-fips': {
+        type: 'boolean',
+      },
       'max-cpu': {
         type: 'string',
         short: 'c',
@@ -381,6 +396,21 @@ function buildExec(values, cmd, args) {
   }
   if (values.strict) {
     exec.strict();
+  }
+  if (values['allow-crypto'] !== undefined) {
+    exec.allowCrypto(values['allow-crypto']);
+  }
+  if (values['block-crypto']) {
+    exec.blockCrypto();
+  }
+  if (values['block-crypto-entropy']) {
+    exec.blockCryptoEntropy();
+  }
+  if (values['detect-fips']) {
+    exec.detectFIPS();
+  }
+  if (values['strict-fips']) {
+    exec.strictFIPS();
   }
 
   const options = {

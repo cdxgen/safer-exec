@@ -188,6 +188,7 @@ Policies are plain JavaScript functions that return config objects. They are pla
 4. Add method to `SaferExec` class in `npm/src/index.js`
 5. Add CLI flag in `npm/src/cli.js`
 6. Add tests to both platform test files and Node.js tests
+7. **Update documentation** (update README.md to describe the new configuration settings, CLI flags, and API methods)
 
 ### Adding a New Ecosystem Policy
 

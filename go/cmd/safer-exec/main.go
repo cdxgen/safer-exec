@@ -35,6 +35,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
+	"strings"
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
 )
@@ -79,7 +81,7 @@ func main() {
 
 	// Handle version flag
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
-		fmt.Println("safer-exec 0.6.3")
+		fmt.Println("safer-exec 0.6.4")
 		return
 	}
 
@@ -90,6 +92,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Detect and warn about sensitive environment variables prior to execution
+	checkSensitiveEnv(cfg.Env)
+
 	// Delegate to the platform-specific engine
 	runErr := run(cfg)
 	if runErr != nil {
@@ -98,6 +103,29 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "safer-exec: %v\n", runErr)
 		os.Exit(1)
+	}
+}
+
+// checkSensitiveEnv scans the environment variables map for keys containing
+// sensitive suffixes/substrings case-insensitively and prints a consolidated warning to Stderr.
+func checkSensitiveEnv(env map[string]string) {
+	if len(env) == 0 {
+		return
+	}
+	var detected []string
+	patterns := []string{"TOKEN", "PASSWORD", "SECRET", "API_KEY", "CLIENT_SECRET", "SESSION", "COOKIE", "AUTH", "KEY"}
+	for k := range env {
+		uk := strings.ToUpper(k)
+		for _, p := range patterns {
+			if strings.Contains(uk, p) {
+				detected = append(detected, k)
+				break
+			}
+		}
+	}
+	if len(detected) > 0 {
+		sort.Strings(detected)
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: sensitive environment variables detected: %s\n", strings.Join(detected, ", "))
 	}
 }
 

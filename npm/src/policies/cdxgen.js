@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { realpathSync } from 'node:fs';
 import { getSslPaths } from './sslhelper.js';
+import { getPnpmPaths } from './pnpm.js';
 
 function getNodeDir() {
   try {
@@ -65,6 +66,7 @@ export function cdxgenPolicy() {
       '/usr',
       '/opt',
       '/etc',
+      ...getPnpmPaths(),
     ],
 
     // 3. WRITE PATHS
@@ -80,7 +82,6 @@ export function cdxgenPolicy() {
     // 4. ENVIRONMENT CONTROLS
     env: {
       PATH: process.env.PATH || '',
-      SAFER_EXEC: 'true',
     },
 
     // 5. EXECUTION CONTROLS

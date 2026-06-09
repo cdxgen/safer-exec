@@ -277,6 +277,28 @@ func (l *Learner) buildPolicy(cmd string, args []string) *config.PolicyFile {
 	}
 	sort.Strings(policy.EnvVars)
 
+	// Determine AllowCrypto based on observed reads
+	// Default to allowCrypto: true if any crypto-related path was read.
+	hasCryptoRead := false
+	hasEntropyRead := false
+	hasFIPSRead := false
+	for p := range l.readPaths {
+		up := strings.ToLower(p)
+		if strings.Contains(up, "libcrypto") || strings.Contains(up, "libssl") || strings.Contains(up, "/ssl") || strings.Contains(up, "security") {
+			hasCryptoRead = true
+		}
+		if strings.Contains(up, "/dev/random") || strings.Contains(up, "/dev/urandom") {
+			hasEntropyRead = true
+		}
+		if strings.Contains(up, "fips_enabled") || strings.Contains(up, "fips.so") || strings.Contains(up, "fips.dylib") {
+			hasFIPSRead = true
+		}
+	}
+	policy.AllowCrypto = hasCryptoRead
+	policy.BlockCrypto = !hasCryptoRead
+	policy.BlockCryptoEntropy = !hasEntropyRead
+	policy.FIPSDetected = hasFIPSRead
+
 	return policy
 }
 

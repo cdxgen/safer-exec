@@ -257,6 +257,54 @@ func TestMergePolicies_MaxCPUCoresMerge(t *testing.T) {
 	}
 }
 
+func TestMergePolicies_CryptoControls(t *testing.T) {
+	base := &PolicyFile{
+		AllowCrypto:        true,
+		BlockCrypto:        false,
+		BlockCryptoEntropy: true,
+	}
+	observed := &PolicyFile{
+		AllowCrypto:        false,
+		BlockCrypto:        true,
+		BlockCryptoEntropy: false,
+	}
+
+	merged := MergePolicies(base, observed)
+	if !merged.AllowCrypto {
+		t.Error("AllowCrypto should be true (OR)")
+	}
+	if !merged.BlockCrypto {
+		t.Error("BlockCrypto should be true (OR)")
+	}
+	if !merged.BlockCryptoEntropy {
+		t.Error("BlockCryptoEntropy should be true (OR)")
+	}
+}
+
+func TestMergePolicies_FIPSControls(t *testing.T) {
+	base := &PolicyFile{
+		DetectFIPS:   true,
+		StrictFIPS:   false,
+		FIPSDetected: true,
+	}
+	observed := &PolicyFile{
+		DetectFIPS:   false,
+		StrictFIPS:   true,
+		FIPSDetected: false,
+	}
+
+	merged := MergePolicies(base, observed)
+	if !merged.DetectFIPS {
+		t.Error("DetectFIPS should be true (OR)")
+	}
+	if !merged.StrictFIPS {
+		t.Error("StrictFIPS should be true (OR)")
+	}
+	if !merged.FIPSDetected {
+		t.Error("FIPSDetected should be true (OR)")
+	}
+}
+
 func TestMergePolicies_MaxProcessesMerge(t *testing.T) {
 	base := &PolicyFile{MaxProcesses: 100}
 	observed := &PolicyFile{MaxProcesses: 50}

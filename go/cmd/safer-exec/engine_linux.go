@@ -456,7 +456,55 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		return fmt.Errorf("mount tmpfs: %w", err)
 	}
 
+	// Setup custom restricted /dev inside newRoot if BlockCryptoEntropy is true.
+	// Normally we'd bind mount host /dev. Let's look at what is bind-mounted or if dev is created.
+	// We'll create dev directory:
+	devDir := filepath.Join(newRoot, "dev")
+	_ = os.MkdirAll(devDir, 0o755)
+	if cfg.BlockCryptoEntropy {
+		// Create empty files for random/urandom so they are empty read-only or blocked.
+		// This intercepts any access to them.
+		if f, err := os.Create(filepath.Join(devDir, "random")); err == nil {
+			f.Close()
+		}
+		if f, err := os.Create(filepath.Join(devDir, "urandom")); err == nil {
+			f.Close()
+		}
+	} else {
+		// Bind mount host /dev to newRoot/dev
+		_ = syscall.Mount("/dev", devDir, "", syscall.MS_BIND|syscall.MS_REC, "")
+	}
+
+	// Setup FIPS simulation if requested
+	if cfg.DetectFIPS || cfg.StrictFIPS {
+		fipsDir := filepath.Join(newRoot, "proc", "sys", "crypto")
+		_ = os.MkdirAll(fipsDir, 0o755)
+		fipsVal := "0"
+		// Check if host actually has FIPS enabled
+		if hostFips, err := os.ReadFile("/proc/sys/crypto/fips_enabled"); err == nil {
+			fipsVal = strings.TrimSpace(string(hostFips))
+		}
+		// If StrictFIPS is enabled, we require fips_enabled to be 1
+		if cfg.StrictFIPS && fipsVal != "1" {
+			// Fail or audit FIPS compliance issue prior to launch
+			logAuditEntry("fips-violation", "Host is not in FIPS-compliant mode")
+			if cfg.Strict {
+				return fmt.Errorf("FIPS strict enforcement failed: host has FIPS disabled")
+			}
+		}
+		// Write the value to the container proc to simulate or mirror it
+		_ = os.WriteFile(filepath.Join(fipsDir, "fips_enabled"), []byte(fipsVal+"\n"), 0o644)
+		logAuditEntry("fips-check", fmt.Sprintf("FIPS mode status: %s", fipsVal))
+	}
+
 	for _, path := range cfg.ReadPaths {
+		// If BlockCrypto is true, skip ssl/certs and crypto libraries if they are read paths
+		if cfg.BlockCrypto {
+			if strings.Contains(path, "/etc/ssl") || strings.Contains(path, "/usr/lib/ssl") || strings.Contains(path, "/etc/security") {
+				continue
+			}
+		}
+
 		target := filepath.Join(newRoot, path)
 		fi, err := os.Stat(path)
 		if err != nil {

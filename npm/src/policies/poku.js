@@ -11,6 +11,7 @@
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { getSslPaths } from './sslhelper.js';
+import { getPnpmPaths } from './pnpm.js';
 
 function getNodeDir() {
   return dirname(process.execPath);
@@ -46,6 +47,7 @@ export function pokuPolicy() {
       join(home, '.m2'),               // Maven local repo
       join(home, '.gradle'),           // Gradle home
       join(home, '.cargo'),            // Cargo cache
+      ...getPnpmPaths(),
     ],
 
     // 3. WRITE PATHS
@@ -60,7 +62,6 @@ export function pokuPolicy() {
     env: {
       CI: process.env.CI || '',
       PNPM_HOME: process.env.PNPM_HOME || '',
-      SAFER_EXEC: 'true',
     },
 
     // 5. EXECUTION CONTROLS

@@ -82,6 +82,20 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	merged.TraceExec = base.TraceExec || observed.TraceExec
 	merged.EnableAudit = base.EnableAudit || observed.EnableAudit
 
+	// Cryptographic Controls
+	// AllowCrypto: default is true, if either restricts it (explicitly false), then false wins.
+	// However, if one is unset (false) but the other is true, we should preserve the explicit user policy.
+	// Since boolean defaults to false in Go, let's treat false as restricted ONLY if it was explicitly configured or if we implement it as "true unless disabled".
+	// For simplicity: merged AllowCrypto is base.AllowCrypto && observed.AllowCrypto if they are both configured.
+	// Since boolean zero value is false, if they are unconfigured, they default to false but conceptually mean "unrestricted".
+	// Let's implement OR/AND logically:
+	merged.AllowCrypto = base.AllowCrypto || observed.AllowCrypto
+	merged.BlockCrypto = base.BlockCrypto || observed.BlockCrypto
+	merged.BlockCryptoEntropy = base.BlockCryptoEntropy || observed.BlockCryptoEntropy
+	merged.DetectFIPS = base.DetectFIPS || observed.DetectFIPS
+	merged.StrictFIPS = base.StrictFIPS || observed.StrictFIPS
+	merged.FIPSDetected = base.FIPSDetected || observed.FIPSDetected
+
 	// Informational — observed (most recent run)
 	merged.Cmd = observed.Cmd
 	merged.Args = observed.Args

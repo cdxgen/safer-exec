@@ -126,6 +126,27 @@ func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.PolicyFile 
 	}
 	sort.Ints(policy.AllowPorts)
 
+	// Determine Crypto and FIPS controls based on observed paths
+	hasCryptoRead := false
+	hasEntropyRead := false
+	hasFIPSRead := false
+	for path := range p.readPaths {
+		up := strings.ToLower(path)
+		if strings.Contains(up, "libcrypto") || strings.Contains(up, "libssl") || strings.Contains(up, "/ssl") || strings.Contains(up, "security") {
+			hasCryptoRead = true
+		}
+		if strings.Contains(up, "/dev/random") || strings.Contains(up, "/dev/urandom") {
+			hasEntropyRead = true
+		}
+		if strings.Contains(up, "fips_enabled") || strings.Contains(up, "fips.so") || strings.Contains(up, "fips.dylib") {
+			hasFIPSRead = true
+		}
+	}
+	policy.AllowCrypto = hasCryptoRead
+	policy.BlockCrypto = !hasCryptoRead
+	policy.BlockCryptoEntropy = !hasEntropyRead
+	policy.FIPSDetected = hasFIPSRead
+
 	return policy
 }
 

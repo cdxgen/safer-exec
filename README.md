@@ -72,7 +72,7 @@ sudo systemctl daemon-reload
 # You may need to log out and log back in for changes to take effect.
 ```
 
-*Note on Alpine Linux (OpenRC):* Alpine Linux uses OpenRC as the init system instead of systemd. OpenRC mounts cgroup v2 automatically at `/sys/fs/cgroup`. The systemd user delegation configuration above is not required; resource limits will be applied directly to the cgroup hierarchy.
+_Note on Alpine Linux (OpenRC):_ Alpine Linux uses OpenRC as the init system instead of systemd. OpenRC mounts cgroup v2 automatically at `/sys/fs/cgroup`. The systemd user delegation configuration above is not required; resource limits will be applied directly to the cgroup hierarchy.
 
 _Note: If cgroup v2 delegation is not configured or available (e.g. inside restricted Docker containers), `safer-exec` will gracefully skip the resource limits and print a warning, but will still enforce all other sandbox constraints (filesystem, network, syscalls)._
 
@@ -294,28 +294,33 @@ Full help: `safer-exec --help`.
 
 `new SaferExec(options?)`
 
-| Option           | Type       | Default         | Description                               |
-| ---------------- | ---------- | --------------- | ----------------------------------------- |
-| `allowHosts`     | `string[]` | `[]`            | Hostnames to allow network access to      |
-| `readPaths`      | `string[]` | `[]`            | Filesystem paths to read from             |
-| `writePaths`     | `string[]` | `[]`            | Filesystem paths to write to              |
-| `env`            | `Object`   | `{}`            | Environment variables to set              |
-| `disableNetwork` | `boolean`  | `false`         | Cut all network access                    |
-| `maxMemoryMB`    | `number`   | `0`             | Memory limit in megabytes                 |
-| `maxCPUCores`    | `number`   | `0`             | CPU limit as fractional cores             |
-| `maxProcesses`   | `number`   | `0`             | Max child processes (anti-fork bomb)      |
-| `timeoutMs`      | `number`   | `0`             | Hard kill timeout in milliseconds         |
-| `workingDir`     | `string`   | `process.cwd()` | Working directory                         |
-| `binaryPath`     | `string`   | auto-resolved   | Override Go binary path                   |
-| `enableAudit`    | `boolean`  | `false`         | Enable violation auditing                 |
-| `allowPorts`     | `number[]` | `[]`            | TCP ports to allow                        |
-| `enableDiff`     | `boolean`  | `false`         | Enable filesystem mutation diffing        |
-| `enableLearn`    | `boolean`  | `false`         | Enable behavioral auto-profiling          |
-| `allowExec`      | `string[]` | `[]`            | Executables the command is allowed to run |
-| `blockExec`      | `string[]` | `[]`            | Executables to block from running         |
-| `blockFork`      | `boolean`  | `false`         | Prevent forking new processes             |
-| `traceExec`      | `boolean`  | `false`         | Log every child process spawned           |
-| `strict`         | `boolean`  | `false`         | Treat sandbox setup warnings as errors    |
+| Option               | Type       | Default         | Description                                |
+| -------------------- | ---------- | --------------- | ------------------------------------------ |
+| `allowHosts`         | `string[]` | `[]`            | Hostnames to allow network access to       |
+| `readPaths`          | `string[]` | `[]`            | Filesystem paths to read from              |
+| `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to               |
+| `env`                | `Object`   | `{}`            | Environment variables to set               |
+| `disableNetwork`     | `boolean`  | `false`         | Cut all network access                     |
+| `maxMemoryMB`        | `number`   | `0`             | Memory limit in megabytes                  |
+| `maxCPUCores`        | `number`   | `0`             | CPU limit as fractional cores              |
+| `maxProcesses`       | `number`   | `0`             | Max child processes (anti-fork bomb)       |
+| `timeoutMs`          | `number`   | `0`             | Hard kill timeout in milliseconds          |
+| `workingDir`         | `string`   | `process.cwd()` | Working directory                          |
+| `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                    |
+| `enableAudit`        | `boolean`  | `false`         | Enable violation auditing                  |
+| `allowPorts`         | `number[]` | `[]`            | TCP ports to allow                         |
+| `enableDiff`         | `boolean`  | `false`         | Enable filesystem mutation diffing         |
+| `enableLearn`        | `boolean`  | `false`         | Enable behavioral auto-profiling           |
+| `allowExec`          | `string[]` | `[]`            | Executables the command is allowed to run  |
+| `blockExec`          | `string[]` | `[]`            | Executables to block from running          |
+| `blockFork`          | `boolean`  | `false`         | Prevent forking new processes              |
+| `traceExec`          | `boolean`  | `false`         | Log every child process spawned            |
+| `strict`             | `boolean`  | `false`         | Treat sandbox setup warnings as errors     |
+| `allowCrypto`        | `boolean`  | `true`          | Permit cryptographic library/device access |
+| `blockCrypto`        | `boolean`  | `false`         | Block system crypto libraries access       |
+| `blockCryptoEntropy` | `boolean`  | `false`         | Block entropy (/dev/random) device access  |
+| `detectFIPS`         | `boolean`  | `false`         | Enable FIPS compliance checks/logging      |
+| `strictFIPS`         | `boolean`  | `false`         | Force strict FIPS validation               |
 
 ### Instance Methods
 
@@ -345,6 +350,11 @@ All methods return `this` for chaining except `.run()`.
 | `.traceExec()`          | Log every child process spawned                |
 | `.strict()`             | Treat sandbox setup warnings as hard errors    |
 | `.resolveSymlinks()`    | Resolve target command symlink in PATH         |
+| `.allowCrypto(allow)`   | Allow/disallow cryptographic operations        |
+| `.blockCrypto()`        | Restrict system cryptographic libraries        |
+| `.blockCryptoEntropy()` | Restrict entropy devices (/dev/random)         |
+| `.detectFIPS()`         | Log and watch for FIPS lookups                 |
+| `.strictFIPS()`         | Restrict runtime to strict FIPS compliant mode |
 
 ### `.run(cmd, args?)`
 
@@ -369,6 +379,12 @@ interface ExecResult {
     allowIPs: string[];
     allowPorts: number[];
     envVars: string[];
+    allowCrypto?: boolean;
+    blockCrypto?: boolean;
+    blockCryptoEntropy?: boolean;
+    detectFIPS?: boolean;
+    strictFIPS?: boolean;
+    fipsDetected?: boolean;
     cmd: string;
     args: string[];
   };
@@ -412,14 +428,31 @@ Communication between layers uses marker-prefixed JSON on stdout:
 - `LEARNED:` prefix for learned policy output
 - Audit entries are written as JSON lines to stderr
 
-## Performance
+## Environment Variables
 
-| Metric                          | Time    |
-| ------------------------------- | ------- |
-| Baseline (`child_process.exec`) | ~2.6ms  |
-| SaferExec warm start            | ~13ms   |
-| Overhead                        | ~10.5ms |
-| With policy + DNS resolution    | ~113ms  |
+### Injected Environment Variables
+
+The sandbox automatically injects the following environment variable into the sandboxed process environment:
+
+- `RUNNING_IN_SAFER_EXEC_SANDBOX=true`: Indication that the command is running inside a secure sandbox (useful for downstream tools to detect the sandboxed environment and suppress warnings or adjust path lookups).
+
+### Sensitive Environment Variable Warning
+
+Prior to executing a command, `safer-exec` scans the environment variables mapping (`env`) case-insensitively for keys containing potentially sensitive strings (such as `TOKEN`, `PASSWORD`, `SECRET`, `API_KEY`, `CLIENT_SECRET`, `SESSION`, `COOKIE`, `AUTH`, and `KEY`).
+
+If any sensitive keys are detected, a consolidated warning is logged to standard error (`stderr`):
+
+```
+safer-exec: warning: sensitive environment variables detected: GITHUB_TOKEN, MY_SECRET
+```
+
+### FIPS Compliance Confinement
+
+`safer-exec` supports auditing and enforcing FIPS (Federal Information Processing Standards) compliance:
+
+- **Linux**: When `detectFIPS` or `strictFIPS` is enabled, the sandbox checks the host state `/proc/sys/crypto/fips_enabled` and mirrors this virtualized file inside the container. If `strictFIPS` is configured and the host lacks FIPS compliance, execution is blocked and a `fips-violation` is audited.
+- **macOS**: On macOS, FIPS state is verified by reading Apple's security preference plist (`FIPSMode`). If `strictFIPS` is active and FIPSMode is disabled on the host, a validation failure is triggered.
+- **Auto-Discovery**: During learn mode, if a process attempts to query the FIPS status or dynamic FIPS module providers (e.g. `fips.so` or `fips.dylib`), the generated policy automatically sets `fipsDetected: true`.
 
 ## Development
 

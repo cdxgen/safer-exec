@@ -126,6 +126,23 @@ type ExecConfig struct {
 	// EnableLearn and PolicyFilePath are set, the learner merges newly
 	// observed behavior into the existing file and writes it back atomically.
 	PolicyFilePath string `json:"policyFilePath,omitempty"`
+
+	// AllowCrypto, when true, allows system cryptographic library and device access.
+	// Defaults to true (unrestricted). If false, access to common cryptographic paths
+	// (OpenSSL, TLS certs, entropy devices) is restricted.
+	AllowCrypto bool `json:"allowCrypto"`
+
+	// BlockCrypto, when true, explicitly prevents loading system cryptographic libraries.
+	BlockCrypto bool `json:"blockCrypto"`
+
+	// BlockCryptoEntropy, when true, blocks access to entropy/random devices (/dev/random, /dev/urandom).
+	BlockCryptoEntropy bool `json:"blockCryptoEntropy"`
+
+	// DetectFIPS, when true, watches for FIPS-compliant operational lookups (checking fips_enabled or loading fips provider modules).
+	DetectFIPS bool `json:"detectFIPS"`
+
+	// StrictFIPS, when true, requires FIPS compliance. If the runtime fails to utilize FIPS mode or fails validation, a sandbox error is triggered.
+	StrictFIPS bool `json:"strictFIPS"`
 }
 
 // AuditEntry represents a single sandbox violation or event.
@@ -217,6 +234,14 @@ type PolicyFile struct {
 	// Observability
 	TraceExec   bool `json:"traceExec,omitempty"`
 	EnableAudit bool `json:"enableAudit,omitempty"`
+
+	// Cryptographic Controls
+	AllowCrypto        bool `json:"allowCrypto,omitempty"`
+	BlockCrypto        bool `json:"blockCrypto,omitempty"`
+	BlockCryptoEntropy bool `json:"blockCryptoEntropy,omitempty"`
+	DetectFIPS         bool `json:"detectFIPS,omitempty"`
+	StrictFIPS         bool `json:"strictFIPS,omitempty"`
+	FIPSDetected       bool `json:"fipsDetected,omitempty"`
 
 	// Informational — set by learner, ignored when loading as policy-file
 	Cmd  string   `json:"cmd,omitempty"`

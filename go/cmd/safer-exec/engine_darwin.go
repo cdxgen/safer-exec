@@ -61,6 +61,32 @@ func run(cfg config.ExecConfig) error {
 		return fmt.Errorf("setting resource limits: %w", err)
 	}
 
+	// Handle FIPS controls on macOS
+	if cfg.DetectFIPS || cfg.StrictFIPS {
+		fipsVal := "0"
+		// Query FIPSMode setting from macOS security defaults plist
+		// When FIPS mode is activated via MDM profiles, FIPSMode defaults to 1.
+		out, err := exec.Command("defaults", "read", "/Library/Preferences/com.apple.security", "FIPSMode").Output()
+		if err == nil {
+			fipsVal = strings.TrimSpace(string(out))
+		} else {
+			// Fallback: check user preferences plist
+			out, err = exec.Command("defaults", "read", "com.apple.security", "FIPSMode").Output()
+			if err == nil {
+				fipsVal = strings.TrimSpace(string(out))
+			}
+		}
+
+		if cfg.StrictFIPS && fipsVal != "1" {
+			fmt.Fprintf(os.Stderr, "safer-exec: audit: fips-violation: macOS host is not running in FIPS-compliant mode\n")
+			if cfg.Strict {
+				return fmt.Errorf("FIPS strict enforcement failed: macOS has FIPSMode disabled")
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "safer-exec: audit: fips-check: macOS FIPS mode status: %s\n", fipsVal)
+		}
+	}
+
 	// Build the Seatbelt profile
 	profile := buildSeatbeltProfile(cfg)
 
@@ -422,8 +448,29 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		"/dev", "/Library", "/opt/homebrew/", "/usr/local/Cellar/",
 	}
 	for _, p := range systemReadPaths {
+		// If BlockCryptoEntropy is true, restrict /dev/random and /dev/urandom
+		if cfg.BlockCryptoEntropy && p == "/dev" {
+			sb.WriteString("(allow file-read* (subpath \"/dev\"))\n")
+			sb.WriteString("(deny file-read* (literal \"/dev/random\"))\n")
+			sb.WriteString("(deny file-read* (literal \"/dev/urandom\"))\n")
+			sb.WriteString("(deny file-read* (literal \"/dev/random.entropy\"))\n")
+			continue
+		}
 		sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", p))
 	}
+
+	// Explicitly block crypto libraries if BlockCrypto is true
+	if cfg.BlockCrypto {
+		sb.WriteString("(deny file-read* (subpath \"/usr/lib/system/libcommonCrypto.dylib\"))\n")
+		sb.WriteString("(deny file-read* (subpath \"/usr/lib/libcrypto\"))\n")
+		sb.WriteString("(deny file-read* (subpath \"/usr/lib/libssl\"))\n")
+		sb.WriteString("(deny file-read* (subpath \"/etc/ssl\"))\n")
+		sb.WriteString("(deny file-read* (subpath \"/private/etc/ssl\"))\n")
+		sb.WriteString("(deny file-read* (subpath \"/etc/security\"))\n")
+		sb.WriteString("(deny file-read* (subpath \"/private/etc/security\"))\n")
+		sb.WriteString("(deny file-read* (subpath \"/System/Library/Frameworks/Security.framework\"))\n")
+	}
+
 	// Allow reading the specific command binary if it's an absolute path
 	if filepath.IsAbs(cfg.Cmd) {
 		sb.WriteString(fmt.Sprintf("(allow file-read* (literal %q))\n", cfg.Cmd))

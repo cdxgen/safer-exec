@@ -21,7 +21,7 @@ function getNodeLibDir() {
   return nodeDir.replace(/bin$/, 'lib');
 }
 
-function getPnpmPaths() {
+export function getPnpmPaths() {
   const extraPaths = [];
   const paths = (process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':');
 

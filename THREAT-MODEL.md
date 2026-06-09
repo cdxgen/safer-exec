@@ -272,17 +272,7 @@ Policies are resolved at runtime based on the operating system. The following pl
 4. DNS resolution returns correct results during the execution window.
 5. The target command is a standard executable, not a shell script that modifies its own environment before running.
 
-## 6. Quality Attributes
-
-| Attribute        | Target                      | Notes                                                                     |
-| ---------------- | --------------------------- | ------------------------------------------------------------------------- |
-| Startup overhead | <15ms warm, <120ms with DNS | Measured on M3 MacBook, 13ms warm start                                   |
-| Memory overhead  | <5MB per sandbox instance   | Go binary + tmpfs root                                                    |
-| Policy coverage  | 11 ecosystems               | npm, pnpm, yarn, pypi, maven, cargo, rubygems, composer, deno, gomod, bun |
-| OS support       | macOS, Linux                | Windows not supported                                                     |
-| Dependencies     | Zero npm dependencies       | Go binary is the only runtime requirement                                 |
-
-## 7. Recommendations
+## 6. Recommendations
 
 1. **Set resource limits by default.** The current defaults are unlimited for memory, CPU, and process count. Consider sensible defaults such as 512MB memory and 100 processes.
 2. **Strengthen macOS Seatbelt rules.** Remove the blanket `(allow file-read*)` and `(allow file-write*)` rules. Use only the per-path subpath rules for actual confinement.

@@ -54,6 +54,7 @@
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { resolveHosts } from './net.js';
 import { run as runBinary } from './runner.js';
 import { npmPolicy } from './policies/npm.js';
@@ -123,6 +124,22 @@ const POLICIES = {
  *   .env('CUSTOM_VAR', 'value')
  *   .run('npm', ['install']);
  */
+function expandEnv(str) {
+  if (typeof str !== 'string') return str;
+  // Replace ~ at the start with HOME
+  if (str.startsWith('~')) {
+    const home = process.env.HOME || process.env.USERPROFILE || '';
+    str = home + str.slice(1);
+  }
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  // Replace $HOME with home directory
+  str = str.replace(/\$HOME\b/g, home);
+  // Replace $PWD or $CWD with process.cwd()
+  str = str.replace(/\$(PWD|CWD)\b/g, () => process.cwd());
+  // Replace $TMPDIR or $TEMP with os.tmpdir()
+  return str.replace(/\$(TMPDIR|TEMP)\b/g, () => tmpdir());
+}
+
 export class SaferExec {
   /**
    * Create a new SaferExec instance with default configuration.
@@ -220,6 +237,21 @@ export class SaferExec {
 
     /** @type {boolean} Opt-in to resolve target command symlink */
     this._resolveSymlinks = options.resolveSymlinks || false;
+
+    /** @type {boolean} Allow cryptographic library and device access */
+    this._allowCrypto = options.allowCrypto !== false;
+
+    /** @type {boolean} Explicitly block cryptographic library access */
+    this._blockCrypto = options.blockCrypto || false;
+
+    /** @type {boolean} Block entropy device access (/dev/random, /dev/urandom) */
+    this._blockCryptoEntropy = options.blockCryptoEntropy || false;
+
+    /** @type {boolean} Detect FIPS compliant operations */
+    this._detectFIPS = options.detectFIPS || false;
+
+    /** @type {boolean} Enforce FIPS compliance strictly */
+    this._strictFIPS = options.strictFIPS || false;
   }
 
   /**
@@ -307,6 +339,12 @@ export class SaferExec {
    *   .applyPolicy('npm')
    *   .applyPolicyFile('./extra-paths.json')
    *   .run('npm', ['install']);
+   *
+   * @example
+   * // Load a policy file with variables
+   * const result = await new SaferExec()
+   *   .applyPolicyFile('./policy-with-vars.json')
+   *   .run('echo', ['test']);
    */
   applyPolicyFile(filePath) {
     this._policyFilePath = filePath;
@@ -317,10 +355,10 @@ export class SaferExec {
 
     // Filesystem paths
     if (Array.isArray(raw.readPaths) && raw.readPaths.length > 0) {
-      this.readPaths(...raw.readPaths);
+      this.readPaths(...raw.readPaths.map(p => expandEnv(p)));
     }
     if (Array.isArray(raw.writePaths) && raw.writePaths.length > 0) {
-      this.writePaths(...raw.writePaths);
+      this.writePaths(...raw.writePaths.map(p => expandEnv(p)));
     }
 
     // Network
@@ -387,6 +425,21 @@ export class SaferExec {
     }
     if (raw.resolveSymlinks) {
       this.resolveSymlinks();
+    }
+    if (raw.allowCrypto !== undefined) {
+      this._allowCrypto = raw.allowCrypto;
+    }
+    if (raw.blockCrypto) {
+      this.blockCrypto();
+    }
+    if (raw.blockCryptoEntropy) {
+      this.blockCryptoEntropy();
+    }
+    if (raw.detectFIPS) {
+      this.detectFIPS();
+    }
+    if (raw.strictFIPS) {
+      this.strictFIPS();
     }
 
     return this;
@@ -761,6 +814,57 @@ export class SaferExec {
   }
 
   /**
+   * Allow cryptographic library and entropy device access (default).
+   *
+   * @param {boolean} [allow=true] - Whether to allow crypto operations
+   * @returns {SaferExec} This instance for chaining
+   */
+  allowCrypto(allow = true) {
+    this._allowCrypto = allow;
+    return this;
+  }
+
+  /**
+   * Block loading of system cryptographic libraries.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  blockCrypto() {
+    this._blockCrypto = true;
+    return this;
+  }
+
+  /**
+   * Block access to entropy devices (/dev/random and /dev/urandom).
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  blockCryptoEntropy() {
+    this._blockCryptoEntropy = true;
+    return this;
+  }
+
+  /**
+   * Detect FIPS-compliant operational lookups.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  detectFIPS() {
+    this._detectFIPS = true;
+    return this;
+  }
+
+  /**
+   * Require FIPS compliance strictly.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  strictFIPS() {
+    this._strictFIPS = true;
+    return this;
+  }
+
+  /**
    * Execute the sandboxed command.
    *
    * Before spawning the Go binary, this method:
@@ -834,11 +938,16 @@ export class SaferExec {
       } catch {}
     }
 
+    const finalEnv = {
+      ...this._env,
+      RUNNING_IN_SAFER_EXEC_SANDBOX: 'true',
+    };
+
     // Build the config object
     const config = {
       cmd: executionCmd,
       args,
-      env: Object.keys(this._env).length > 0 ? this._env : undefined,
+      env: finalEnv,
       readPaths: effectiveReadPaths,
       writePaths: effectiveWritePaths,
       allowHosts: this._allowHosts,
@@ -861,6 +970,11 @@ export class SaferExec {
       dumpProfile: this._dumpProfile,
       strict: this._strict,
       policyFilePath: this._policyFilePath,
+      allowCrypto: this._allowCrypto,
+      blockCrypto: this._blockCrypto,
+      blockCryptoEntropy: this._blockCryptoEntropy,
+      detectFIPS: this._detectFIPS,
+      strictFIPS: this._strictFIPS,
     };
 
     // Determine effective timeout: use explicit timeout or default to 60s
