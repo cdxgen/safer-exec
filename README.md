@@ -321,6 +321,9 @@ Full help: `safer-exec --help`.
 | `blockCryptoEntropy` | `boolean`  | `false`         | Block entropy (/dev/random) device access  |
 | `detectFIPS`         | `boolean`  | `false`         | Enable FIPS compliance checks/logging      |
 | `strictFIPS`         | `boolean`  | `false`         | Force strict FIPS validation               |
+| `allowGPU`           | `boolean`  | `false`         | Permit process to utilize host GPU nodes   |
+| `blockTPM`           | `boolean`  | `false`         | Restrict hardware access to TPM device     |
+| `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks |
 
 ### Instance Methods
 
@@ -355,6 +358,9 @@ All methods return `this` for chaining except `.run()`.
 | `.blockCryptoEntropy()` | Restrict entropy devices (/dev/random)         |
 | `.detectFIPS()`         | Log and watch for FIPS lookups                 |
 | `.strictFIPS()`         | Restrict runtime to strict FIPS compliant mode |
+| `.allowGPU(allow)`      | Allow/disallow access to host GPU nodes        |
+| `.blockTPM()`           | Restrict hardware access to TPM device         |
+| `.spoofAntiVM()`        | Intercept debugger & virtualization checks     |
 
 ### `.run(cmd, args?)`
 

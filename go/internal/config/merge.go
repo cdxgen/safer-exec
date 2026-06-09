@@ -96,6 +96,15 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	merged.StrictFIPS = base.StrictFIPS || observed.StrictFIPS
 	merged.FIPSDetected = base.FIPSDetected || observed.FIPSDetected
 
+	// Advanced Controls
+	merged.AllowGPU = base.AllowGPU || observed.AllowGPU
+	merged.BlockGPU = base.BlockGPU || observed.BlockGPU
+	merged.BlockTPM = base.BlockTPM || observed.BlockTPM
+	merged.SpoofAntiVM = base.SpoofAntiVM || observed.SpoofAntiVM
+	merged.GPUUsed = base.GPUUsed || observed.GPUUsed
+	merged.TPMUsed = base.TPMUsed || observed.TPMUsed
+	merged.AntiVMActive = base.AntiVMActive || observed.AntiVMActive
+
 	// Informational — observed (most recent run)
 	merged.Cmd = observed.Cmd
 	merged.Args = observed.Args

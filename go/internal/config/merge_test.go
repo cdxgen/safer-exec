@@ -305,6 +305,50 @@ func TestMergePolicies_FIPSControls(t *testing.T) {
 	}
 }
 
+func TestMergePolicies_AdvancedControls(t *testing.T) {
+	base := &PolicyFile{
+		AllowGPU:     true,
+		BlockGPU:     false,
+		BlockTPM:     false,
+		SpoofAntiVM:  true,
+		GPUUsed:      true,
+		TPMUsed:      false,
+		AntiVMActive: true,
+	}
+	observed := &PolicyFile{
+		AllowGPU:     false,
+		BlockGPU:     true,
+		BlockTPM:     true,
+		SpoofAntiVM:  false,
+		GPUUsed:      false,
+		TPMUsed:      true,
+		AntiVMActive: false,
+	}
+
+	merged := MergePolicies(base, observed)
+	if !merged.AllowGPU {
+		t.Error("AllowGPU should be true (OR)")
+	}
+	if !merged.BlockGPU {
+		t.Error("BlockGPU should be true (OR)")
+	}
+	if !merged.BlockTPM {
+		t.Error("BlockTPM should be true (OR)")
+	}
+	if !merged.SpoofAntiVM {
+		t.Error("SpoofAntiVM should be true (OR)")
+	}
+	if !merged.GPUUsed {
+		t.Error("GPUUsed should be true (OR)")
+	}
+	if !merged.TPMUsed {
+		t.Error("TPMUsed should be true (OR)")
+	}
+	if !merged.AntiVMActive {
+		t.Error("AntiVMActive should be true (OR)")
+	}
+}
+
 func TestMergePolicies_MaxProcessesMerge(t *testing.T) {
 	base := &PolicyFile{MaxProcesses: 100}
 	observed := &PolicyFile{MaxProcesses: 50}

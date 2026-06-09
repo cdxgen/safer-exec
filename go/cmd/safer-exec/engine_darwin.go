@@ -456,6 +456,20 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 			sb.WriteString("(deny file-read* (literal \"/dev/random.entropy\"))\n")
 			continue
 		}
+		// Deny TPM device if BlockTPM is true
+		if cfg.BlockTPM && p == "/dev" {
+			sb.WriteString("(allow file-read* (subpath \"/dev\"))\n")
+			sb.WriteString("(deny file-read* (literal \"/dev/tpm0\"))\n")
+			sb.WriteString("(deny file-read* (literal \"/dev/tpmrm0\"))\n")
+			continue
+		}
+		// Deny GPU nodes if AllowGPU is false or BlockGPU is true
+		if (!cfg.AllowGPU || cfg.BlockGPU) && p == "/dev" {
+			sb.WriteString("(allow file-read* (subpath \"/dev\"))\n")
+			sb.WriteString("(deny file-read* (subpath \"/dev/dri\"))\n")
+			sb.WriteString("(deny file-read* (literal \"/dev/opencl\"))\n")
+			continue
+		}
 		sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", p))
 	}
 

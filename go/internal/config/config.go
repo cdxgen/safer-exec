@@ -143,6 +143,18 @@ type ExecConfig struct {
 
 	// StrictFIPS, when true, requires FIPS compliance. If the runtime fails to utilize FIPS mode or fails validation, a sandbox error is triggered.
 	StrictFIPS bool `json:"strictFIPS"`
+
+	// AllowGPU, when true, permits processes to utilize host GPU nodes (/dev/nvidia*, /dev/dri/*). Defaults to true.
+	AllowGPU bool `json:"allowGPU"`
+
+	// BlockGPU, when true, restricts hardware access to host GPU nodes.
+	BlockGPU bool `json:"blockGPU"`
+
+	// BlockTPM, when true, restricts hardware access to the Trusted Platform Module (/dev/tpm0, /dev/tpmrm0).
+	BlockTPM bool `json:"blockTPM"`
+
+	// SpoofAntiVM, when true, intercepts virtualization and debugger detection paths (/sys/class/dmi/id/product_name, TracerPid in /proc) to conceal sandboxing.
+	SpoofAntiVM bool `json:"spoofAntiVM"`
 }
 
 // AuditEntry represents a single sandbox violation or event.
@@ -242,6 +254,15 @@ type PolicyFile struct {
 	DetectFIPS         bool `json:"detectFIPS,omitempty"`
 	StrictFIPS         bool `json:"strictFIPS,omitempty"`
 	FIPSDetected       bool `json:"fipsDetected,omitempty"`
+
+	// Advanced Controls
+	AllowGPU     bool `json:"allowGPU,omitempty"`
+	BlockGPU     bool `json:"blockGPU,omitempty"`
+	BlockTPM     bool `json:"blockTPM,omitempty"`
+	SpoofAntiVM  bool `json:"spoofAntiVM,omitempty"`
+	GPUUsed      bool `json:"gpuUsed,omitempty"`
+	TPMUsed      bool `json:"tpmUsed,omitempty"`
+	AntiVMActive bool `json:"antiVMActive,omitempty"`
 
 	// Informational — set by learner, ignored when loading as policy-file
 	Cmd  string   `json:"cmd,omitempty"`

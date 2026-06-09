@@ -252,6 +252,15 @@ export class SaferExec {
 
     /** @type {boolean} Enforce FIPS compliance strictly */
     this._strictFIPS = options.strictFIPS || false;
+
+    /** @type {boolean} Allow processes to utilize host GPU nodes */
+    this._allowGPU = options.allowGPU || false;
+
+    /** @type {boolean} Restrict hardware access to TPM device */
+    this._blockTPM = options.blockTPM || false;
+
+    /** @type {boolean} Intercept VM and hypervisor properties */
+    this._spoofAntiVM = options.spoofAntiVM || false;
   }
 
   /**
@@ -440,6 +449,15 @@ export class SaferExec {
     }
     if (raw.strictFIPS) {
       this.strictFIPS();
+    }
+    if (raw.allowGPU !== undefined) {
+      this._allowGPU = raw.allowGPU;
+    }
+    if (raw.blockTPM) {
+      this.blockTPM();
+    }
+    if (raw.spoofAntiVM) {
+      this.spoofAntiVM();
     }
 
     return this;
@@ -865,6 +883,37 @@ export class SaferExec {
   }
 
   /**
+   * Allow/disallow GPU hardware node usage.
+   *
+   * @param {boolean} [allow=true] - Whether to allow GPU access
+   * @returns {SaferExec} This instance for chaining
+   */
+  allowGPU(allow = true) {
+    this._allowGPU = allow;
+    return this;
+  }
+
+  /**
+   * Block hardware access to the Trusted Platform Module (TPM).
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  blockTPM() {
+    this._blockTPM = true;
+    return this;
+  }
+
+  /**
+   * Conceal sandboxing by intercepting hypervisor and debugger checks.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  spoofAntiVM() {
+    this._spoofAntiVM = true;
+    return this;
+  }
+
+  /**
    * Execute the sandboxed command.
    *
    * Before spawning the Go binary, this method:
@@ -975,6 +1024,9 @@ export class SaferExec {
       blockCryptoEntropy: this._blockCryptoEntropy,
       detectFIPS: this._detectFIPS,
       strictFIPS: this._strictFIPS,
+      allowGPU: this._allowGPU,
+      blockTPM: this._blockTPM,
+      spoofAntiVM: this._spoofAntiVM,
     };
 
     // Determine effective timeout: use explicit timeout or default to 60s

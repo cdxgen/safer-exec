@@ -130,6 +130,9 @@ func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.PolicyFile 
 	hasCryptoRead := false
 	hasEntropyRead := false
 	hasFIPSRead := false
+	hasGPURead := false
+	hasTPMRead := false
+	hasVMRead := false
 	for path := range p.readPaths {
 		up := strings.ToLower(path)
 		if strings.Contains(up, "libcrypto") || strings.Contains(up, "libssl") || strings.Contains(up, "/ssl") || strings.Contains(up, "security") {
@@ -141,11 +144,28 @@ func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.PolicyFile 
 		if strings.Contains(up, "fips_enabled") || strings.Contains(up, "fips.so") || strings.Contains(up, "fips.dylib") {
 			hasFIPSRead = true
 		}
+		if strings.Contains(up, "nvidia") || strings.Contains(up, "/dev/dri") || strings.Contains(up, "cuda") {
+			hasGPURead = true
+		}
+		if strings.Contains(up, "/dev/tpm") {
+			hasTPMRead = true
+		}
+		if strings.Contains(up, "dmi/id") || strings.Contains(up, "hypervisor") {
+			hasVMRead = true
+		}
 	}
 	policy.AllowCrypto = hasCryptoRead
 	policy.BlockCrypto = !hasCryptoRead
 	policy.BlockCryptoEntropy = !hasEntropyRead
 	policy.FIPSDetected = hasFIPSRead
+
+	policy.AllowGPU = !hasGPURead
+	policy.BlockGPU = !hasGPURead
+	policy.BlockTPM = hasTPMRead
+	policy.SpoofAntiVM = hasVMRead
+	policy.GPUUsed = hasGPURead
+	policy.TPMUsed = hasTPMRead
+	policy.AntiVMActive = hasVMRead
 
 	return policy
 }

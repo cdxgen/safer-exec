@@ -163,6 +163,15 @@ function parseCliArgs() {
       'strict-fips': {
         type: 'boolean',
       },
+      'allow-gpu': {
+        type: 'boolean',
+      },
+      'block-tpm': {
+        type: 'boolean',
+      },
+      'spoof-antivm': {
+        type: 'boolean',
+      },
       'max-cpu': {
         type: 'string',
         short: 'c',
@@ -411,6 +420,15 @@ function buildExec(values, cmd, args) {
   }
   if (values['strict-fips']) {
     exec.strictFIPS();
+  }
+  if (values['allow-gpu']) {
+    exec.allowGPU();
+  }
+  if (values['block-tpm']) {
+    exec.blockTPM();
+  }
+  if (values['spoof-antivm']) {
+    exec.spoofAntiVM();
   }
 
   const options = {

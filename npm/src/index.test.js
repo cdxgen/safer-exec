@@ -85,13 +85,16 @@ describe('SaferExec', () => {
       strict.equal(exec._traceExec, true);
     });
 
-    it('should initialize crypto options', () => {
+    it('should initialize crypto and advanced options', () => {
       const exec = new SaferExec();
       strict.equal(exec._allowCrypto, true);
       strict.equal(exec._blockCrypto, false);
       strict.equal(exec._blockCryptoEntropy, false);
       strict.equal(exec._detectFIPS, false);
       strict.equal(exec._strictFIPS, false);
+      strict.equal(exec._allowGPU, false);
+      strict.equal(exec._blockTPM, false);
+      strict.equal(exec._spoofAntiVM, false);
 
       const execCustom = new SaferExec({
         allowCrypto: false,
@@ -99,12 +102,18 @@ describe('SaferExec', () => {
         blockCryptoEntropy: true,
         detectFIPS: true,
         strictFIPS: true,
+        allowGPU: true,
+        blockTPM: true,
+        spoofAntiVM: true,
       });
       strict.equal(execCustom._allowCrypto, false);
       strict.equal(execCustom._blockCrypto, true);
       strict.equal(execCustom._blockCryptoEntropy, true);
       strict.equal(execCustom._detectFIPS, true);
       strict.equal(execCustom._strictFIPS, true);
+      strict.equal(execCustom._allowGPU, true);
+      strict.equal(execCustom._blockTPM, true);
+      strict.equal(execCustom._spoofAntiVM, true);
     });
   });
 
@@ -174,7 +183,10 @@ describe('SaferExec', () => {
         .blockCrypto()
         .blockCryptoEntropy()
         .detectFIPS()
-        .strictFIPS();
+        .strictFIPS()
+        .allowGPU(false)
+        .blockTPM()
+        .spoofAntiVM();
 
       strict.equal(result, exec, 'all methods should return the same instance');
       strict.equal(exec._allowCrypto, false);
@@ -182,6 +194,9 @@ describe('SaferExec', () => {
       strict.equal(exec._blockCryptoEntropy, true);
       strict.equal(exec._detectFIPS, true);
       strict.equal(exec._strictFIPS, true);
+      strict.equal(exec._allowGPU, false);
+      strict.equal(exec._blockTPM, true);
+      strict.equal(exec._spoofAntiVM, true);
     });
 
     it('should deduplicate allowHosts', () => {

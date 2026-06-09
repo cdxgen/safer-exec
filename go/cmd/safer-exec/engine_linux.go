@@ -470,9 +470,37 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		if f, err := os.Create(filepath.Join(devDir, "urandom")); err == nil {
 			f.Close()
 		}
-	} else {
 		// Bind mount host /dev to newRoot/dev
 		_ = syscall.Mount("/dev", devDir, "", syscall.MS_BIND|syscall.MS_REC, "")
+
+		// If BlockTPM is true, unmount or override tpm devices inside devDir
+		if cfg.BlockTPM {
+			_ = syscall.Unmount(filepath.Join(devDir, "tpm0"), syscall.MNT_DETACH)
+			_ = syscall.Unmount(filepath.Join(devDir, "tpmrm0"), syscall.MNT_DETACH)
+			// Mount empty files over them
+			if f, err := os.Create(filepath.Join(devDir, "tpm0")); err == nil {
+				f.Close()
+			}
+			if f, err := os.Create(filepath.Join(devDir, "tpmrm0")); err == nil {
+				f.Close()
+			}
+		}
+		// If AllowGPU is false or BlockGPU is true, unmount or restrict NVIDIA/DRI access inside devDir
+		if !cfg.AllowGPU || cfg.BlockGPU {
+			_ = syscall.Unmount(filepath.Join(devDir, "nvidiactl"), syscall.MNT_DETACH)
+			_ = syscall.Unmount(filepath.Join(devDir, "nvidia-uvm"), syscall.MNT_DETACH)
+			_ = syscall.Unmount(filepath.Join(devDir, "dri"), syscall.MNT_DETACH)
+		}
+	}
+
+	// Setup SpoofAntiVM paths if requested
+	if cfg.SpoofAntiVM {
+		dmiDir := filepath.Join(newRoot, "sys", "class", "dmi", "id")
+		_ = os.MkdirAll(dmiDir, 0o755)
+		_ = os.WriteFile(filepath.Join(dmiDir, "product_name"), []byte("ThinkPad T480\n"), 0o644)
+		_ = os.WriteFile(filepath.Join(dmiDir, "sys_vendor"), []byte("LENOVO\n"), 0o644)
+		_ = os.WriteFile(filepath.Join(dmiDir, "bios_vendor"), []byte("LENOVO\n"), 0o644)
+		logAuditEntry("antivm-spoof", "Concealing virtualization markers")
 	}
 
 	// Setup FIPS simulation if requested
