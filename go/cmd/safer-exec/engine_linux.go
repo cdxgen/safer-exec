@@ -911,7 +911,17 @@ func execCommand(cfg config.ExecConfig) error {
 			var soPath string
 			var err error
 			if hasPrecompiledSo && len(auditHelperSo) > 0 {
-				soPath, err = extractPrecompiledAuditHelper(os.TempDir())
+				soDir := os.Getenv("RUNNER_TEMP")
+				if soDir == "" {
+					soDir = cfg.WorkingDir
+				}
+				if soDir == "" {
+					soDir = "."
+				}
+				soPath, err = extractPrecompiledAuditHelper(soDir)
+				if err != nil && soDir != "." {
+					soPath, err = extractPrecompiledAuditHelper(".")
+				}
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: failed to extract precompiled helper: %v\n", err)
 				} else {
