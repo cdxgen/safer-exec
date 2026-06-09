@@ -315,7 +315,7 @@ func TestTraceLibraries_ExtractPrecompiledHelper(t *testing.T) {
 		t.Skip("precompiled SO helper not enabled for this architecture/platform")
 	}
 
-	soPath, err := extractPrecompiledAuditHelper()
+	soPath, err := extractPrecompiledAuditHelper(t.TempDir())
 	if err != nil {
 		t.Fatalf("extractPrecompiledAuditHelper failed: %v", err)
 	}

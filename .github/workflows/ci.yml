@@ -187,7 +187,7 @@ jobs:
                   url: "git+https://github.com/cdxgen/safer-exec.git"
                 },
                 bugs: {
-                  url: "https://github.com/cdxgen/safer-exec/issues"
+                  url: "https://github.com/cdxgen/cdxgen/issues"
                 },
                 homepage: "https://github.com/cdxgen/safer-exec#readme",
                 os: [$os],

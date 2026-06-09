@@ -8,8 +8,8 @@ import (
 // extractPrecompiledAuditHelper writes the precompiled platform-specific library helper to
 // a temporary file and returns its path. The lifecycle/cleanup of this temporary file
 // is managed automatically by the engine callers (e.g. engine_linux.go).
-func extractPrecompiledAuditHelper() (string, error) {
-	tmpFile, err := os.CreateTemp("", "safer-exec-audit-*.so")
+func extractPrecompiledAuditHelper(dir string) (string, error) {
+	tmpFile, err := os.CreateTemp(dir, "safer-exec-audit-*.so")
 	if err != nil {
 		return "", err
 	}
