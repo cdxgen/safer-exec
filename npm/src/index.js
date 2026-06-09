@@ -56,7 +56,7 @@ import { dirname, resolve, join } from 'node:path';
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolveHosts } from './net.js';
-import { run as runBinary } from './runner.js';
+import { run as runBinary, runPipe as runBinaryPipe } from './runner.js';
 import { npmPolicy } from './policies/npm.js';
 import { pnpmPolicy } from './policies/pnpm.js';
 import { yarnPolicy } from './policies/yarn.js';
@@ -956,7 +956,17 @@ export class SaferExec {
    *   console.log('Install succeeded');
    * }
    */
-  async run(cmd, args = []) {
+  /**
+   * Build the ExecConfig object and resolve all hostnames to IPs.
+   *
+   * This is the shared preparation step used by both `run()` and `runPipe()`.
+   * It resolves symlinks, filters non-existent paths, and resolves hostnames.
+   *
+   * @param {string} cmd - The command to execute
+   * @param {string[]} args - Command arguments
+   * @returns {Promise<{ config: object, binaryPath: string, effectiveTimeout: number }>}
+   */
+  async _buildConfig(cmd, args) {
     // Resolve hostnames to IPs
     if (this._allowHosts.length > 0) {
       const { ips, failures } = await resolveHosts(this._allowHosts);
@@ -986,7 +996,7 @@ export class SaferExec {
         }
       }
     }
-    
+
     // Filter non-existent paths to prevent Go bind mount warnings/errors
     effectiveReadPaths = effectiveReadPaths.filter(p => existsSync(p));
     let effectiveWritePaths = [...this._writePaths].filter(p => existsSync(p));
@@ -1057,6 +1067,43 @@ export class SaferExec {
       binaryPath = resolve(__packageRoot, binaryPath);
     }
 
+    return { config, binaryPath, effectiveTimeout };
+  }
+
+  /**
+   * Execute the sandboxed command, buffering all output.
+   *
+   * Before spawning the Go binary, this method:
+   * 1. Resolves all allowed hostnames to IP addresses
+   * 2. Builds the JSON config
+   * 3. Spawns the Go binary and pipes the config via stdin
+   *
+   * Output (stdout/stderr) is collected and returned in the result object.
+   * For interactive or long-running commands where you want live output,
+   * use {@link runPipe} instead.
+   *
+   * @param {string} cmd - The command to execute
+   * @param {string[]} [args=[]] - Command arguments
+   * @returns {Promise<ExecResult>} The execution result
+   * @returns {string} returns.stdout - Captured stdout
+   * @returns {string} returns.stderr - Captured stderr
+   * @returns {number} returns.exitCode - Process exit code
+   * @returns {Array<Object>} [returns.auditLog] - Audit log entries (when enableAudit is true)
+   * @returns {Object} [returns.fsDiff] - Filesystem mutation report (when enableDiff is true)
+   * @returns {Object} [returns.learnedPolicy] - Auto-generated policy (when enableLearn is true)
+   *
+   * @example
+   * const result = await new SaferExec()
+   *   .applyPolicy('npm')
+   *   .run('npm', ['install']);
+   *
+   * if (result.exitCode === 0) {
+   *   console.log('Install succeeded');
+   * }
+   */
+  async run(cmd, args = []) {
+    const { config, binaryPath, effectiveTimeout } = await this._buildConfig(cmd, args);
+
     // Run the Go binary with a slightly longer timeout to let it finish cleanly
     const options = {
       binaryPath,
@@ -1064,6 +1111,47 @@ export class SaferExec {
       enableAudit: this._enableAudit || this._traceLibraries,
     };
     return runBinary(config, options);
+  }
+
+  /**
+   * Execute the sandboxed command, streaming stdout/stderr in real-time.
+   *
+   * Identical to {@link run} but pipes stdout and stderr directly to the
+   * parent process streams as data arrives, rather than buffering until
+   * completion. This is the correct mode for long-running or interactive
+   * commands (e.g. test runners, build tools) where live output is expected.
+   *
+   * Structured output markers (`FSDIFF:`, `LEARNED:`) are still intercepted
+   * and returned in the result object. Only clean command output reaches
+   * the streams.
+   *
+   * @param {string} cmd - The command to execute
+   * @param {string[]} [args=[]] - Command arguments
+   * @param {object} [pipeOptions={}] - Streaming options
+   * @param {NodeJS.WritableStream|null} [pipeOptions.stdout=process.stdout] - Target stream for stdout (null = suppress)
+   * @param {NodeJS.WritableStream|null} [pipeOptions.stderr=process.stderr] - Target stream for stderr (null = suppress)
+   * @returns {Promise<{ exitCode: number, timedOut: boolean, fsDiff: object|null, learnedPolicy: object|null }>}
+   *
+   * @example
+   * // Stream output live (e.g. from a CLI)
+   * const result = await new SaferExec()
+   *   .applyPolicy('poku')
+   *   .timeout(240000)
+   *   .runPipe('pnpm', ['test']);
+   *
+   * process.exit(result.exitCode);
+   */
+  async runPipe(cmd, args = [], pipeOptions = {}) {
+    const { config, binaryPath, effectiveTimeout } = await this._buildConfig(cmd, args);
+
+    const options = {
+      binaryPath,
+      timeout: effectiveTimeout + 2000,
+      enableAudit: this._enableAudit || this._traceLibraries,
+      stdout: pipeOptions.stdout !== undefined ? pipeOptions.stdout : process.stdout,
+      stderr: pipeOptions.stderr !== undefined ? pipeOptions.stderr : process.stderr,
+    };
+    return runBinaryPipe(config, options);
   }
 }
 

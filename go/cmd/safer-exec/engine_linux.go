@@ -50,6 +50,28 @@ const (
 // SYS_CLONE unconditionally kills the sandboxed process. We only block forks (no CLONE_THREAD).
 const cloneThreadFlag = 0x00010000
 
+// writeStructured writes a structured output line (e.g. "FSDIFF:{...}") either
+// to the file at cfg.StructuredOutputPath (when set) or to stdout as a fallback.
+// When the path is set every caller appends to the same file so multiple markers
+// can coexist in one file, one per line.
+func writeStructured(cfg config.ExecConfig, marker string, data []byte) {
+	line := marker + string(data) + "\n"
+	if cfg.StructuredOutputPath != "" {
+		f, err := os.OpenFile(cfg.StructuredOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: open structured-output file: %v\n", err)
+			return
+		}
+		defer f.Close()
+		if _, err := f.WriteString(line); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: write structured-output file: %v\n", err)
+		}
+		return
+	}
+	// Fallback: write to stdout (legacy / buffered-run mode)
+	fmt.Print(line)
+}
+
 // isUserNamespaceRestricted returns true when the kernel or security policy
 // prevents unprivileged processes from creating user namespaces. Covers the
 // three common Linux mechanisms:
@@ -164,7 +186,7 @@ func run(cfg config.ExecConfig) error {
 					if afterSnap, err := fsdiff.SnapshotPath(cfg.WritePaths...); err == nil {
 						diff := fsdiff.Diff(beforeSnap, afterSnap)
 						if data, err := json.Marshal(diff); err == nil {
-							fmt.Printf("FSDIFF:%s\n", string(data))
+							writeStructured(cfg, "FSDIFF:", data)
 						}
 					}
 				}
@@ -183,7 +205,7 @@ func run(cfg config.ExecConfig) error {
 		if afterSnap, err := fsdiff.SnapshotPath(cfg.WritePaths...); err == nil {
 			diff := fsdiff.Diff(beforeSnap, afterSnap)
 			if data, err := json.Marshal(diff); err == nil {
-				fmt.Printf("FSDIFF:%s\n", string(data))
+				writeStructured(cfg, "FSDIFF:", data)
 			}
 		}
 	}
@@ -201,7 +223,7 @@ func runLearn(cfg config.ExecConfig) error {
 		return fmt.Errorf("learning mode: %w", err)
 	}
 	data, _ := json.Marshal(policy)
-	fmt.Printf("LEARNED:%s\n", string(data))
+	writeStructured(cfg, "LEARNED:", data)
 	return nil
 }
 

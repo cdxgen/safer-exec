@@ -169,6 +169,19 @@ interface ExecResult {
 }
 ```
 
+### `.runPipe(cmd, args?, options?)`
+
+Execute the sandboxed command, streaming stdout and stderr directly in real-time as the command runs. This is the recommended execution method for long-running or interactive commands (like build scripts, test runners, or command-line wrappers) where buffering output is undesirable.
+
+```ts
+interface PipeOptions {
+  stdout?: NodeJS.WritableStream | null; // Stream to pipe stdout to (defaults to process.stdout, null to suppress)
+  stderr?: NodeJS.WritableStream | null; // Stream to pipe stderr to (defaults to process.stderr, null to suppress)
+}
+```
+
+Returns `Promise<Omit<ExecResult, 'stdout' | 'stderr'>>`. Captured structured output (filesystem diffs, learned policies, profile logs) is written to a temporary file instead of stdout and parsed after exit.
+
 ## Architecture
 
 The Node.js layer handles policy resolution, DNS lookups, and config serialization. It pipes a JSON `ExecConfig` to the Go binary over stdin. The Go binary reads the config and delegates to a platform-specific engine.

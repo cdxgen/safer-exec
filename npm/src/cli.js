@@ -437,12 +437,7 @@ function buildExec(values, cmd, args) {
     exec.traceLibraries();
   }
 
-  const options = {
-    timeout: values.timeout ? parseNumeric(values.timeout, 'timeout') + 2000 : 0,
-    enableAudit: values.audit || values['trace-exec'] || values['trace-libraries'],
-  };
-
-  return { exec, options };
+  return { exec };
 }
 
 /**
@@ -473,15 +468,14 @@ async function main() {
   const args = positionals.slice(1);
 
   // Build the SaferExec instance
-  const { exec, options } = buildExec(values, cmd, args);
+  const { exec } = buildExec(values, cmd, args);
 
-  // Run with real-time output piping
+  // Run the command
   try {
-    const result = await exec.run(cmd, args);
-
-    // Ensure fsDiff and learnedPolicy are always present in JSON output
-    // when --diff or --learn flags are enabled (even if null/empty)
+    // JSON mode: buffer all output so we can emit a single JSON object
     if (values.json) {
+      const result = await exec.run(cmd, args);
+
       if (values.diff && result.fsDiff === undefined) {
         result.fsDiff = null;
       }
@@ -492,13 +486,8 @@ async function main() {
       process.exit(result.exitCode);
     }
 
-    // Pipe command stdout/stderr to parent process
-    if (result.stdout) {
-      process.stdout.write(result.stdout);
-    }
-    if (result.stderr) {
-      process.stderr.write(result.stderr);
-    }
+    // Normal mode: stream stdout/stderr in real-time as the command runs
+    const result = await exec.runPipe(cmd, args);
 
     // Output learned policy to file if requested
     if (values.learn && values['learn-output'] && result.learnedPolicy) {
@@ -531,21 +520,14 @@ async function main() {
       }
     }
 
-    // JSON output mode
-    if (values.json) {
-      process.stdout.write(JSON.stringify(result, null, 2) + '\n');
-    }
-
-    // Print success/failure message (unless JSON mode)
-    if (!values.json) {
-      if (result.exitCode === 124 || result.timedOut) {
-        process.stderr.write('[safer-exec] Command timed out\n');
-        result.exitCode = 124; // Force standard timeout exit code
-      } else {
-        process.stderr.write(
-          `[safer-exec] Command exited with code ${result.exitCode}\n`
-        );
-      }
+    // Print success/failure message
+    if (result.exitCode === 124 || result.timedOut) {
+      process.stderr.write('[safer-exec] Command timed out\n');
+      result.exitCode = 124; // Force standard timeout exit code
+    } else if (result.exitCode !== 0) {
+      process.stderr.write(
+        `[safer-exec] Command exited with code ${result.exitCode}\n`
+      );
     }
 
     process.exit(result.exitCode);

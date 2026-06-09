@@ -155,6 +155,13 @@ type ExecConfig struct {
 
 	// TraceLibraries, when true, tracks dynamic library loading using LD_AUDIT (Linux) / DYLD_INSERT_LIBRARIES (macOS).
 	TraceLibraries bool `json:"traceLibraries"`
+
+	// StructuredOutputPath, when non-empty, redirects all structured output
+	// (FSDIFF, LEARNED, PROFILE markers) to the specified file path instead
+	// of writing them to stdout. The file is written as newline-delimited
+	// JSON lines, one marker per line. When this field is set, the binary's
+	// stdout carries only the raw command output with no marker pollution.
+	StructuredOutputPath string `json:"structuredOutputPath,omitempty"`
 }
 
 // AuditEntry represents a single sandbox violation or event.

@@ -41,13 +41,35 @@ const (
 	rlimitNPROC = 6 // RLIMIT_NPROC: max child processes
 )
 
+// writeStructured writes a structured output line (e.g. "FSDIFF:{...}") either
+// to the file at cfg.StructuredOutputPath (when set) or to stdout as a fallback.
+// When the path is set every caller appends to the same file so multiple markers
+// can coexist in one file, one per line.
+func writeStructured(cfg config.ExecConfig, marker string, data []byte) {
+	line := marker + string(data) + "\n"
+	if cfg.StructuredOutputPath != "" {
+		f, err := os.OpenFile(cfg.StructuredOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: open structured-output file: %v\n", err)
+			return
+		}
+		defer f.Close()
+		if _, err := f.WriteString(line); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: write structured-output file: %v\n", err)
+		}
+		return
+	}
+	// Fallback: write to stdout (legacy / buffered-run mode)
+	fmt.Print(line)
+}
+
 // run generates a Seatbelt profile from the config, applies RLIMIT quotas,
 // and executes the command under sandbox-exec with the generated profile.
 func run(cfg config.ExecConfig) error {
 	// Handle dump profile mode: output profile and exit
 	if cfg.DumpProfile {
 		profile := buildSeatbeltProfile(cfg)
-		fmt.Printf("PROFILE:%s\n", profile)
+		writeStructured(cfg, "PROFILE:", []byte(profile))
 		return nil
 	}
 
@@ -199,7 +221,7 @@ func run(cfg config.ExecConfig) error {
 		} else {
 			diff := fsdiff.Diff(beforeSnap, afterSnap)
 			data, _ := json.Marshal(diff)
-			fmt.Printf("FSDIFF:%s\n", string(data))
+			writeStructured(cfg, "FSDIFF:", data)
 		}
 	}
 
@@ -279,13 +301,12 @@ func runLearn(cfg config.ExecConfig) error {
 		}
 	}
 
-	// Output the learned policy — prepend newline to ensure it's on its own line
-	// even if the command output doesn't end with a newline
+	// Output the learned policy
 	data, err := json.Marshal(policy)
 	if err != nil {
 		return fmt.Errorf("marshaling learned policy: %w", err)
 	}
-	fmt.Printf("\nLEARNED:%s\n", string(data))
+	writeStructured(cfg, "LEARNED:", data)
 
 	return nil
 }

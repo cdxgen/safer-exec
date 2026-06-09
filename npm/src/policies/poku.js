@@ -43,10 +43,12 @@ export function pokuPolicy() {
       getNodeLibDir(),
       ...getSslPaths(),
       cwd,
+      join(home, '.npmrc'),
       join(home, 'go', 'pkg', 'mod'),  // Go module cache (Obs #3)
       join(home, '.m2'),               // Maven local repo
       join(home, '.gradle'),           // Gradle home
       join(home, '.cargo'),            // Cargo cache
+      ...(process.platform === 'darwin' ? [join(home, 'Library', 'Preferences', 'pnpm')] : []),
       ...getPnpmPaths(),
     ],
 

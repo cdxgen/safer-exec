@@ -7,7 +7,7 @@
 import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { dirname } from 'node:path';
-import { resolveBinaryPath, run } from './runner.js';
+import { resolveBinaryPath, run, runPipe, readStructuredFile } from './runner.js';
 
 const baseReadPaths = process.platform === 'darwin'
   ? ['/bin', '/usr', '/System', '/dev', '/private', dirname(process.execPath)]
@@ -49,5 +49,22 @@ describe('run', () => {
     const result = await run(createConfig({ cmd: 'sh', args: ['-c', 'echo $TEST_VAR'], env: { TEST_VAR: 'sandboxed_value' } }));
     strict.equal(result.exitCode, 0);
     strict.ok(result.stdout.includes('sandboxed_value'));
+  });
+});
+
+describe('runPipe', () => {
+  it('should stream real-time stdout and exit correctly', async () => {
+    let output = '';
+    const stdoutMock = {
+      write(chunk) {
+        output += chunk.toString();
+      }
+    };
+    const result = await runPipe(
+      createConfig({ cmd: 'echo', args: ['pipe test line'] }),
+      { stdout: stdoutMock }
+    );
+    strict.equal(result.exitCode, 0);
+    strict.ok(output.includes('pipe test line'));
   });
 });
