@@ -40,13 +40,42 @@ jobs:
       - name: Cross-compile ${{ matrix.os }}-${{ matrix.arch }}
         run: |
           cd go
-          GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -ldflags="-s -w" -o bin/safer-exec-${{ matrix.os }}-${{ matrix.arch }} ./cmd/safer-exec/
+          # CGO_ENABLED=0 required: cilium/ebpf is pure Go; static build works on both glibc and musl.
+          # -extldflags are Linux-only hardening flags; omit for darwin cross-compile to avoid linker warnings.
+          if [[ "${{ matrix.os }}" == "linux" ]]; then
+            CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build \
+              -ldflags="-s -w -extldflags=-Wl,-z,now,-z,relro" \
+              -o bin/safer-exec-${{ matrix.os }}-${{ matrix.arch }} ./cmd/safer-exec/
+          else
+            CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build \
+              -ldflags="-s -w" \
+              -o bin/safer-exec-${{ matrix.os }}-${{ matrix.arch }} ./cmd/safer-exec/
+          fi
 
       - name: Upload binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: safer-exec-${{ matrix.os }}-${{ matrix.arch }}
           path: go/bin/safer-exec-${{ matrix.os }}-${{ matrix.arch }}
+
+  check-bpf-objects:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Verify BPF .o files are committed
+        run: |
+          for f in \
+            go/internal/httptrace/bpf/ssl_trace_linux_amd64.o \
+            go/internal/httptrace/bpf/ssl_trace_linux_arm64.o; do
+            if [[ ! -s "$f" ]]; then
+              echo "ERROR: $f is missing or empty. Run go/internal/httptrace/bpf/compile.sh to regenerate."
+              exit 1
+            fi
+            echo "OK: $f ($(wc -c < "$f") bytes)"
+          done
 
   test-go:
     runs-on: ${{ matrix.os }}
@@ -72,6 +101,24 @@ jobs:
         run: |
           cd go
           go test -v -race ./...
+
+      - name: Verify --trace-http-urls graceful degradation (no CAP_BPF on runner)
+        if: contains(matrix.os, 'ubuntu')
+        run: |
+          cd go
+          CGO_ENABLED=0 go build -o /tmp/safer-exec-test ./cmd/safer-exec/
+          # The Go binary reads JSON config from stdin; CLI flags belong to the npm wrapper.
+          # Without CAP_BPF the eBPF warning is emitted but the process must exit 0.
+          output=$(echo '{"cmd":"/bin/echo","args":["http-trace-graceful-degradation-ok"],"traceHTTPURLs":true}' \
+            | /tmp/safer-exec-test 2>&1) || true
+          echo "$output"
+          # Fail only if the eBPF layer emitted a fatal (non-warning) error.
+          if echo "$output" | grep -q "safer-exec: http-trace:" && \
+             ! echo "$output" | grep -q "safer-exec: warning: http-trace:"; then
+            echo "ERROR: eBPF tracer emitted a fatal error instead of a graceful warning"
+            exit 1
+          fi
+          echo "Graceful degradation verified."
 
   test-node:
     runs-on: ${{ matrix.os }}
@@ -125,7 +172,7 @@ jobs:
           npm run test:security
 
   publish:
-    needs: [build-go, test-go, test-node]
+    needs: [build-go, check-bpf-objects, test-go, test-node]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     permissions:

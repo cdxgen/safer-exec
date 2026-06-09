@@ -159,12 +159,37 @@ type ExecConfig struct {
 	// TraceTempDir, when non-empty, specifies the directory where the dynamic library tracker (LD_AUDIT helper) is extracted.
 	TraceTempDir string `json:"traceTempDir,omitempty"`
 
+	// TraceHTTPURLs, when true, attaches eBPF uprobes to TLS write functions
+	// (SSL_write, gnutls_record_send, Go crypto/tls.(*Conn).Write) to capture
+	// plaintext HTTP/1.x requests before encryption. Requires Linux kernel >= 5.8
+	// and CAP_BPF + CAP_PERFMON in the init user namespace.
+	// Captured requests are emitted as "http-request" audit entries when
+	// EnableAudit is true, and as httpAccess entries in --learn mode output.
+	TraceHTTPURLs bool `json:"traceHTTPURLs"`
+
 	// StructuredOutputPath, when non-empty, redirects all structured output
 	// (FSDIFF, LEARNED, PROFILE markers) to the specified file path instead
 	// of writing them to stdout. The file is written as newline-delimited
 	// JSON lines, one marker per line. When this field is set, the binary's
 	// stdout carries only the raw command output with no marker pollution.
 	StructuredOutputPath string `json:"structuredOutputPath,omitempty"`
+}
+
+// HTTPAccessEntry records a single HTTP request observed during eBPF tracing.
+// It is emitted in audit logs as type "http-request" and stored in PolicyFile.HTTPAccess
+// when --learn mode is active with --trace-http-urls.
+type HTTPAccessEntry struct {
+	// Method is the HTTP verb (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS).
+	Method string `json:"method"`
+	// Host is the value of the HTTP Host header (e.g. "registry.npmjs.org").
+	Host string `json:"host"`
+	// Path is the request path (e.g. "/-/npm/v1/security/advisories/bulk").
+	Path string `json:"path,omitempty"`
+	// Source identifies the TLS library that was intercepted.
+	// One of: "ssl_write_uprobe", "go_tls_uprobe", "gnutls_uprobe".
+	Source string `json:"source"`
+	// PID is the host PID of the process that made the request.
+	PID uint32 `json:"pid,omitempty"`
 }
 
 // AuditEntry represents a single sandbox violation or event.
@@ -273,6 +298,10 @@ type PolicyFile struct {
 	GPUUsed        bool `json:"gpuUsed,omitempty"`
 	TPMUsed        bool `json:"tpmUsed,omitempty"`
 	AntiVMActive   bool `json:"antiVMActive,omitempty"`
+
+	// HTTP access log — populated when --trace-http-urls is used with --learn
+	// or --audit. Records observed HTTP requests with method, host, and path.
+	HTTPAccess []HTTPAccessEntry `json:"httpAccess,omitempty"`
 
 	// Informational — set by learner, ignored when loading as policy-file
 	Cmd  string   `json:"cmd,omitempty"`

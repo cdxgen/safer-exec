@@ -262,3 +262,140 @@ if (result.auditLog) {
   // or added as components to the SBOM.
 }
 ```
+
+---
+
+## HTTPS URL Tracing (`--trace-http-urls`)
+
+### Overview
+
+`--trace-http-urls` attaches eBPF uprobes to TLS write functions (`SSL_write` in OpenSSL/BoringSSL, `gnutls_record_send` in GnuTLS, `crypto/tls.(*Conn).Write` in Go binaries) to capture plaintext HTTP/1.x request headers **before encryption happens**. Unlike a network proxy or MITM approach, this requires no CA certificate and no modification of the target process.
+
+### Prerequisites
+
+| Requirement      | Detail                                                                                                                                        |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Linux only**   | eBPF uprobes are a Linux kernel feature. macOS and other platforms gracefully skip this feature.                                              |
+| **Kernel ≥ 5.8** | BPF ring buffer (`BPF_MAP_TYPE_RINGBUF`) was introduced in 5.8.                                                                               |
+| **Architecture** | `amd64` and `arm64` only. Other architectures fall back gracefully.                                                                           |
+| **Privileges**   | `CAP_BPF` + `CAP_PERFMON` in the init user namespace, or `root`. On most systems this means running with `sudo`.                              |
+| **TLS library**  | OpenSSL / BoringSSL (`libssl.so`), GnuTLS (`libgnutls.so`), or a Go binary. The feature is silently skipped if no supported library is found. |
+| **HTTP version** | HTTP/1.x only. HTTP/2 uses binary HPACK framing and cannot be decoded. A friendly warning is emitted when HTTP/2 is detected.                 |
+
+Install `bpftrace` (optional, for independent verification):
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install -y bpftrace
+
+# Fedora/RHEL
+sudo dnf install -y bpftrace
+```
+
+### JSON Audit Entry Shape
+
+Each captured HTTP/1.x request emits one JSON line to stderr:
+
+```json
+{
+  "type": "http-request",
+  "method": "GET",
+  "host": "registry.npmjs.org",
+  "path": "/express",
+  "source": "ssl_write_uprobe",
+  "pid": 12345
+}
+```
+
+| Field    | Type     | Description                                                                                                 |
+| -------- | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `type`   | `string` | Always `"http-request"`                                                                                     |
+| `method` | `string` | HTTP verb: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `CONNECT`, `TRACE`                   |
+| `host`   | `string` | Value of the HTTP `Host` header (e.g. `"registry.npmjs.org"`)                                               |
+| `path`   | `string` | Request-target path (e.g. `"/express"`, `"/-/npm/v1/security/advisories/bulk"`)                             |
+| `source` | `string` | TLS library intercepted: `"ssl_write_uprobe"` (OpenSSL), `"go_tls_uprobe"` (Go), `"gnutls_uprobe"` (GnuTLS) |
+| `pid`    | `number` | Host PID of the process that made the request                                                               |
+
+In `--learn` mode the same entries are deduplicated and written to the `httpAccess` array of the generated policy file:
+
+```json
+{
+  "httpAccess": [
+    {
+      "method": "GET",
+      "host": "registry.npmjs.org",
+      "path": "/express",
+      "source": "ssl_write_uprobe"
+    },
+    {
+      "method": "GET",
+      "host": "registry.npmjs.org",
+      "path": "/lodash",
+      "source": "ssl_write_uprobe"
+    }
+  ]
+}
+```
+
+### CLI Examples
+
+```bash
+# Capture HTTPS URLs made by npm install (HTTP/1.1 forced to bypass HTTP/2)
+sudo safer-exec --policy npm --trace-http-urls --audit -- npm install
+
+# Capture URLs and record into a reusable policy file
+sudo safer-exec --learn --learn-output policy.json --trace-http-urls -- npm install
+
+# Verify the uprobe fires independently using bpftrace
+sudo bpftrace -e 'uprobe:/usr/lib/x86_64-linux-gnu/libssl.so.3:SSL_write {
+  printf("SSL_write pid=%d len=%d\n", pid, (int64)arg2);
+}'
+```
+
+### JavaScript API Examples
+
+```js
+import { SaferExec } from "@cdxgen/safer-exec";
+
+// Audit mode: capture all HTTPS requests as structured audit entries
+const result = await new SaferExec()
+  .applyPolicy("npm")
+  .traceHTTPURLs()
+  .enableAudit()
+  .run("npm", ["install"]);
+
+// Filter http-request entries from the audit log
+const httpRequests = result.auditLog.filter((e) => e.type === "http-request");
+console.log(httpRequests);
+/* Output:
+[
+  { type: 'http-request', method: 'GET', host: 'registry.npmjs.org',
+    path: '/express', source: 'ssl_write_uprobe', pid: 12345 },
+  { type: 'http-request', method: 'GET', host: 'registry.npmjs.org',
+    path: '/-/npm/v1/security/advisories/bulk', source: 'ssl_write_uprobe', pid: 12346 }
+]
+*/
+```
+
+```js
+// Learn mode: capture unique URLs into a reusable policy file
+const learnResult = await new SaferExec()
+  .applyPolicy("npm")
+  .traceHTTPURLs()
+  .enableLearn()
+  .policyFile("./npm-policy.json")
+  .run("npm", ["install"]);
+
+// The generated policy.json will contain:
+// { "httpAccess": [{ "method": "GET", "host": "registry.npmjs.org", ... }] }
+```
+
+### Troubleshooting
+
+| Symptom                                       | Cause                                                              | Fix                                                                                                       |
+| --------------------------------------------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| `http-trace: eBPF HTTP tracing not supported` | Missing `CAP_BPF`/`CAP_PERFMON`, kernel < 5.8, or unsupported arch | Run with `sudo`; upgrade kernel                                                                           |
+| `http-trace: no SSL/TLS libraries found`      | `libssl.so` not installed                                          | `apt-get install libssl3`                                                                                 |
+| Empty `auditLog` despite HTTP activity        | Program uses HTTP/2 (binary HPACK)                                 | Force HTTP/1.1 with `--http1.1` flag or equivalent                                                        |
+| `http-trace: process is using HTTP/2…`        | Program negotiated h2 via ALPN                                     | Add `--http1.1` / `--no-alpn` to the sandboxed command, or accept that HTTP/2 endpoints won't be captured |
+| `pivot_root failed, falling back to chroot`   | `readPaths` includes `/` (entire root bind-mounted over tmpfs)     | Use specific paths via a policy preset instead of `readPaths: ["/"]`                                      |

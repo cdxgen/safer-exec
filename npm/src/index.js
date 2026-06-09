@@ -270,6 +270,9 @@ export class SaferExec {
 
     /** @type {boolean} Suppress printing lib-load JSON entries to stderr stream */
     this._suppressLibLoadStderr = options.suppressLibLoadStderr || false;
+
+    /** @type {boolean} Attach eBPF uprobes to TLS write functions to capture HTTP URLs (Linux only, kernel >= 5.8) */
+    this._traceHTTPURLs = options.traceHTTPURLs || false;
   }
 
   /**
@@ -473,6 +476,9 @@ export class SaferExec {
     }
     if (raw.traceTempDir) {
       this.traceTempDir(raw.traceTempDir);
+    }
+    if (raw.traceHTTPURLs) {
+      this.traceHTTPURLs();
     }
 
     return this;
@@ -939,6 +945,24 @@ export class SaferExec {
   }
 
   /**
+   * Enable eBPF-based HTTP URL tracing via uprobes on TLS write functions.
+   *
+   * Attaches uprobes to SSL_write (OpenSSL/BoringSSL), gnutls_record_send (GnuTLS),
+   * and Go's crypto/tls.(*Conn).Write to capture plaintext HTTP/1.x requests before
+   * encryption. Observed requests are emitted as "http-request" audit entries and
+   * included in the learned policy when combined with enableLearn().
+   *
+   * Requirements: Linux kernel >= 5.8, CAP_BPF + CAP_PERFMON (effectively root).
+   * Gracefully falls back with a warning on unsupported platforms/kernels.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  traceHTTPURLs() {
+    this._traceHTTPURLs = true;
+    return this;
+  }
+
+  /**
    * Set the temporary directory where the dynamic library tracker (LD_AUDIT helper) is extracted.
    *
    * @param {string} dir - The path to the directory
@@ -1089,6 +1113,7 @@ export class SaferExec {
       spoofAntiVM: this._spoofAntiVM,
       traceLibraries: this._traceLibraries,
       traceTempDir: this._traceTempDir,
+      traceHTTPURLs: this._traceHTTPURLs,
     };
 
     // Determine effective timeout: use explicit timeout or default to 60s
@@ -1143,7 +1168,7 @@ export class SaferExec {
     const options = {
       binaryPath,
       timeout: effectiveTimeout + 2000,
-      enableAudit: this._enableAudit || this._traceLibraries,
+      enableAudit: this._enableAudit || this._traceLibraries || this._traceHTTPURLs,
       suppressLibLoadStderr: this._suppressLibLoadStderr,
     };
     return runBinary(config, options);
@@ -1183,7 +1208,7 @@ export class SaferExec {
     const options = {
       binaryPath,
       timeout: effectiveTimeout + 2000,
-      enableAudit: this._enableAudit || this._traceLibraries,
+      enableAudit: this._enableAudit || this._traceLibraries || this._traceHTTPURLs,
       stdout: pipeOptions.stdout !== undefined ? pipeOptions.stdout : process.stdout,
       stderr: pipeOptions.stderr !== undefined ? pipeOptions.stderr : process.stderr,
       suppressLibLoadStderr: this._suppressLibLoadStderr,

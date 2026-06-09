@@ -105,6 +105,9 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	merged.TPMUsed = base.TPMUsed || observed.TPMUsed
 	merged.AntiVMActive = base.AntiVMActive || observed.AntiVMActive
 
+	// HTTP access — union, deduplicated by (method, host, path) key.
+	merged.HTTPAccess = mergeHTTPAccess(base.HTTPAccess, observed.HTTPAccess)
+
 	// Informational — observed (most recent run)
 	merged.Cmd = observed.Cmd
 	merged.Args = observed.Args
@@ -209,4 +212,23 @@ func pickNonZeroFloat(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// mergeHTTPAccess returns the union of two HTTPAccessEntry slices, deduplicated
+// by (method, host, path). Source and PID from the first occurrence are kept.
+func mergeHTTPAccess(a, b []HTTPAccessEntry) []HTTPAccessEntry {
+	type key struct{ method, host, path string }
+	seen := make(map[key]bool)
+	var result []HTTPAccessEntry
+	for _, e := range append(a, b...) {
+		k := key{e.Method, e.Host, e.Path}
+		if !seen[k] {
+			seen[k] = true
+			result = append(result, e)
+		}
+	}
+	if result == nil {
+		result = []HTTPAccessEntry{}
+	}
+	return result
 }

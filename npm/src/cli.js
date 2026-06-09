@@ -85,6 +85,7 @@ Options:
   --trace-libraries          Track dynamically loaded libraries at runtime
   --trace-output-file=<file> Write tracked libraries to file (implies trace-libraries)
   --trace-temp-dir=<dir>     Temporary directory to extract dynamic library helper to (implies trace-libraries)
+  --trace-http-urls          Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only, requires CAP_BPF)
 
   -d, --diff                 Enable filesystem mutation diffing
   -l, --learn                Enable behavioral auto-profiling (learning mode)
@@ -176,6 +177,9 @@ function parseCliArgs() {
         type: 'boolean',
       },
       'trace-libraries': {
+        type: 'boolean',
+      },
+      'trace-http-urls': {
         type: 'boolean',
       },
       'trace-output-file': {
@@ -443,6 +447,9 @@ function buildExec(values, cmd, args) {
   }
   if (values['spoof-antivm']) {
     exec.spoofAntiVM();
+  }
+  if (values['trace-http-urls']) {
+    exec.traceHTTPURLs();
   }
   if (values['trace-libraries'] || values['trace-output-file'] || values['trace-temp-dir']) {
     exec.traceLibraries();

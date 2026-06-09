@@ -64,37 +64,38 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 
 `new SaferExec(options?)`
 
-| Option               | Type       | Default         | Description                                |
-| -------------------- | ---------- | --------------- | ------------------------------------------ |
-| `allowHosts`         | `string[]` | `[]`            | Hostnames to allow network access to       |
-| `readPaths`          | `string[]` | `[]`            | Filesystem paths to read from              |
-| `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to               |
-| `env`                | `Object`   | `{}`            | Environment variables to set               |
-| `disableNetwork`     | `boolean`  | `false`         | Cut all network access                     |
-| `maxMemoryMB`        | `number`   | `0`             | Memory limit in megabytes                  |
-| `maxCPUCores`        | `number`   | `0`             | CPU limit as fractional cores              |
-| `maxProcesses`       | `number`   | `0`             | Max child processes (anti-fork bomb)       |
-| `timeoutMs`          | `number`   | `0`             | Hard kill timeout in milliseconds          |
-| `workingDir`         | `string`   | `process.cwd()` | Working directory                          |
-| `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                    |
-| `enableAudit`        | `boolean`  | `false`         | Enable violation auditing                  |
-| `allowPorts`         | `number[]` | `[]`            | TCP ports to allow                         |
-| `enableDiff`         | `boolean`  | `false`         | Enable filesystem mutation diffing         |
-| `enableLearn`        | `boolean`  | `false`         | Enable behavioral auto-profiling           |
-| `allowExec`          | `string[]` | `[]`            | Executables the command is allowed to run  |
-| `blockExec`          | `string[]` | `[]`            | Executables to block from running          |
-| `blockFork`          | `boolean`  | `false`         | Prevent forking new processes              |
-| `traceExec`          | `boolean`  | `false`         | Log every child process spawned            |
-| `strict`             | `boolean`  | `false`         | Treat sandbox setup warnings as errors     |
-| `allowCrypto`        | `boolean`  | `true`          | Permit cryptographic library/device access |
-| `blockCrypto`        | `boolean`  | `false`         | Block system crypto libraries access       |
-| `blockCryptoEntropy` | `boolean`  | `false`         | Block entropy (/dev/random) device access  |
-| `detectFIPS`         | `boolean`  | `false`         | Enable FIPS compliance checks/logging      |
-| `strictFIPS`         | `boolean`  | `false`         | Force strict FIPS validation               |
-| `allowGPU`           | `boolean`  | `false`         | Permit process to utilize host GPU nodes   |
-| `blockTPM`           | `boolean`  | `false`         | Restrict hardware access to TPM device     |
-| `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks |
-| `traceLibraries`     | `boolean`  | `false`         | Track dynamic library loading (opt-in)     |
+| Option               | Type       | Default         | Description                                                                |
+| -------------------- | ---------- | --------------- | -------------------------------------------------------------------------- |
+| `allowHosts`         | `string[]` | `[]`            | Hostnames to allow network access to                                       |
+| `readPaths`          | `string[]` | `[]`            | Filesystem paths to read from                                              |
+| `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to                                               |
+| `env`                | `Object`   | `{}`            | Environment variables to set                                               |
+| `disableNetwork`     | `boolean`  | `false`         | Cut all network access                                                     |
+| `maxMemoryMB`        | `number`   | `0`             | Memory limit in megabytes                                                  |
+| `maxCPUCores`        | `number`   | `0`             | CPU limit as fractional cores                                              |
+| `maxProcesses`       | `number`   | `0`             | Max child processes (anti-fork bomb)                                       |
+| `timeoutMs`          | `number`   | `0`             | Hard kill timeout in milliseconds                                          |
+| `workingDir`         | `string`   | `process.cwd()` | Working directory                                                          |
+| `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                                                    |
+| `enableAudit`        | `boolean`  | `false`         | Enable violation auditing                                                  |
+| `allowPorts`         | `number[]` | `[]`            | TCP ports to allow                                                         |
+| `enableDiff`         | `boolean`  | `false`         | Enable filesystem mutation diffing                                         |
+| `enableLearn`        | `boolean`  | `false`         | Enable behavioral auto-profiling                                           |
+| `allowExec`          | `string[]` | `[]`            | Executables the command is allowed to run                                  |
+| `blockExec`          | `string[]` | `[]`            | Executables to block from running                                          |
+| `blockFork`          | `boolean`  | `false`         | Prevent forking new processes                                              |
+| `traceExec`          | `boolean`  | `false`         | Log every child process spawned                                            |
+| `strict`             | `boolean`  | `false`         | Treat sandbox setup warnings as errors                                     |
+| `allowCrypto`        | `boolean`  | `true`          | Permit cryptographic library/device access                                 |
+| `blockCrypto`        | `boolean`  | `false`         | Block system crypto libraries access                                       |
+| `blockCryptoEntropy` | `boolean`  | `false`         | Block entropy (/dev/random) device access                                  |
+| `detectFIPS`         | `boolean`  | `false`         | Enable FIPS compliance checks/logging                                      |
+| `strictFIPS`         | `boolean`  | `false`         | Force strict FIPS validation                                               |
+| `allowGPU`           | `boolean`  | `false`         | Permit process to utilize host GPU nodes                                   |
+| `blockTPM`           | `boolean`  | `false`         | Restrict hardware access to TPM device                                     |
+| `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks                                 |
+| `traceLibraries`     | `boolean`  | `false`         | Track dynamic library loading (opt-in)                                     |
+| `traceHTTPURLs`      | `boolean`  | `false`         | Capture HTTPS request URLs via eBPF uprobes (Linux only, requires CAP_BPF) |
 
 ### Instance Methods
 
@@ -133,6 +134,7 @@ All methods return `this` for chaining except `.run()`.
 | `.blockTPM()`           | Restrict hardware access to TPM device                                   |
 | `.spoofAntiVM()`        | Intercept debugger & virtualization checks                               |
 | `.traceLibraries()`     | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS) |
+| `.traceHTTPURLs()`      | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)     |
 
 ### `.run(cmd, args?)`
 
@@ -491,6 +493,48 @@ safer-exec --trace-libraries --audit -- python3 script.py
 
 > [!NOTE]
 > `--trace-libraries` and `--trace-output-file` work out-of-the-box on Linux (using the embedded precompiled helper library or proc maps fallback) and macOS (using the existing Seatbelt audit infrastructure). On Linux, the precompiled LD_AUDIT helper is extracted to a temporary folder before execution. The path is automatically negotiated checking common CI temp variables (`RUNNER_TEMP`, `WORKSPACE_TMP`, `CI_PROJECT_DIR`, etc.) or working directories, but you can explicitly specify it via `--trace-temp-dir` (CLI) or `.traceTempDir(dir)` (JS API). No external compiler is required.
+
+## HTTPS URL Tracing (`--trace-http-urls`)
+
+Enable opt-in capture of outbound HTTPS request URLs and methods by attaching eBPF uprobes to TLS write functions. Because the uprobes fire _before_ encryption, the plaintext HTTP/1.x request headers are captured without needing a CA certificate or man-in-the-middle proxy.
+
+**Platform requirements:**
+
+- Linux kernel ≥ 5.8 (BPF ring buffer support), `amd64` or `arm64`
+- `CAP_BPF` + `CAP_PERFMON` in the init user namespace (typically requires running as root or with those capabilities granted)
+- Supported TLS libraries: OpenSSL/BoringSSL (`libssl.so`), GnuTLS (`libgnutls.so`), Go's built-in `crypto/tls`
+
+When requirements are not met the flag is silently ignored; execution continues without HTTP tracing.
+
+```bash
+# Capture HTTPS URLs during audit mode
+safer-exec --trace-http-urls --audit -- node index.js
+
+# Capture HTTPS URLs during learn mode (records into policy file's httpAccess section)
+safer-exec --learn --learn-output=policy.json --trace-http-urls -- npm install
+```
+
+```js
+// JavaScript API
+const result = await new SaferExec()
+  .traceHTTPURLs()
+  .enableAudit()
+  .run("node", ["index.js"]);
+
+// result.auditLog entries with type "http-request":
+// { type: "http-request", method: "GET", host: "registry.npmjs.org", path: "/-/npm/v1/security/advisories/bulk", source: "ssl_write_uprobe", pid: 12345 }
+```
+
+Each captured request emits a `{"type":"http-request","method":"...","host":"...","path":"...","source":"...","pid":...}` JSON line to stderr (audit log). In `--learn` mode, deduplicated entries are also written to the `httpAccess` array in the generated policy file.
+
+| Source value       | TLS library intercepted                |
+| ------------------ | -------------------------------------- |
+| `ssl_write_uprobe` | OpenSSL / BoringSSL (`libssl.so`)      |
+| `go_tls_uprobe`    | Go built-in `crypto/tls` (Go binaries) |
+| `gnutls_uprobe`    | GnuTLS (`libgnutls.so`)                |
+
+> [!NOTE]
+> Only HTTP/1.x requests are parsed. HTTP/2 (binary framing) is not currently decoded.
 
 ## Environment Variables
 

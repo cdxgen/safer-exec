@@ -18,6 +18,7 @@ import (
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
 	"github.com/cdxgen/safer-exec/go/internal/fsdiff"
+	"github.com/cdxgen/safer-exec/go/internal/httptrace"
 	"github.com/cdxgen/safer-exec/go/internal/learner"
 )
 
@@ -164,9 +165,28 @@ func run(cfg config.ExecConfig) error {
 		cmd.Dir = cfg.WorkingDir
 	}
 
+	// Start eBPF HTTP URL tracer BEFORE cmd.Start() so uprobes are attached
+	// before the child process can call SSL_write. Loading BPF takes ~10-50ms;
+	// doing it first ensures fast-starting commands (e.g. curl) are captured.
+	// A background goroutine refreshes the PID filter every 5ms after the
+	// process starts, covering the unshare → --init → target spawn chain.
+	var httpTracer httptrace.Tracer
+	var httpEvents []config.HTTPAccessEntry
+	var stopPIDRefresh chan struct{}
+	if cfg.TraceHTTPURLs {
+		if tr, err2 := httptrace.New(); err2 == nil {
+			httpTracer = tr
+		} else {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: http-trace: %v\n", err2)
+		}
+	}
+
 	if err := cmd.Start(); err != nil {
 		if cfg.EnableAudit && auditR != nil {
 			auditR.Close()
+		}
+		if httpTracer != nil {
+			httpTracer.Close()
 		}
 		return fmt.Errorf("starting sandboxed process: %w", err)
 	}
@@ -181,9 +201,52 @@ func run(cfg config.ExecConfig) error {
 		go monitorMaps(cmd.Process.Pid, stopMonitor)
 	}
 
+	if httpTracer != nil {
+		rootPID := uint32(cmd.Process.Pid)
+		stopPIDRefresh = make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(5 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				for p := range httptrace.PidDescendants(rootPID) {
+					_ = httpTracer.AddPID(p)
+				}
+				select {
+				case <-stopPIDRefresh:
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+
+		go func() {
+			for ev := range httpTracer.Events() {
+				entry := config.HTTPAccessEntry{
+					Method: ev.Method,
+					Host:   ev.Host,
+					Path:   ev.Path,
+					Source: ev.Source.String(),
+					PID:    ev.PID,
+				}
+				if cfg.EnableAudit {
+					logAuditHTTPEntry(entry)
+				}
+				httpEvents = append(httpEvents, entry)
+			}
+		}()
+	}
+
 	err = cmd.Wait()
+	if stopPIDRefresh != nil {
+		close(stopPIDRefresh)
+	}
 	if stopMonitor != nil {
 		close(stopMonitor)
+	}
+	if httpTracer != nil {
+		// Allow ring buffer drain goroutine to flush remaining events before close.
+		time.Sleep(100 * time.Millisecond)
+		httpTracer.Close()
 	}
 
 	if err != nil {
@@ -225,18 +288,73 @@ func run(cfg config.ExecConfig) error {
 	if cfg.EnableAudit && auditR != nil {
 		collectAuditLog(auditR)
 	}
+	_ = httpEvents // collected for future use / audit mode emission
 	return nil
 }
 
 func runLearn(cfg config.ExecConfig) error {
 	l := learner.New()
+
+	// Start eBPF HTTP tracer before running the learner command so we capture
+	// all TLS writes from the very beginning of execution.
+	var httpTracer httptrace.Tracer
+	var httpEntries []config.HTTPAccessEntry
+	if cfg.TraceHTTPURLs {
+		if tr, err := httptrace.New(); err == nil {
+			httpTracer = tr
+			// In learn mode with strace, we set trace-all because we don't
+			// know child PIDs ahead of time; strace spawns them itself.
+			_ = tr.SetTraceAll(true)
+			go func() {
+				for ev := range tr.Events() {
+					httpEntries = append(httpEntries, config.HTTPAccessEntry{
+						Method: ev.Method,
+						Host:   ev.Host,
+						Path:   ev.Path,
+						Source: ev.Source.String(),
+						PID:    ev.PID,
+					})
+				}
+			}()
+		} else {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: http-trace unavailable: %v\n", err)
+		}
+	}
+
 	policy, err := l.Learn(cfg)
+
+	if httpTracer != nil {
+		httpTracer.Close()
+	}
+
 	if err != nil {
 		return fmt.Errorf("learning mode: %w", err)
 	}
+
+	// Merge HTTP access entries into the learned policy.
+	if len(httpEntries) > 0 {
+		policy.HTTPAccess = deduplicateHTTPAccess(httpEntries)
+	}
+
 	data, _ := json.Marshal(policy)
 	writeStructured(cfg, "LEARNED:", data)
 	return nil
+}
+
+// deduplicateHTTPAccess removes duplicate (method, host, path) tuples,
+// keeping the first occurrence.
+func deduplicateHTTPAccess(entries []config.HTTPAccessEntry) []config.HTTPAccessEntry {
+	type key struct{ method, host, path string }
+	seen := make(map[key]bool, len(entries))
+	var result []config.HTTPAccessEntry
+	for _, e := range entries {
+		k := key{e.Method, e.Host, e.Path}
+		if !seen[k] {
+			seen[k] = true
+			result = append(result, e)
+		}
+	}
+	return result
 }
 
 // runReduced executes the target command with reduced isolation when user namespaces
@@ -872,6 +990,26 @@ func applySeccomp(cfg config.ExecConfig) error {
 
 func logAuditEntry(entryType, target string) {
 	entry := map[string]string{"type": entryType, "target": target, "details": fmt.Sprintf("violation detected at %s", target)}
+	data, _ := json.Marshal(entry)
+	auditFD := os.Getenv("SAFER_EXEC_AUDIT_FD")
+	if auditFD != "" {
+		fd, _ := strconv.Atoi(auditFD)
+		syscall.Write(fd, append(data, '\n'))
+	} else {
+		fmt.Fprintf(os.Stderr, "%s\n", string(data))
+	}
+}
+
+// logAuditHTTPEntry emits an "http-request" audit entry for a captured HTTP call.
+func logAuditHTTPEntry(e config.HTTPAccessEntry) {
+	entry := map[string]interface{}{
+		"type":   "http-request",
+		"method": e.Method,
+		"host":   e.Host,
+		"path":   e.Path,
+		"source": e.Source,
+		"pid":    e.PID,
+	}
 	data, _ := json.Marshal(entry)
 	auditFD := os.Getenv("SAFER_EXEC_AUDIT_FD")
 	if auditFD != "" {

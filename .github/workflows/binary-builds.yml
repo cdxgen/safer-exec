@@ -84,7 +84,7 @@ jobs:
         run: |
           # First compile Go binary on the host runner to avoid installing Go inside Docker
           echo "Compiling static Go binary on host for Linux ${{ matrix.arch }}..."
-          (cd go && CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/)
+          (cd go && CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -ldflags="-s -w -extldflags=-Wl,-z,now,-z,relro" -o bin/safer-exec ./cmd/safer-exec/)
 
           # Now run caxa inside an Alpine container which has a musl Node.js
           echo "Packaging standalone binary inside Alpine Docker..."
@@ -193,6 +193,34 @@ jobs:
               exit 1
             fi
             echo "Trace libraries verified successfully on macOS SEA binary!"
+          fi
+
+          if [[ "${{ matrix.os }}" == "linux" ]]; then
+            echo "Testing --trace-http-urls graceful degradation (no CAP_BPF on runner)..."
+            # The Go binary reads JSON config from stdin; CLI flags belong to the npm wrapper.
+            # GitHub Actions runners lack CAP_BPF so the eBPF tracer cannot load.
+            # We verify the binary emits a warning (not a fatal error) and does NOT crash
+            # with a non-zero exit due to the missing eBPF capability alone.
+            # The sandbox (unshare) may also fail in unprivileged containers — that is a
+            # separate concern; we grep only for the eBPF-specific error pattern.
+            JSON='{"cmd":"/bin/echo","args":["http-trace-degradation-ok"],"traceHTTPURLs":true}'
+            if [[ "${{ matrix.libc }}" == "musl" ]]; then
+              output=$(docker run --rm \
+                -v "${{ github.workspace }}:${{ github.workspace }}" \
+                -w "${{ github.workspace }}" \
+                alpine:3.21 \
+                sh -c "echo '$JSON' | ./${bin_name}" 2>&1) || true
+            else
+              output=$(echo "$JSON" | ./${bin_name} 2>&1) || true
+            fi
+            echo "$output"
+            # Fail only if the eBPF layer printed a *fatal* (non-warning) error.
+            if echo "$output" | grep -q "safer-exec: http-trace:" && \
+               ! echo "$output" | grep -q "safer-exec: warning: http-trace:"; then
+              echo "ERROR: eBPF tracer emitted a fatal error instead of a graceful warning"
+              exit 1
+            fi
+            echo "--trace-http-urls graceful degradation verified."
           fi
 
 

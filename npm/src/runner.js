@@ -54,34 +54,67 @@ export function resolveBinaryPath() {
   // Try to resolve from platform-specific optional dependencies
   const currentPlatform = platform();
   const currentArch = arch();
-  let pkgName = '';
+  let pkgName = "";
 
-  if (currentPlatform === 'darwin') {
-    if (currentArch === 'arm64') {
-      pkgName = '@cdxgen/safer-exec-darwin-arm64';
-    } else if (currentArch === 'x64') {
-      pkgName = '@cdxgen/safer-exec-darwin-amd64';
+  if (currentPlatform === "darwin") {
+    if (currentArch === "arm64") {
+      pkgName = "@cdxgen/safer-exec-darwin-arm64";
+    } else if (currentArch === "x64") {
+      pkgName = "@cdxgen/safer-exec-darwin-amd64";
     }
-  } else if (currentPlatform === 'linux') {
-    if (currentArch === 'x64') {
-      pkgName = '@cdxgen/safer-exec-linux-amd64';
-    } else if (currentArch === 'arm64') {
-      pkgName = '@cdxgen/safer-exec-linux-arm64';
+  } else if (currentPlatform === "linux") {
+    if (currentArch === "x64") {
+      pkgName = "@cdxgen/safer-exec-linux-amd64";
+    } else if (currentArch === "arm64") {
+      pkgName = "@cdxgen/safer-exec-linux-arm64";
     }
   }
 
-  if (pkgName) {
-    try {
-      const require = createRequire(import.meta.url);
-      const pkgJsonPath = require.resolve(`${pkgName}/package.json`);
-      const pkgDir = dirname(pkgJsonPath);
-      const binaryPath = join(pkgDir, 'bin', 'safer-exec');
-      if (existsSync(binaryPath)) {
-        return binaryPath;
+  if (!pkgName) {
+    return undefined;
+  }
+
+  try {
+    const require = createRequire(import.meta.url);
+    const mainPkgPath = require.resolve("@cdxgen/safer-exec");
+
+    // Resolve standard pnpm, npm, and yarn physical locations of node_modules relative to resolved package file
+    const searchDirs = [];
+    let curDir = dirname(mainPkgPath);
+    while (curDir && curDir !== dirname(curDir)) {
+      if (basename(curDir) === "node_modules") {
+        searchDirs.push(curDir);
       }
-    } catch (_err) {
-      // Package not installed
+      const nodeModulesSub = join(curDir, "node_modules");
+      if (existsSync(nodeModulesSub)) {
+        searchDirs.push(nodeModulesSub);
+      }
+      curDir = dirname(curDir);
     }
+
+    for (const modulesDir of searchDirs) {
+      // Direct structure under node_modules
+      const directPath = join(modulesDir, pkgName, "bin", "safer-exec");
+      let realDirectPath;
+      try {
+        realDirectPath = realpathSync(directPath);
+      } catch (_err) {
+        realDirectPath = directPath;
+      }
+      if (existsSync(realDirectPath)) {
+        try {
+          chmodSync(realDirectPath, 0o755);
+        } catch (_err) {
+          // ignore
+        }
+        return realDirectPath;
+      }
+    }
+  } catch (err) {
+    console.log(
+      "error resolving safer-exec package path:",
+      err.message,
+    );
   }
 
   // Try PATH
@@ -240,8 +273,9 @@ export function parseAuditLog(stderr) {
     try {
       const entry = JSON.parse(trimmed);
 
-      // Validate it looks like an audit entry
-      if (entry.type && entry.target) {
+      // Validate it looks like an audit entry.
+      // http-request entries use "host" instead of "target".
+      if (entry.type && (entry.target || entry.host)) {
         entries.push(entry);
       }
     } catch {
