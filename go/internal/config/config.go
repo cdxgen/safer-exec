@@ -156,6 +156,9 @@ type ExecConfig struct {
 	// TraceLibraries, when true, tracks dynamic library loading using LD_AUDIT (Linux) / DYLD_INSERT_LIBRARIES (macOS).
 	TraceLibraries bool `json:"traceLibraries"`
 
+	// TraceTempDir, when non-empty, specifies the directory where the dynamic library tracker (LD_AUDIT helper) is extracted.
+	TraceTempDir string `json:"traceTempDir,omitempty"`
+
 	// StructuredOutputPath, when non-empty, redirects all structured output
 	// (FSDIFF, LEARNED, PROFILE markers) to the specified file path instead
 	// of writing them to stdout. The file is written as newline-delimited

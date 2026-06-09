@@ -84,6 +84,7 @@ Options:
   --trace-exec               Log every child process spawned (fork + exec audit)
   --trace-libraries          Track dynamically loaded libraries at runtime
   --trace-output-file=<file> Write tracked libraries to file (implies trace-libraries)
+  --trace-temp-dir=<dir>     Temporary directory to extract dynamic library helper to (implies trace-libraries)
 
   -d, --diff                 Enable filesystem mutation diffing
   -l, --learn                Enable behavioral auto-profiling (learning mode)
@@ -178,6 +179,9 @@ function parseCliArgs() {
         type: 'boolean',
       },
       'trace-output-file': {
+        type: 'string',
+      },
+      'trace-temp-dir': {
         type: 'string',
       },
       'max-cpu': {
@@ -280,6 +284,7 @@ function parseCliArgs() {
       'cwd',
       'learn-output',
       'trace-output-file',
+      'trace-temp-dir',
       'allow-exec',
       'block-exec',
     ],
@@ -439,10 +444,13 @@ function buildExec(values, cmd, args) {
   if (values['spoof-antivm']) {
     exec.spoofAntiVM();
   }
-  if (values['trace-libraries'] || values['trace-output-file']) {
+  if (values['trace-libraries'] || values['trace-output-file'] || values['trace-temp-dir']) {
     exec.traceLibraries();
     if (values['trace-output-file']) {
       exec.suppressLibLoadStderr();
+    }
+    if (values['trace-temp-dir']) {
+      exec.traceTempDir(values['trace-temp-dir']);
     }
   }
 

@@ -482,12 +482,15 @@ safer-exec --trace-libraries -- node myapp.js
 # Output dynamic library list directly to a JSON file (automatically enables trace-libraries)
 safer-exec --trace-output-file=libs.json -- node myapp.js
 
+# Extract the helper library to a specific directory (implies trace-libraries)
+safer-exec --trace-temp-dir=/tmp/custom-temp-dir -- node myapp.js
+
 # Combine with audit output
 safer-exec --trace-libraries --audit -- python3 script.py
 ```
 
 > [!NOTE]
-> `--trace-libraries` and `--trace-output-file` work out-of-the-box on Linux (using the embedded precompiled helper library or proc maps fallback) and macOS (using the existing Seatbelt audit infrastructure). No external compiler is required.
+> `--trace-libraries` and `--trace-output-file` work out-of-the-box on Linux (using the embedded precompiled helper library or proc maps fallback) and macOS (using the existing Seatbelt audit infrastructure). On Linux, the precompiled LD_AUDIT helper is extracted to a temporary folder before execution. The path is automatically negotiated checking common CI temp variables (`RUNNER_TEMP`, `WORKSPACE_TMP`, `CI_PROJECT_DIR`, etc.) or working directories, but you can explicitly specify it via `--trace-temp-dir` (CLI) or `.traceTempDir(dir)` (JS API). No external compiler is required.
 
 ## Environment Variables
 

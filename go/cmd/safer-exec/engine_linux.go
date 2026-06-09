@@ -911,17 +911,37 @@ func execCommand(cfg config.ExecConfig) error {
 			var soPath string
 			var err error
 			if hasPrecompiledSo && len(auditHelperSo) > 0 {
-				soDir := os.Getenv("RUNNER_TEMP")
-				if soDir == "" {
-					soDir = cfg.WorkingDir
+				var candidates []string
+				if cfg.TraceTempDir != "" {
+					candidates = append(candidates, cfg.TraceTempDir)
 				}
-				if soDir == "" {
-					soDir = "."
+				envVars := []string{
+					"RUNNER_TEMP",
+					"WORKSPACE_TMP",
+					"CI_PROJECT_DIR",
+					"BITBUCKET_CLONE_DIR",
+					"CCI_TEMP_DIR",
+					"TMPDIR",
+					"TEMP",
+					"TMP",
 				}
-				soPath, err = extractPrecompiledAuditHelper(soDir)
-				if err != nil && soDir != "." {
-					soPath, err = extractPrecompiledAuditHelper(".")
+				for _, ev := range envVars {
+					if val := os.Getenv(ev); val != "" {
+						candidates = append(candidates, val)
+					}
 				}
+				if cfg.WorkingDir != "" {
+					candidates = append(candidates, cfg.WorkingDir)
+				}
+				candidates = append(candidates, ".")
+
+				for _, dir := range candidates {
+					soPath, err = extractPrecompiledAuditHelper(dir)
+					if err == nil {
+						break
+					}
+				}
+
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: failed to extract precompiled helper: %v\n", err)
 				} else {

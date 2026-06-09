@@ -265,6 +265,9 @@ export class SaferExec {
     /** @type {boolean} Track dynamic library loading (opt-in) */
     this._traceLibraries = options.traceLibraries || false;
 
+    /** @type {string} Temporary directory to extract dynamic library helper to */
+    this._traceTempDir = options.traceTempDir || '';
+
     /** @type {boolean} Suppress printing lib-load JSON entries to stderr stream */
     this._suppressLibLoadStderr = options.suppressLibLoadStderr || false;
   }
@@ -467,6 +470,9 @@ export class SaferExec {
     }
     if (raw.traceLibraries) {
       this.traceLibraries();
+    }
+    if (raw.traceTempDir) {
+      this.traceTempDir(raw.traceTempDir);
     }
 
     return this;
@@ -933,6 +939,20 @@ export class SaferExec {
   }
 
   /**
+   * Set the temporary directory where the dynamic library tracker (LD_AUDIT helper) is extracted.
+   *
+   * @param {string} dir - The path to the directory
+   * @returns {SaferExec} This instance for chaining
+   */
+  traceTempDir(dir) {
+    this._traceTempDir = dir;
+    if (dir) {
+      this._traceLibraries = true;
+    }
+    return this;
+  }
+
+  /**
    * Suppress dynamic library load warnings/entries from being printed to the stderr stream.
    *
    * @param {boolean} [val=true] - Whether to suppress the log lines from reaching process.stderr
@@ -1068,6 +1088,7 @@ export class SaferExec {
       blockTPM: this._blockTPM,
       spoofAntiVM: this._spoofAntiVM,
       traceLibraries: this._traceLibraries,
+      traceTempDir: this._traceTempDir,
     };
 
     // Determine effective timeout: use explicit timeout or default to 60s

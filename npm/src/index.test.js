@@ -96,6 +96,7 @@ describe('SaferExec', () => {
       strict.equal(exec._blockTPM, false);
       strict.equal(exec._spoofAntiVM, false);
       strict.equal(exec._traceLibraries, false);
+      strict.equal(exec._traceTempDir, '');
 
       const execCustom = new SaferExec({
         allowCrypto: false,
@@ -107,6 +108,7 @@ describe('SaferExec', () => {
         blockTPM: true,
         spoofAntiVM: true,
         traceLibraries: true,
+        traceTempDir: '/tmp/my-trace-helper',
       });
       strict.equal(execCustom._allowCrypto, false);
       strict.equal(execCustom._blockCrypto, true);
@@ -117,6 +119,7 @@ describe('SaferExec', () => {
       strict.equal(execCustom._blockTPM, true);
       strict.equal(execCustom._spoofAntiVM, true);
       strict.equal(execCustom._traceLibraries, true);
+      strict.equal(execCustom._traceTempDir, '/tmp/my-trace-helper');
     });
   });
 
@@ -190,7 +193,7 @@ describe('SaferExec', () => {
         .allowGPU(false)
         .blockTPM()
         .spoofAntiVM()
-        .traceLibraries();
+        .traceTempDir('/tmp/my-trace-helper');
 
       strict.equal(result, exec, 'all methods should return the same instance');
       strict.equal(exec._allowCrypto, false);
@@ -202,6 +205,7 @@ describe('SaferExec', () => {
       strict.equal(exec._blockTPM, true);
       strict.equal(exec._spoofAntiVM, true);
       strict.equal(exec._traceLibraries, true);
+      strict.equal(exec._traceTempDir, '/tmp/my-trace-helper');
     });
 
     it('should deduplicate allowHosts', () => {
