@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
@@ -174,7 +175,18 @@ func run(cfg config.ExecConfig) error {
 		auditW.Close()
 	}
 
-	if err := cmd.Wait(); err != nil {
+	var stopMonitor chan struct{}
+	if cfg.TraceLibraries && isMusl() {
+		stopMonitor = make(chan struct{})
+		go monitorMaps(cmd.Process.Pid, stopMonitor)
+	}
+
+	err = cmd.Wait()
+	if stopMonitor != nil {
+		close(stopMonitor)
+	}
+
+	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			if cfg.EnableAudit && auditR != nil {
 				collectAuditLog(auditR)
@@ -269,7 +281,18 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string) error {
 		auditW.Close()
 	}
 
-	if err := cmd.Wait(); err != nil {
+	var stopMonitor chan struct{}
+	if cfg.TraceLibraries && isMusl() {
+		stopMonitor = make(chan struct{})
+		go monitorMaps(cmd.Process.Pid, stopMonitor)
+	}
+
+	err := cmd.Wait()
+	if stopMonitor != nil {
+		close(stopMonitor)
+	}
+
+	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			if auditR != nil {
 				collectAuditLog(auditR)
@@ -881,32 +904,31 @@ func execCommand(cfg config.ExecConfig) error {
 	// capturing every shared library load via la_objopen().
 	var auditCleanup string
 	if cfg.TraceLibraries {
-		fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: enabled (LD_AUDIT).\n")
-		cFile, cErr := extractAuditHelper()
-		if cErr != nil {
-			fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: failed to extract helper: %v\n", cErr)
+		if isMusl() {
+			fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: enabled (proc maps fallback under musl).\n")
 		} else {
-			soPath := cFile + ".so"
-			// Try gcc first, fall back to cc
-			var compileErr error
-			for _, compiler := range []string{"gcc", "cc"} {
-				var compileOut strings.Builder
-				compileCmd := exec.Command(compiler, "-shared", "-fPIC", "-o", soPath, cFile)
-				compileCmd.Stderr = &compileOut
-				compileErr = compileCmd.Run()
-				if compileErr == nil {
-					fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: compiled with %s -> %s\n", compiler, soPath)
-					break
+			fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: enabled (LD_AUDIT).\n")
+			var soPath string
+			var err error
+			if hasPrecompiledSo && len(auditHelperSo) > 0 {
+				soPath, err = extractPrecompiledAuditHelper()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: failed to extract precompiled helper: %v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: using precompiled helper -> %s\n", soPath)
 				}
-				fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: %s failed: %v\n%s\n", compiler, compileErr, compileOut.String())
-			}
-			if _, statErr := os.Stat(soPath); statErr == nil {
-				env = append(env, fmt.Sprintf("LD_AUDIT=%s", soPath))
-				auditCleanup = soPath
 			} else {
-				fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: no .so produced, skipping injection\n")
+				fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: precompiled helper not available for this platform\n")
 			}
-			os.Remove(cFile)
+
+			if soPath != "" {
+				if _, statErr := os.Stat(soPath); statErr == nil {
+					env = append(env, fmt.Sprintf("LD_AUDIT=%s", soPath))
+					auditCleanup = soPath
+				} else {
+					fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: precompiled .so not found, skipping injection\n")
+				}
+			}
 		}
 	}
 	if auditCleanup != "" {
@@ -978,4 +1000,133 @@ func dedupPaths(paths []string) []string {
 		}
 	}
 	return result
+}
+
+func isMusl() bool {
+	for _, dir := range []string{"/lib", "/lib64", "/usr/lib", "/usr/lib64"} {
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if strings.HasPrefix(f.Name(), "ld-musl-") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func getDescendantPids(ppid int) []int {
+	pids := []int{ppid}
+	queue := []int{ppid}
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+
+		path := fmt.Sprintf("/proc/%d/task/%d/children", curr, curr)
+		data, err := os.ReadFile(path)
+		if err == nil {
+			fields := strings.Fields(string(data))
+			for _, f := range fields {
+				if childPid, err := strconv.Atoi(f); err == nil {
+					pids = append(pids, childPid)
+					queue = append(queue, childPid)
+				}
+			}
+		}
+	}
+
+	if len(pids) == 1 {
+		files, err := os.ReadDir("/proc")
+		if err == nil {
+			for _, f := range files {
+				pid, err := strconv.Atoi(f.Name())
+				if err != nil {
+					continue
+				}
+				statPath := fmt.Sprintf("/proc/%d/stat", pid)
+				data, err := os.ReadFile(statPath)
+				if err == nil {
+					commEnd := strings.LastIndex(string(data), ")")
+					if commEnd != -1 && commEnd+2 < len(data) {
+						fields := strings.Fields(string(data[commEnd+2:]))
+						if len(fields) >= 2 {
+							parentPid, _ := strconv.Atoi(fields[1])
+							for _, p := range pids {
+								if parentPid == p {
+									exists := false
+									for _, existing := range pids {
+										if existing == pid {
+											exists = true
+											break
+										}
+									}
+									if !exists {
+										pids = append(pids, pid)
+									}
+									break
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return pids
+}
+
+func monitorMaps(parentPid int, stopChan chan struct{}) {
+	seen := make(map[string]bool)
+	ticker := time.NewTicker(1 * time.Millisecond)
+	defer ticker.Stop()
+
+	scan := func() {
+		pids := getDescendantPids(parentPid)
+		for _, pid := range pids {
+			mapsPath := fmt.Sprintf("/proc/%d/maps", pid)
+			data, err := os.ReadFile(mapsPath)
+			if err != nil {
+				continue
+			}
+			lines := strings.Split(string(data), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				fields := strings.Fields(line)
+				if len(fields) < 6 {
+					continue
+				}
+				pathname := fields[len(fields)-1]
+				if !strings.HasPrefix(pathname, "/") {
+					continue
+				}
+				if strings.Contains(pathname, ".so") && !seen[pathname] {
+					seen[pathname] = true
+					entry := map[string]string{"type": "lib-load", "target": pathname}
+					if jsonData, err := json.Marshal(entry); err == nil {
+						fmt.Fprintf(os.Stderr, "%s\n", string(jsonData))
+					}
+				}
+			}
+		}
+	}
+
+	// Scan immediately
+	scan()
+
+	for {
+		select {
+		case <-stopChan:
+			// Final scan at exit
+			scan()
+			return
+		case <-ticker.C:
+			scan()
+		}
+	}
 }

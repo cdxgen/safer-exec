@@ -309,62 +309,26 @@ var _ = syscall.CLONE_NEWUSER
 
 // --- TraceLibraries / LD_AUDIT ---
 
-// TestTraceLibraries_ExtractHelper verifies that extractAuditHelper produces a
-// valid C source file containing the Linux rtld-audit interface hook.
-func TestTraceLibraries_ExtractHelper(t *testing.T) {
-	cFile, err := extractAuditHelper()
+// TestTraceLibraries_ExtractPrecompiledHelper verifies that extractPrecompiledAuditHelper
+// extracts a valid .so file when precompiled support is enabled.
+func TestTraceLibraries_ExtractPrecompiledHelper(t *testing.T) {
+	if !hasPrecompiledSo {
+		t.Skip("precompiled SO helper not enabled for this architecture/platform")
+	}
+
+	soPath, err := extractPrecompiledAuditHelper()
 	if err != nil {
-		t.Fatalf("extractAuditHelper failed: %v", err)
+		t.Fatalf("extractPrecompiledAuditHelper failed: %v", err)
 	}
-	defer os.Remove(cFile)
-
-	data, err := os.ReadFile(cFile)
-	if err != nil {
-		t.Fatalf("could not read extracted helper: %v", err)
-	}
-	src := string(data)
-
-	// Must contain la_objopen (rtld-audit entry point)
-	if !strings.Contains(src, "la_objopen") {
-		t.Errorf("Linux helper should contain la_objopen, got: %q", src)
-	}
-	// Must output lib-load JSON lines
-	if !strings.Contains(src, "lib-load") {
-		t.Errorf("helper should contain lib-load JSON tag, got: %q", src)
-	}
-}
-
-// TestTraceLibraries_Compilation verifies that the Linux audit helper C source
-// can be compiled into a shared object using gcc or cc.
-func TestTraceLibraries_Compilation(t *testing.T) {
-	compiler := ""
-	for _, c := range []string{"gcc", "cc"} {
-		if _, err := exec.LookPath(c); err == nil {
-			compiler = c
-			break
-		}
-	}
-	if compiler == "" {
-		t.Skip("neither gcc nor cc found")
-	}
-
-	cFile, err := extractAuditHelper()
-	if err != nil {
-		t.Fatalf("extractAuditHelper failed: %v", err)
-	}
-	defer os.Remove(cFile)
-
-	soPath := cFile + ".so"
 	defer os.Remove(soPath)
 
-	cmd := exec.Command(compiler, "-shared", "-fPIC", "-o", soPath, cFile)
-	out, err := cmd.CombinedOutput()
+	info, err := os.Stat(soPath)
 	if err != nil {
-		t.Fatalf("%s failed: %v\n%s", compiler, err, out)
+		t.Fatalf("could not stat extracted helper: %v", err)
 	}
 
-	if _, err := os.Stat(soPath); err != nil {
-		t.Errorf("expected .so to be produced at %s", soPath)
+	if info.Size() == 0 {
+		t.Errorf("extracted helper file has zero size")
 	}
 }
 

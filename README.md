@@ -468,15 +468,15 @@ console.log(result.auditLog.filter((e) => e.type === "lib-load"));
 
 | Platform  | Mechanism                                                           | Scope                                                                                                     |
 | --------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| **Linux** | `LD_AUDIT` via rtld-audit (`la_objopen` hook compiled at runtime)   | All ELF shared libraries loaded by `ld.so`, including transitive dependencies and `dlopen` calls          |
+| **Linux** | `LD_AUDIT` (glibc) or `/proc/<pid>/maps` monitor fallback (musl)     | All ELF shared libraries loaded, including transitive dependencies and `dlopen` calls                      |
 | **macOS** | Seatbelt audit (file-read events for `.dylib` / `.framework` paths) | Library paths as captured by Seatbelt trace; `DYLD_INSERT_LIBRARIES` is blocked by macOS hardened runtime |
 
-On Linux, `safer-exec` compiles a small C audit helper at runtime using `gcc` (or `cc` as fallback) and injects it via `LD_AUDIT`. Each loaded library emits a `{"type":"lib-load","target":"<path>"}` JSON entry to stderr, which `runner.js` parses into `result.auditLog`.
+On Linux (glibc), `safer-exec` ships with a precompiled C audit helper embedded inside the binary and injects it via `LD_AUDIT`. On Linux systems running `musl` libc (like Alpine Linux) where `LD_AUDIT` is not supported, it automatically falls back to a high-precision recursive `/proc/<pid>/maps` scanner. Each loaded library emits a `{"type":"lib-load","target":"<path>"}` JSON entry to stderr, which `runner.js` parses into `result.auditLog`.
 
 **CLI:**
 
 ```bash
-# Trace library loads on Linux (requires gcc)
+# Trace library loads on Linux (works out-of-the-box on both glibc and musl)
 safer-exec --trace-libraries -- node myapp.js
 
 # Combine with audit output
@@ -484,7 +484,7 @@ safer-exec --trace-libraries --audit -- python3 script.py
 ```
 
 > [!NOTE]
-> `--trace-libraries` requires `gcc` or `cc` to be installed on Linux for runtime compilation of the audit helper. On macOS, no compiler is required as the mechanism uses the existing Seatbelt audit infrastructure.
+> `--trace-libraries` works out-of-the-box on Linux (using the embedded precompiled helper library or proc maps fallback) and macOS (using the existing Seatbelt audit infrastructure). No external compiler is required.
 
 ## Environment Variables
 

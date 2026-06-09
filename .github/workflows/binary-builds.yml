@@ -127,7 +127,7 @@ jobs:
             ./${bin_name} --version
           fi
           
-          echo "Testing network sandboxing (should fail to resolve host)..."
+           echo "Testing network sandboxing (should fail to resolve host)..."
           if [[ "${{ matrix.libc }}" == "musl" ]]; then
             docker run --rm \
               --privileged \
@@ -138,6 +138,55 @@ jobs:
           else
             ./${bin_name} --disable-network -- curl -I -m 2 https://api.github.com && (echo "Error: Sandbox did not restrict network!" && exit 1) || echo "Network sandbox blocked request successfully!"
           fi
+
+          if [[ "${{ matrix.os }}" == "linux" ]]; then
+            echo "Testing trace-libraries sandboxing on Linux SEA binary..."
+            trace_output=$(./${bin_name} --trace-libraries --audit -- node tests/fixtures/trace_fixture.js 2>&1)
+            echo "Trace Output:"
+            echo "$trace_output"
+            if ! echo "$trace_output" | grep -q "trace-fixture-run"; then
+              echo "Error: Fixture did not run successfully!"
+              exit 1
+            fi
+            if ! echo "$trace_output" | grep -q "lib-load"; then
+              echo "Error: Dynamic library tracing did not capture any lib-load events!"
+              exit 1
+            fi
+            if [[ "${{ matrix.libc }}" == "musl" ]]; then
+              if ! echo "$trace_output" | grep -q "ld-musl"; then
+                echo "Error: Dynamic library tracing did not capture ld-musl on Alpine!"
+                exit 1
+              fi
+            else
+              if ! echo "$trace_output" | grep -q "libc.so"; then
+                echo "Error: Dynamic library tracing did not capture libc.so on glibc Linux!"
+                exit 1
+              fi
+            fi
+            echo "Trace libraries verified successfully on Linux SEA binary!"
+          fi
+
+          if [[ "${{ matrix.os }}" == "darwin" ]]; then
+            echo "Testing trace-libraries sandboxing on macOS SEA binary..."
+            trace_output=$(./${bin_name} --trace-libraries --audit -- node tests/fixtures/trace_fixture.js 2>&1)
+            echo "Trace Output:"
+            echo "$trace_output"
+            if ! echo "$trace_output" | grep -q "trace-fixture-run"; then
+              echo "Error: Fixture did not run successfully!"
+              exit 1
+            fi
+            if ! echo "$trace_output" | grep -q "trace-libraries: enabled on macOS"; then
+              echo "Error: Dynamic library tracing did not enable on macOS!"
+              exit 1
+            fi
+            if ! echo "$trace_output" | grep -E -q "file-read.*\.dylib|file-read.*\.framework"; then
+              echo "Error: Dynamic library tracing did not capture any dylib/framework file-read events!"
+              exit 1
+            fi
+            echo "Trace libraries verified successfully on macOS SEA binary!"
+          fi
+
+
 
       - name: Generate Checksums
         shell: bash

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -475,57 +474,11 @@ func TestReadConfig_InvalidJSON(t *testing.T) {
 
 // --- TraceLibraries / LD_AUDIT / DYLD_INSERT_LIBRARIES ---
 
-// TestTraceLibraries_ExtractHelper verifies that extractAuditHelper writes a
-// valid C source file containing the expected Darwin audit hook symbol.
-func TestTraceLibraries_ExtractHelper(t *testing.T) {
-	cFile, err := extractAuditHelper()
-	if err != nil {
-		t.Fatalf("extractAuditHelper failed: %v", err)
-	}
-	defer os.Remove(cFile)
-
-	data, err := os.ReadFile(cFile)
-	if err != nil {
-		t.Fatalf("could not read extracted helper: %v", err)
-	}
-
-	// On Darwin the helper uses _dyld_register_func_for_add_image
-	if !strings.Contains(string(data), "_dyld_register_func_for_add_image") {
-		t.Errorf("Darwin helper should contain _dyld_register_func_for_add_image, got: %q", string(data))
-	}
-	// Must output JSON lib-load lines
-	if !strings.Contains(string(data), "lib-load") {
-		t.Errorf("helper should contain lib-load JSON tag, got: %q", string(data))
-	}
-}
-
-// TestTraceLibraries_Compilation verifies that the Darwin audit helper C source
-// can be compiled into a dynamic library using clang.
-func TestTraceLibraries_Compilation(t *testing.T) {
-	if _, err := os.Stat("/usr/bin/clang"); err != nil {
-		// Try PATH
-		if _, pathErr := exec.LookPath("clang"); pathErr != nil {
-			t.Skip("clang not available")
-		}
-	}
-
-	cFile, err := extractAuditHelper()
-	if err != nil {
-		t.Fatalf("extractAuditHelper failed: %v", err)
-	}
-	defer os.Remove(cFile)
-
-	dylibPath := cFile + ".dylib"
-	defer os.Remove(dylibPath)
-
-	cmd := exec.Command("clang", "-dynamiclib", "-o", dylibPath, cFile)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("clang failed: %v\n%s", err, out)
-	}
-
-	if _, err := os.Stat(dylibPath); err != nil {
-		t.Errorf("expected dylib to be produced at %s", dylibPath)
+// TestTraceLibraries_ExtractPrecompiledHelper verifies that extractPrecompiledAuditHelper
+// behavior on Darwin (should skip).
+func TestTraceLibraries_ExtractPrecompiledHelper(t *testing.T) {
+	if !hasPrecompiledSo {
+		t.Skip("precompiled SO helper not enabled for this architecture/platform")
 	}
 }
 

@@ -310,25 +310,31 @@ describe('Integration Tests', () => {
       const result = await new SaferExec()
         .traceLibraries()
         .enableAudit()
-        .run('sh', ['-c', 'echo lib-load-test']);
+        .workingDir(FIXTURE_DIR)
+        .readPaths([FIXTURE_DIR])
+        .run('node', ['trace_fixture.js']);
 
       strict.equal(result.exitCode, 0);
-      // On Linux with gcc available, LD_AUDIT should emit lib-load JSON events.
-      // If gcc is not installed, the audit log may be empty — both are valid.
-      if (result.auditLog && result.auditLog.length > 0) {
-        const libLoads = result.auditLog.filter(e => e.type === 'lib-load');
-        strict.ok(
-          libLoads.length > 0,
-          `expected lib-load entries in auditLog, got types: ${JSON.stringify(result.auditLog.map(e => e.type))}`
-        );
-        // Each lib-load entry should have a target path ending in .so
-        for (const entry of libLoads) {
-          strict.ok(
-            entry.target && typeof entry.target === 'string',
-            `lib-load entry should have string target: ${JSON.stringify(entry)}`
-          );
-        }
-      }
+      strict.ok(result.stdout.includes('trace-fixture-run'), `expected fixture output, got: ${result.stdout}`);
+
+      // With precompiled SO support, LD_AUDIT must emit lib-load JSON events.
+      strict.ok(
+        result.auditLog && result.auditLog.length > 0,
+        'expected auditLog to be populated'
+      );
+
+      const libLoads = result.auditLog.filter(e => e.type === 'lib-load');
+      strict.ok(
+        libLoads.length > 0,
+        `expected lib-load entries in auditLog, got types: ${JSON.stringify(result.auditLog.map(e => e.type))}`
+      );
+
+      // Verify that libc or similar system libraries were tracked
+      const hasLibc = libLoads.some(entry => entry.target && (entry.target.includes('libc.so') || entry.target.includes('musl')));
+      strict.ok(
+        hasLibc,
+        `expected libc.so or musl to be in the tracked library loads, got: ${JSON.stringify(libLoads.map(e => e.target))}`
+      );
     });
 
     it('should support chaining traceLibraries with other options', async () => {
