@@ -20,5 +20,10 @@ func extractPrecompiledAuditHelper() (string, error) {
 		return "", err
 	}
 
+	if err := tmpFile.Chmod(0755); err != nil {
+		os.Remove(tmpFile.Name())
+		return "", err
+	}
+
 	return tmpFile.Name(), nil
 }

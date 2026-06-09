@@ -141,7 +141,16 @@ jobs:
 
           if [[ "${{ matrix.os }}" == "linux" ]]; then
             echo "Testing trace-libraries sandboxing on Linux SEA binary..."
-            trace_output=$(./${bin_name} --trace-libraries --audit -- node tests/fixtures/trace_fixture.js 2>&1)
+            if [[ "${{ matrix.libc }}" == "musl" ]]; then
+              trace_output=$(docker run --rm \
+                --privileged \
+                -v "${{ github.workspace }}:${{ github.workspace }}" \
+                -w "${{ github.workspace }}" \
+                alpine:3.21 \
+                sh -c "apk add --no-cache libstdc++ nodejs && ./${bin_name} --trace-libraries --audit -- node tests/fixtures/trace_fixture.js" 2>&1)
+            else
+              trace_output=$(./${bin_name} --trace-libraries --audit -- node tests/fixtures/trace_fixture.js 2>&1)
+            fi
             echo "Trace Output:"
             echo "$trace_output"
             if ! echo "$trace_output" | grep -q "trace-fixture-run"; then
