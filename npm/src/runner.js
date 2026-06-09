@@ -327,12 +327,16 @@ export async function runPipe(config, options = {}) {
       child.stdout.pipe(outStream);
     }
   }
-  if (errStream) {
-    if (typeof errStream.write === 'function' && typeof errStream.on !== 'function') {
-      child.stderr.on('data', (chunk) => errStream.write(chunk));
-    } else {
-      child.stderr.pipe(errStream);
-    }
+  let stderrBuffer = '';
+  if (options.enableAudit || errStream) {
+    child.stderr.on('data', (chunk) => {
+      if (options.enableAudit) {
+        stderrBuffer += chunk.toString();
+      }
+      if (errStream) {
+        errStream.write(chunk);
+      }
+    });
   }
 
   // Set up timeout
@@ -379,12 +383,18 @@ export async function runPipe(config, options = {}) {
         } catch {}
       }
 
+      let auditLog = null;
+      if (options.enableAudit) {
+        auditLog = parseAuditLog(stderrBuffer);
+      }
+
       resolve({
         exitCode: code ?? 1,
         timedOut,
         fsDiff,
         learnedPolicy,
         profile,
+        auditLog,
       });
     });
   });

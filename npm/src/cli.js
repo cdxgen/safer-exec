@@ -82,6 +82,8 @@ Options:
   --block-exec=<cmd>         Block specific executables from running (repeatable)
   --block-fork               Prevent the command from forking new processes
   --trace-exec               Log every child process spawned (fork + exec audit)
+  --trace-libraries          Track dynamically loaded libraries at runtime
+  --trace-output-file=<file> Write tracked libraries to file (implies trace-libraries)
 
   -d, --diff                 Enable filesystem mutation diffing
   -l, --learn                Enable behavioral auto-profiling (learning mode)
@@ -174,6 +176,9 @@ function parseCliArgs() {
       },
       'trace-libraries': {
         type: 'boolean',
+      },
+      'trace-output-file': {
+        type: 'string',
       },
       'max-cpu': {
         type: 'string',
@@ -274,6 +279,7 @@ function parseCliArgs() {
       'env',
       'cwd',
       'learn-output',
+      'trace-output-file',
       'allow-exec',
       'block-exec',
     ],
@@ -433,8 +439,11 @@ function buildExec(values, cmd, args) {
   if (values['spoof-antivm']) {
     exec.spoofAntiVM();
   }
-  if (values['trace-libraries']) {
+  if (values['trace-libraries'] || values['trace-output-file']) {
     exec.traceLibraries();
+    if (values['trace-output-file']) {
+      exec.suppressLibLoadStderr();
+    }
   }
 
   return { exec };
@@ -482,12 +491,29 @@ async function main() {
       if (values.learn && result.learnedPolicy === undefined) {
         result.learnedPolicy = null;
       }
+      if (values['trace-output-file'] && result.auditLog) {
+        const libLoads = result.auditLog
+          .filter((e) => e.type === 'lib-load')
+          .map((e) => e.target);
+        writeFileSync(values['trace-output-file'], JSON.stringify(libLoads, null, 2));
+      }
       process.stdout.write(JSON.stringify(result, null, 2) + '\n');
       process.exit(result.exitCode);
     }
 
     // Normal mode: stream stdout/stderr in real-time as the command runs
     const result = await exec.runPipe(cmd, args);
+
+    // Output trace-libraries to file if requested
+    if (values['trace-output-file'] && result.auditLog) {
+      const libLoads = result.auditLog
+        .filter((e) => e.type === 'lib-load')
+        .map((e) => e.target);
+      writeFileSync(values['trace-output-file'], JSON.stringify(libLoads, null, 2));
+      process.stderr.write(
+        `[safer-exec] Trace libraries output written to ${values['trace-output-file']}\n`
+      );
+    }
 
     // Output learned policy to file if requested
     if (values.learn && values['learn-output'] && result.learnedPolicy) {

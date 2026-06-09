@@ -264,6 +264,9 @@ export class SaferExec {
 
     /** @type {boolean} Track dynamic library loading (opt-in) */
     this._traceLibraries = options.traceLibraries || false;
+
+    /** @type {boolean} Suppress printing lib-load JSON entries to stderr stream */
+    this._suppressLibLoadStderr = options.suppressLibLoadStderr || false;
   }
 
   /**
@@ -930,6 +933,17 @@ export class SaferExec {
   }
 
   /**
+   * Suppress dynamic library load warnings/entries from being printed to the stderr stream.
+   *
+   * @param {boolean} [val=true] - Whether to suppress the log lines from reaching process.stderr
+   * @returns {SaferExec} This instance for chaining
+   */
+  suppressLibLoadStderr(val = true) {
+    this._suppressLibLoadStderr = val;
+    return this;
+  }
+
+  /**
    * Execute the sandboxed command.
    *
    * Before spawning the Go binary, this method:
@@ -1109,6 +1123,7 @@ export class SaferExec {
       binaryPath,
       timeout: effectiveTimeout + 2000,
       enableAudit: this._enableAudit || this._traceLibraries,
+      suppressLibLoadStderr: this._suppressLibLoadStderr,
     };
     return runBinary(config, options);
   }
@@ -1150,6 +1165,7 @@ export class SaferExec {
       enableAudit: this._enableAudit || this._traceLibraries,
       stdout: pipeOptions.stdout !== undefined ? pipeOptions.stdout : process.stdout,
       stderr: pipeOptions.stderr !== undefined ? pipeOptions.stderr : process.stderr,
+      suppressLibLoadStderr: this._suppressLibLoadStderr,
     };
     return runBinaryPipe(config, options);
   }

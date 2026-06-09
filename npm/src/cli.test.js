@@ -322,5 +322,18 @@ describe('CLI E2E', () => {
         try { unlinkSync(tempPolicy); } catch {}
       }
     });
+
+    it('should support --trace-output-file to capture dynamic libraries', async () => {
+      const tempTraceFile = join(tmpdir(), `cli-test-trace-${Date.now()}.json`);
+      try {
+        const res = await runCli('--trace-output-file', tempTraceFile, ...basePaths, '--', nodeCmd, '-e', 'console.log("trace-test")');
+        assertSuccess(res, 'trace-test');
+
+        const content = JSON.parse(readFileSync(tempTraceFile, 'utf8'));
+        strict.ok(Array.isArray(content), 'should write a JSON array');
+      } finally {
+        try { unlinkSync(tempTraceFile); } catch {}
+      }
+    });
   });
 });

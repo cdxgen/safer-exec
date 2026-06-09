@@ -192,3 +192,73 @@ steps:
 ```
 
 Using the standalone binary ensures that even if Node.js or other tools are not yet configured on the runner, process sandboxing works out of the box.
+
+---
+
+## Dynamic Library Tracing for SBOM Generation
+
+Software Bill of Materials (SBOM) generation often relies on static analysis, which can miss dynamically loaded libraries (`dlopen`-ed shared objects or platform-specific frameworks). `@cdxgen/safer-exec` supports dynamic library tracing to capture libraries loaded at runtime, enabling more complete and accurate SBOMs.
+
+### How it Works
+
+When `traceLibraries()` is enabled:
+
+1. On **glibc Linux**, `safer-exec` injects a precompiled `rtld-audit` helper using `LD_AUDIT`. The helper intercepts runtime linker actions (specifically `la_objopen`) and reports every loaded `.so` library.
+2. On **musl Linux (Alpine)**, `safer-exec` runs an active process maps monitor that periodically scans `/proc/<pid>/maps` of the parent and all spawned subprocesses.
+3. On **macOS**, `safer-exec` parses Seatbelt audit logs under the `file-read` event type matching `.dylib` or `.framework` paths.
+
+In all cases, library loads are streamed to `stderr` as JSON lines:
+
+```json
+{"type":"lib-load","target":"/lib/x86_64-linux-gnu/libc.so.6"}
+{"type":"lib-load","target":"/usr/lib/x86_64-linux-gnu/libcrypto.so.3"}
+```
+
+### JSON Structure
+
+Each entry consists of:
+
+- `type`: "lib-load" (identifies the event as a dynamic library loading event).
+- `target`: Absolute path to the shared library (`.so`, `.dylib`, or framework path).
+
+### CLI Example: Collecting Library Traces
+
+Run the command with dynamic library tracing enabled, directing standard output and audit logs accordingly:
+
+```bash
+# Execute node app.js and capture library loads from stderr
+node npm/src/cli.js --trace-libraries -- node app.js 2> raw_audit.log
+```
+
+You can filter and extract the dynamic libraries using standard tools like `jq`:
+
+```bash
+# Filter and extract library paths into a clean JSON list
+grep '{"type":"lib-load"' raw_audit.log | jq -s 'map(.target) | unique' > dynamic_libraries.json
+```
+
+### Programmatic Example: Generating Dependency Artifacts
+
+You can consume these events programmatically using the Node.js API:
+
+```javascript
+import { SaferExec } from "@cdxgen/safer-exec";
+
+const result = await new SaferExec()
+  .traceLibraries()
+  .enableAudit()
+  .run("node", ["app.js"]);
+
+if (result.auditLog) {
+  // Filter for dynamic library loads
+  const loadedLibraries = result.auditLog
+    .filter((event) => event.type === "lib-load")
+    .map((event) => event.target);
+
+  console.log("Dynamically loaded libraries detected:", loadedLibraries);
+  // Example output: ["/usr/lib/libsqlite3.dylib", "/usr/lib/libz.1.dylib"]
+
+  // These paths can then be translated into SPDX/CycloneDX external references
+  // or added as components to the SBOM.
+}
+```

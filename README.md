@@ -468,7 +468,7 @@ console.log(result.auditLog.filter((e) => e.type === "lib-load"));
 
 | Platform  | Mechanism                                                           | Scope                                                                                                     |
 | --------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| **Linux** | `LD_AUDIT` (glibc) or `/proc/<pid>/maps` monitor fallback (musl)     | All ELF shared libraries loaded, including transitive dependencies and `dlopen` calls                      |
+| **Linux** | `LD_AUDIT` (glibc) or `/proc/<pid>/maps` monitor fallback (musl)    | All ELF shared libraries loaded, including transitive dependencies and `dlopen` calls                     |
 | **macOS** | Seatbelt audit (file-read events for `.dylib` / `.framework` paths) | Library paths as captured by Seatbelt trace; `DYLD_INSERT_LIBRARIES` is blocked by macOS hardened runtime |
 
 On Linux (glibc), `safer-exec` ships with a precompiled C audit helper embedded inside the binary and injects it via `LD_AUDIT`. On Linux systems running `musl` libc (like Alpine Linux) where `LD_AUDIT` is not supported, it automatically falls back to a high-precision recursive `/proc/<pid>/maps` scanner. Each loaded library emits a `{"type":"lib-load","target":"<path>"}` JSON entry to stderr, which `runner.js` parses into `result.auditLog`.
@@ -479,12 +479,15 @@ On Linux (glibc), `safer-exec` ships with a precompiled C audit helper embedded 
 # Trace library loads on Linux (works out-of-the-box on both glibc and musl)
 safer-exec --trace-libraries -- node myapp.js
 
+# Output dynamic library list directly to a JSON file (automatically enables trace-libraries)
+safer-exec --trace-output-file=libs.json -- node myapp.js
+
 # Combine with audit output
 safer-exec --trace-libraries --audit -- python3 script.py
 ```
 
 > [!NOTE]
-> `--trace-libraries` works out-of-the-box on Linux (using the embedded precompiled helper library or proc maps fallback) and macOS (using the existing Seatbelt audit infrastructure). No external compiler is required.
+> `--trace-libraries` and `--trace-output-file` work out-of-the-box on Linux (using the embedded precompiled helper library or proc maps fallback) and macOS (using the existing Seatbelt audit infrastructure). No external compiler is required.
 
 ## Environment Variables
 
