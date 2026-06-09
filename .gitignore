@@ -4,9 +4,6 @@ go/bin/
 # Node modules
 node_modules/
 
-# Test fixtures
-tests/fixtures/
-
 # OS files
 **/.DS_Store
 
