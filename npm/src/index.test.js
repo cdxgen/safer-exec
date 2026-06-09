@@ -95,6 +95,7 @@ describe('SaferExec', () => {
       strict.equal(exec._allowGPU, false);
       strict.equal(exec._blockTPM, false);
       strict.equal(exec._spoofAntiVM, false);
+      strict.equal(exec._traceLibraries, false);
 
       const execCustom = new SaferExec({
         allowCrypto: false,
@@ -105,6 +106,7 @@ describe('SaferExec', () => {
         allowGPU: true,
         blockTPM: true,
         spoofAntiVM: true,
+        traceLibraries: true,
       });
       strict.equal(execCustom._allowCrypto, false);
       strict.equal(execCustom._blockCrypto, true);
@@ -114,6 +116,7 @@ describe('SaferExec', () => {
       strict.equal(execCustom._allowGPU, true);
       strict.equal(execCustom._blockTPM, true);
       strict.equal(execCustom._spoofAntiVM, true);
+      strict.equal(execCustom._traceLibraries, true);
     });
   });
 
@@ -186,7 +189,8 @@ describe('SaferExec', () => {
         .strictFIPS()
         .allowGPU(false)
         .blockTPM()
-        .spoofAntiVM();
+        .spoofAntiVM()
+        .traceLibraries();
 
       strict.equal(result, exec, 'all methods should return the same instance');
       strict.equal(exec._allowCrypto, false);
@@ -197,6 +201,7 @@ describe('SaferExec', () => {
       strict.equal(exec._allowGPU, false);
       strict.equal(exec._blockTPM, true);
       strict.equal(exec._spoofAntiVM, true);
+      strict.equal(exec._traceLibraries, true);
     });
 
     it('should deduplicate allowHosts', () => {

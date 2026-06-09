@@ -485,8 +485,8 @@ func setupFilesystem(cfg config.ExecConfig) error {
 				f.Close()
 			}
 		}
-		// If AllowGPU is false or BlockGPU is true, unmount or restrict NVIDIA/DRI access inside devDir
-		if !cfg.AllowGPU || cfg.BlockGPU {
+		// If AllowGPU is false, unmount or restrict NVIDIA/DRI access inside devDir
+		if !cfg.AllowGPU {
 			_ = syscall.Unmount(filepath.Join(devDir, "nvidiactl"), syscall.MNT_DETACH)
 			_ = syscall.Unmount(filepath.Join(devDir, "nvidia-uvm"), syscall.MNT_DETACH)
 			_ = syscall.Unmount(filepath.Join(devDir, "dri"), syscall.MNT_DETACH)
@@ -853,6 +853,43 @@ func execCommand(cfg config.ExecConfig) error {
 		_ = os.Chdir(cfg.WorkingDir)
 	}
 	env := config.BuildEnv(cfg.Env)
+
+	// Inject dynamic library tracking if TraceLibraries is enabled.
+	// LD_AUDIT hooks into the runtime linker via the rtld-audit interface,
+	// capturing every shared library load via la_objopen().
+	var auditCleanup string
+	if cfg.TraceLibraries {
+		fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: enabled (LD_AUDIT).\n")
+		cFile, cErr := extractAuditHelper()
+		if cErr != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: failed to extract helper: %v\n", cErr)
+		} else {
+			soPath := cFile + ".so"
+			// Try gcc first, fall back to cc
+			var compileErr error
+			for _, compiler := range []string{"gcc", "cc"} {
+				var compileOut strings.Builder
+				compileCmd := exec.Command(compiler, "-shared", "-fPIC", "-o", soPath, cFile)
+				compileCmd.Stderr = &compileOut
+				compileErr = compileCmd.Run()
+				if compileErr == nil {
+					fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: compiled with %s -> %s\n", compiler, soPath)
+					break
+				}
+				fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: %s failed: %v\n%s\n", compiler, compileErr, compileOut.String())
+			}
+			if _, statErr := os.Stat(soPath); statErr == nil {
+				env = append(env, fmt.Sprintf("LD_AUDIT=%s", soPath))
+				auditCleanup = soPath
+			} else {
+				fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: no .so produced, skipping injection\n")
+			}
+			os.Remove(cFile)
+		}
+	}
+	if auditCleanup != "" {
+		defer os.Remove(auditCleanup)
+	}
 
 	// Try execveat to allow seccomp filtering to block standard execve
 	err = execveat(-100, cmdPath, append([]string{cfg.Cmd}, cfg.Args...), env, 0)

@@ -10,6 +10,202 @@ On macOS the Go binary generates Seatbelt profiles and runs commands through `sa
 npm install @cdxgen/safer-exec
 ```
 
+## CLI
+
+The CLI provides terminal access to all sandbox features.
+
+```bash
+# Run with a built-in policy
+safer-exec --policy=npm -- npm install
+
+# Resource limits
+safer-exec --max-memory=512 --max-cpu=1.0 -- npm run build
+
+# Disable network, enable auditing
+safer-exec --disable-network --audit -- cat package.json
+
+# Filesystem diffing
+safer-exec --diff --write-path=/tmp -- sh -c "echo hello > /tmp/out.txt"
+
+# Learning mode
+safer-exec --learn --learn-output=policy.json -- npm install
+
+# Fork and exec control
+safer-exec --allow-exec=node --allow-exec=npx -- npm run build
+safer-exec --block-exec=sh -- npm install
+safer-exec --block-fork -- npm install
+safer-exec --trace-exec -- npm install
+```
+
+Full help: `safer-exec --help`.
+
+## Fluent API
+
+```js
+import { SaferExec } from "@cdxgen/safer-exec";
+
+const result = await new SaferExec()
+  .allowHosts("registry.npmjs.org", "api.github.com")
+  .readPaths("/usr", "/etc/ssl/certs")
+  .writePaths(process.cwd() + "/node_modules")
+  .env("NODE_ENV", "production")
+  .maxMemory(512)
+  .disableNetwork()
+  .run("npm", ["install"]);
+
+console.log(result.exitCode, result.stdout);
+```
+
+Every configuration method returns `this` for chaining. The `.run()` method returns a promise that resolves to an `ExecResult` object containing `stdout`, `stderr`, `exitCode`, and optional `auditLog`, `fsDiff`, or `learnedPolicy` fields depending on which features are enabled.
+
+## API Reference
+
+### Constructor
+
+`new SaferExec(options?)`
+
+| Option               | Type       | Default         | Description                                |
+| -------------------- | ---------- | --------------- | ------------------------------------------ |
+| `allowHosts`         | `string[]` | `[]`            | Hostnames to allow network access to       |
+| `readPaths`          | `string[]` | `[]`            | Filesystem paths to read from              |
+| `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to               |
+| `env`                | `Object`   | `{}`            | Environment variables to set               |
+| `disableNetwork`     | `boolean`  | `false`         | Cut all network access                     |
+| `maxMemoryMB`        | `number`   | `0`             | Memory limit in megabytes                  |
+| `maxCPUCores`        | `number`   | `0`             | CPU limit as fractional cores              |
+| `maxProcesses`       | `number`   | `0`             | Max child processes (anti-fork bomb)       |
+| `timeoutMs`          | `number`   | `0`             | Hard kill timeout in milliseconds          |
+| `workingDir`         | `string`   | `process.cwd()` | Working directory                          |
+| `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                    |
+| `enableAudit`        | `boolean`  | `false`         | Enable violation auditing                  |
+| `allowPorts`         | `number[]` | `[]`            | TCP ports to allow                         |
+| `enableDiff`         | `boolean`  | `false`         | Enable filesystem mutation diffing         |
+| `enableLearn`        | `boolean`  | `false`         | Enable behavioral auto-profiling           |
+| `allowExec`          | `string[]` | `[]`            | Executables the command is allowed to run  |
+| `blockExec`          | `string[]` | `[]`            | Executables to block from running          |
+| `blockFork`          | `boolean`  | `false`         | Prevent forking new processes              |
+| `traceExec`          | `boolean`  | `false`         | Log every child process spawned            |
+| `strict`             | `boolean`  | `false`         | Treat sandbox setup warnings as errors     |
+| `allowCrypto`        | `boolean`  | `true`          | Permit cryptographic library/device access |
+| `blockCrypto`        | `boolean`  | `false`         | Block system crypto libraries access       |
+| `blockCryptoEntropy` | `boolean`  | `false`         | Block entropy (/dev/random) device access  |
+| `detectFIPS`         | `boolean`  | `false`         | Enable FIPS compliance checks/logging      |
+| `strictFIPS`         | `boolean`  | `false`         | Force strict FIPS validation               |
+| `allowGPU`           | `boolean`  | `false`         | Permit process to utilize host GPU nodes   |
+| `blockTPM`           | `boolean`  | `false`         | Restrict hardware access to TPM device     |
+| `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks |
+| `traceLibraries`     | `boolean`  | `false`         | Track dynamic library loading (opt-in)     |
+
+### Instance Methods
+
+All methods return `this` for chaining except `.run()`.
+
+| Method                  | Description                                                              |
+| ----------------------- | ------------------------------------------------------------------------ |
+| `.applyPolicy(name)`    | Apply a pre-defined policy. Throws if unknown.                           |
+| `.allowHosts(...hosts)` | Add hostnames to the network allow list                                  |
+| `.readPaths(...paths)`  | Add filesystem read paths                                                |
+| `.writePaths(...paths)` | Add filesystem write paths                                               |
+| `.env(key, value)`      | Set an environment variable                                              |
+| `.disableNetwork()`     | Disable all network access                                               |
+| `.maxMemory(mb)`        | Set memory limit in megabytes                                            |
+| `.maxCPUCores(cores)`   | Set CPU limit as fractional cores (e.g. 0.5)                             |
+| `.maxProcesses(count)`  | Set maximum child process count                                          |
+| `.timeout(ms)`          | Set hard kill timeout in milliseconds                                    |
+| `.binaryPath(path)`     | Override the Go binary path                                              |
+| `.workingDir(dir)`      | Set the working directory                                                |
+| `.enableAudit()`        | Enable sandbox violation auditing                                        |
+| `.allowPorts(...ports)` | Set allowed TCP ports                                                    |
+| `.enableDiff()`         | Enable filesystem mutation diffing                                       |
+| `.enableLearn()`        | Enable behavioral auto-profiling                                         |
+| `.allowExec(...cmds)`   | Restrict which executables can run                                       |
+| `.blockExec(...cmds)`   | Block specific executables from running                                  |
+| `.blockFork()`          | Prevent the command from forking new processes                           |
+| `.traceExec()`          | Log every child process spawned                                          |
+| `.strict()`             | Treat sandbox setup warnings as hard errors                              |
+| `.resolveSymlinks()`    | Resolve target command symlink in PATH                                   |
+| `.allowCrypto(allow)`   | Allow/disallow cryptographic operations                                  |
+| `.blockCrypto()`        | Restrict system cryptographic libraries                                  |
+| `.blockCryptoEntropy()` | Restrict entropy devices (/dev/random)                                   |
+| `.detectFIPS()`         | Log and watch for FIPS lookups                                           |
+| `.strictFIPS()`         | Restrict runtime to strict FIPS compliant mode                           |
+| `.allowGPU(allow)`      | Allow/disallow access to host GPU nodes                                  |
+| `.blockTPM()`           | Restrict hardware access to TPM device                                   |
+| `.spoofAntiVM()`        | Intercept debugger & virtualization checks                               |
+| `.traceLibraries()`     | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS) |
+
+### `.run(cmd, args?)`
+
+Execute the sandboxed command. Returns `Promise<ExecResult>`:
+
+```ts
+interface Entry {
+  path: string;
+  size: number;
+}
+
+interface ExecResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  timedOut?: boolean;
+  auditLog?: Array<{ type: string; target: string; detail?: string }>;
+  fsDiff?: { added: Entry[]; modified: Entry[]; deleted: Entry[] };
+  learnedPolicy?: {
+    readPaths: string[];
+    writePaths: string[];
+    allowIPs: string[];
+    allowPorts: number[];
+    envVars: string[];
+    allowCrypto?: boolean;
+    blockCrypto?: boolean;
+    blockCryptoEntropy?: boolean;
+    detectFIPS?: boolean;
+    strictFIPS?: boolean;
+    fipsDetected?: boolean;
+    cmd: string;
+    args: string[];
+  };
+}
+```
+
+## Architecture
+
+The Node.js layer handles policy resolution, DNS lookups, and config serialization. It pipes a JSON `ExecConfig` to the Go binary over stdin. The Go binary reads the config and delegates to a platform-specific engine.
+
+**macOS path:**
+
+1. Generate a Seatbelt profile from the config
+2. Apply RLIMIT quotas (memory via `RLIMIT_AS`, CPU via `RLIMIT_CPU`, process count via `RLIMIT_NPROC`)
+3. Execute `sandbox-exec -f <profile> <cmd> <args...>`
+
+**Linux path (full isolation):**
+
+1. Probe for user namespace availability; fall back to reduced mode if restricted
+2. Fork self with `--init` flag and config in `SAFER_EXEC_CONFIG` env var
+3. Unshare namespaces (user, mount, PID, UTS, network)
+4. Map UID/GID to root inside the user namespace for mount privileges
+5. Create cgroup v2 hierarchy for resource quotas
+6. Mount tmpfs root, bind-mount read/write paths, mount proc and sysfs
+7. Apply Landlock v2 network confinement rules
+8. Apply seccomp-bpf filter blocking ptrace, kcmp, unshare, mount, pivot_root
+9. `pivot_root` to the new filesystem tree
+10. `execve` the target command
+
+**Linux path (reduced isolation — user namespaces unavailable):**
+
+1. Fork self with `--init-reduced` flag (no unshare)
+2. Create cgroup v2 hierarchy for resource quotas
+3. Apply Landlock v2 network confinement rules
+4. Apply seccomp-bpf syscall filter
+5. `execve` the target command (host filesystem fully visible)
+
+Communication between layers uses marker-prefixed JSON on stdout:
+
+- `FSDIFF:` prefix for filesystem diff reports
+- `LEARNED:` prefix for learned policy output
+- Audit entries are written as JSON lines to stderr
+
 ## Standalone SEA Binaries
 
 For environments without Node.js, or when you want to execute sandboxed commands directly using a standalone binary, pre-built Single Executable Application (SEA) binaries are published to GitHub Releases.
@@ -151,25 +347,6 @@ sudo sysctl -p /etc/sysctl.d/99-userns.conf
 
 This weakens a system-wide security policy. Prefer the AppArmor profile for production systems.
 
-## Fluent API
-
-```js
-import { SaferExec } from "@cdxgen/safer-exec";
-
-const result = await new SaferExec()
-  .allowHosts("registry.npmjs.org", "api.github.com")
-  .readPaths("/usr", "/etc/ssl/certs")
-  .writePaths(process.cwd() + "/node_modules")
-  .env("NODE_ENV", "production")
-  .maxMemory(512)
-  .disableNetwork()
-  .run("npm", ["install"]);
-
-console.log(result.exitCode, result.stdout);
-```
-
-Every configuration method returns `this` for chaining. The `.run()` method returns a promise that resolves to an `ExecResult` object containing `stdout`, `stderr`, `exitCode`, and optional `auditLog`, `fsDiff`, or `learnedPolicy` fields depending on which features are enabled.
-
 ## Pre-built Policies
 
 Apply a hardened profile for common package managers. User-defined settings take precedence over policy defaults when both are present.
@@ -259,180 +436,42 @@ console.log(result.auditLog);
 
 Each audit entry contains a type (`file-read`, `file-write`, `network-connect`, `syscall`, `process-exec`), the target resource, and optional details.
 
-## CLI
+## Library Tracing (Dynamic Link Observability)
 
-The CLI provides terminal access to all sandbox features.
+Enable opt-in dynamic library load tracking to observe which shared libraries a sandboxed process loads at runtime.
+
+```js
+const result = await new SaferExec()
+  .traceLibraries()
+  .enableAudit()
+  .run("node", ["myapp.js"]);
+
+// On Linux: auditLog contains {"type":"lib-load","target":"/lib/x86_64-linux-gnu/libc.so.6"} entries
+// On macOS: stderr contains trace-libraries diagnostic; .dylib loads appear as file-read audit events
+console.log(result.auditLog.filter((e) => e.type === "lib-load"));
+```
+
+**Platform behavior:**
+
+| Platform  | Mechanism                                                           | Scope                                                                                                     |
+| --------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| **Linux** | `LD_AUDIT` via rtld-audit (`la_objopen` hook compiled at runtime)   | All ELF shared libraries loaded by `ld.so`, including transitive dependencies and `dlopen` calls          |
+| **macOS** | Seatbelt audit (file-read events for `.dylib` / `.framework` paths) | Library paths as captured by Seatbelt trace; `DYLD_INSERT_LIBRARIES` is blocked by macOS hardened runtime |
+
+On Linux, `safer-exec` compiles a small C audit helper at runtime using `gcc` (or `cc` as fallback) and injects it via `LD_AUDIT`. Each loaded library emits a `{"type":"lib-load","target":"<path>"}` JSON entry to stderr, which `runner.js` parses into `result.auditLog`.
+
+**CLI:**
 
 ```bash
-# Run with a built-in policy
-safer-exec --policy=npm -- npm install
+# Trace library loads on Linux (requires gcc)
+safer-exec --trace-libraries -- node myapp.js
 
-# Resource limits
-safer-exec --max-memory=512 --max-cpu=1.0 -- npm run build
-
-# Disable network, enable auditing
-safer-exec --disable-network --audit -- cat package.json
-
-# Filesystem diffing
-safer-exec --diff --write-path=/tmp -- sh -c "echo hello > /tmp/out.txt"
-
-# Learning mode
-safer-exec --learn --learn-output=policy.json -- npm install
-
-# Fork and exec control
-safer-exec --allow-exec=node --allow-exec=npx -- npm run build
-safer-exec --block-exec=sh -- npm install
-safer-exec --block-fork -- npm install
-safer-exec --trace-exec -- npm install
+# Combine with audit output
+safer-exec --trace-libraries --audit -- python3 script.py
 ```
 
-Full help: `safer-exec --help`.
-
-## API Reference
-
-### Constructor
-
-`new SaferExec(options?)`
-
-| Option               | Type       | Default         | Description                                |
-| -------------------- | ---------- | --------------- | ------------------------------------------ |
-| `allowHosts`         | `string[]` | `[]`            | Hostnames to allow network access to       |
-| `readPaths`          | `string[]` | `[]`            | Filesystem paths to read from              |
-| `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to               |
-| `env`                | `Object`   | `{}`            | Environment variables to set               |
-| `disableNetwork`     | `boolean`  | `false`         | Cut all network access                     |
-| `maxMemoryMB`        | `number`   | `0`             | Memory limit in megabytes                  |
-| `maxCPUCores`        | `number`   | `0`             | CPU limit as fractional cores              |
-| `maxProcesses`       | `number`   | `0`             | Max child processes (anti-fork bomb)       |
-| `timeoutMs`          | `number`   | `0`             | Hard kill timeout in milliseconds          |
-| `workingDir`         | `string`   | `process.cwd()` | Working directory                          |
-| `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                    |
-| `enableAudit`        | `boolean`  | `false`         | Enable violation auditing                  |
-| `allowPorts`         | `number[]` | `[]`            | TCP ports to allow                         |
-| `enableDiff`         | `boolean`  | `false`         | Enable filesystem mutation diffing         |
-| `enableLearn`        | `boolean`  | `false`         | Enable behavioral auto-profiling           |
-| `allowExec`          | `string[]` | `[]`            | Executables the command is allowed to run  |
-| `blockExec`          | `string[]` | `[]`            | Executables to block from running          |
-| `blockFork`          | `boolean`  | `false`         | Prevent forking new processes              |
-| `traceExec`          | `boolean`  | `false`         | Log every child process spawned            |
-| `strict`             | `boolean`  | `false`         | Treat sandbox setup warnings as errors     |
-| `allowCrypto`        | `boolean`  | `true`          | Permit cryptographic library/device access |
-| `blockCrypto`        | `boolean`  | `false`         | Block system crypto libraries access       |
-| `blockCryptoEntropy` | `boolean`  | `false`         | Block entropy (/dev/random) device access  |
-| `detectFIPS`         | `boolean`  | `false`         | Enable FIPS compliance checks/logging      |
-| `strictFIPS`         | `boolean`  | `false`         | Force strict FIPS validation               |
-| `allowGPU`           | `boolean`  | `false`         | Permit process to utilize host GPU nodes   |
-| `blockTPM`           | `boolean`  | `false`         | Restrict hardware access to TPM device     |
-| `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks |
-
-### Instance Methods
-
-All methods return `this` for chaining except `.run()`.
-
-| Method                  | Description                                    |
-| ----------------------- | ---------------------------------------------- |
-| `.applyPolicy(name)`    | Apply a pre-defined policy. Throws if unknown. |
-| `.allowHosts(...hosts)` | Add hostnames to the network allow list        |
-| `.readPaths(...paths)`  | Add filesystem read paths                      |
-| `.writePaths(...paths)` | Add filesystem write paths                     |
-| `.env(key, value)`      | Set an environment variable                    |
-| `.disableNetwork()`     | Disable all network access                     |
-| `.maxMemory(mb)`        | Set memory limit in megabytes                  |
-| `.maxCPUCores(cores)`   | Set CPU limit as fractional cores (e.g. 0.5)   |
-| `.maxProcesses(count)`  | Set maximum child process count                |
-| `.timeout(ms)`          | Set hard kill timeout in milliseconds          |
-| `.binaryPath(path)`     | Override the Go binary path                    |
-| `.workingDir(dir)`      | Set the working directory                      |
-| `.enableAudit()`        | Enable sandbox violation auditing              |
-| `.allowPorts(...ports)` | Set allowed TCP ports                          |
-| `.enableDiff()`         | Enable filesystem mutation diffing             |
-| `.enableLearn()`        | Enable behavioral auto-profiling               |
-| `.allowExec(...cmds)`   | Restrict which executables can run             |
-| `.blockExec(...cmds)`   | Block specific executables from running        |
-| `.blockFork()`          | Prevent the command from forking new processes |
-| `.traceExec()`          | Log every child process spawned                |
-| `.strict()`             | Treat sandbox setup warnings as hard errors    |
-| `.resolveSymlinks()`    | Resolve target command symlink in PATH         |
-| `.allowCrypto(allow)`   | Allow/disallow cryptographic operations        |
-| `.blockCrypto()`        | Restrict system cryptographic libraries        |
-| `.blockCryptoEntropy()` | Restrict entropy devices (/dev/random)         |
-| `.detectFIPS()`         | Log and watch for FIPS lookups                 |
-| `.strictFIPS()`         | Restrict runtime to strict FIPS compliant mode |
-| `.allowGPU(allow)`      | Allow/disallow access to host GPU nodes        |
-| `.blockTPM()`           | Restrict hardware access to TPM device         |
-| `.spoofAntiVM()`        | Intercept debugger & virtualization checks     |
-
-### `.run(cmd, args?)`
-
-Execute the sandboxed command. Returns `Promise<ExecResult>`:
-
-```ts
-interface Entry {
-  path: string;
-  size: number;
-}
-
-interface ExecResult {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-  timedOut?: boolean;
-  auditLog?: Array<{ type: string; target: string; detail?: string }>;
-  fsDiff?: { added: Entry[]; modified: Entry[]; deleted: Entry[] };
-  learnedPolicy?: {
-    readPaths: string[];
-    writePaths: string[];
-    allowIPs: string[];
-    allowPorts: number[];
-    envVars: string[];
-    allowCrypto?: boolean;
-    blockCrypto?: boolean;
-    blockCryptoEntropy?: boolean;
-    detectFIPS?: boolean;
-    strictFIPS?: boolean;
-    fipsDetected?: boolean;
-    cmd: string;
-    args: string[];
-  };
-}
-```
-
-## Architecture
-
-The Node.js layer handles policy resolution, DNS lookups, and config serialization. It pipes a JSON `ExecConfig` to the Go binary over stdin. The Go binary reads the config and delegates to a platform-specific engine.
-
-**macOS path:**
-
-1. Generate a Seatbelt profile from the config
-2. Apply RLIMIT quotas (memory via `RLIMIT_AS`, CPU via `RLIMIT_CPU`, process count via `RLIMIT_NPROC`)
-3. Execute `sandbox-exec -f <profile> <cmd> <args...>`
-
-**Linux path (full isolation):**
-
-1. Probe for user namespace availability; fall back to reduced mode if restricted
-2. Fork self with `--init` flag and config in `SAFER_EXEC_CONFIG` env var
-3. Unshare namespaces (user, mount, PID, UTS, network)
-4. Map UID/GID to root inside the user namespace for mount privileges
-5. Create cgroup v2 hierarchy for resource quotas
-6. Mount tmpfs root, bind-mount read/write paths, mount proc and sysfs
-7. Apply Landlock v2 network confinement rules
-8. Apply seccomp-bpf filter blocking ptrace, kcmp, unshare, mount, pivot_root
-9. `pivot_root` to the new filesystem tree
-10. `execve` the target command
-
-**Linux path (reduced isolation — user namespaces unavailable):**
-
-1. Fork self with `--init-reduced` flag (no unshare)
-2. Create cgroup v2 hierarchy for resource quotas
-3. Apply Landlock v2 network confinement rules
-4. Apply seccomp-bpf syscall filter
-5. `execve` the target command (host filesystem fully visible)
-
-Communication between layers uses marker-prefixed JSON on stdout:
-
-- `FSDIFF:` prefix for filesystem diff reports
-- `LEARNED:` prefix for learned policy output
-- Audit entries are written as JSON lines to stderr
+> [!NOTE]
+> `--trace-libraries` requires `gcc` or `cc` to be installed on Linux for runtime compilation of the audit helper. On macOS, no compiler is required as the mechanism uses the existing Seatbelt audit infrastructure.
 
 ## Environment Variables
 

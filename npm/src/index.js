@@ -261,6 +261,9 @@ export class SaferExec {
 
     /** @type {boolean} Intercept VM and hypervisor properties */
     this._spoofAntiVM = options.spoofAntiVM || false;
+
+    /** @type {boolean} Track dynamic library loading (opt-in) */
+    this._traceLibraries = options.traceLibraries || false;
   }
 
   /**
@@ -458,6 +461,9 @@ export class SaferExec {
     }
     if (raw.spoofAntiVM) {
       this.spoofAntiVM();
+    }
+    if (raw.traceLibraries) {
+      this.traceLibraries();
     }
 
     return this;
@@ -914,6 +920,16 @@ export class SaferExec {
   }
 
   /**
+   * Track dynamic library loading via LD_AUDIT / DYLD_INSERT_LIBRARIES.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  traceLibraries() {
+    this._traceLibraries = true;
+    return this;
+  }
+
+  /**
    * Execute the sandboxed command.
    *
    * Before spawning the Go binary, this method:
@@ -1027,6 +1043,7 @@ export class SaferExec {
       allowGPU: this._allowGPU,
       blockTPM: this._blockTPM,
       spoofAntiVM: this._spoofAntiVM,
+      traceLibraries: this._traceLibraries,
     };
 
     // Determine effective timeout: use explicit timeout or default to 60s
@@ -1044,7 +1061,7 @@ export class SaferExec {
     const options = {
       binaryPath,
       timeout: effectiveTimeout + 2000,
-      enableAudit: this._enableAudit,
+      enableAudit: this._enableAudit || this._traceLibraries,
     };
     return runBinary(config, options);
   }

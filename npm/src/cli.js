@@ -172,6 +172,9 @@ function parseCliArgs() {
       'spoof-antivm': {
         type: 'boolean',
       },
+      'trace-libraries': {
+        type: 'boolean',
+      },
       'max-cpu': {
         type: 'string',
         short: 'c',
@@ -430,10 +433,13 @@ function buildExec(values, cmd, args) {
   if (values['spoof-antivm']) {
     exec.spoofAntiVM();
   }
+  if (values['trace-libraries']) {
+    exec.traceLibraries();
+  }
 
   const options = {
     timeout: values.timeout ? parseNumeric(values.timeout, 'timeout') + 2000 : 0,
-    enableAudit: values.audit || values['trace-exec'],
+    enableAudit: values.audit || values['trace-exec'] || values['trace-libraries'],
   };
 
   return { exec, options };
@@ -532,9 +538,7 @@ async function main() {
 
     // Print success/failure message (unless JSON mode)
     if (!values.json) {
-      if (result.exitCode === 0) {
-        process.stderr.write('[safer-exec] Command finished successfully\n');
-      } else if (result.exitCode === 124 || result.timedOut) {
+      if (result.exitCode === 124 || result.timedOut) {
         process.stderr.write('[safer-exec] Command timed out\n');
         result.exitCode = 124; // Force standard timeout exit code
       } else {

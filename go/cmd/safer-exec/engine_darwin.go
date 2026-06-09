@@ -87,7 +87,24 @@ func run(cfg config.ExecConfig) error {
 		}
 	}
 
-	// Build the Seatbelt profile
+	// Set environment securely using filtered environment
+	env := config.BuildEnv(cfg.Env)
+
+	// Library tracing on macOS: modern macOS (Big Sur+) hardened runtime prevents
+	// DYLD_INSERT_LIBRARIES injection into any binary protected by SIP or the
+	// CS_RESTRICT code-signing flag. This covers virtually all system tools
+	// (/bin/sh, /usr/bin/python3, node, etc.).
+	//
+	// We use the Seatbelt audit mechanism instead: enabling TraceLibraries
+	// activates audit mode so that file-read events for .dylib and .framework
+	// paths are captured in the audit log. Callers can filter by file extension
+	// to identify which libraries were loaded.
+	if cfg.TraceLibraries {
+		cfg.EnableAudit = true
+		fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: enabled on macOS. Library loads appear as file-read audit events (.dylib/.framework paths).\n")
+	}
+
+	// Build the Seatbelt profile (after potentially adding the dylib path to ReadPaths)
 	profile := buildSeatbeltProfile(cfg)
 
 	// Write profile to a temporary file
@@ -126,9 +143,7 @@ func run(cfg config.ExecConfig) error {
 	// Build the full command: sandbox-exec -f <profile> <cmd> <args...>
 	fullArgs := append([]string{"-f", tmpFile.Name(), cmdPath}, cfg.Args...)
 	cmd := exec.Command("sandbox-exec", fullArgs...)
-
-	// Set environment securely using filtered environment
-	cmd.Env = config.BuildEnv(cfg.Env)
+	cmd.Env = env
 
 	// Set working directory
 	if cfg.WorkingDir != "" {
@@ -463,8 +478,8 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 			sb.WriteString("(deny file-read* (literal \"/dev/tpmrm0\"))\n")
 			continue
 		}
-		// Deny GPU nodes if AllowGPU is false or BlockGPU is true
-		if (!cfg.AllowGPU || cfg.BlockGPU) && p == "/dev" {
+		// Deny GPU nodes if AllowGPU is false
+		if (!cfg.AllowGPU) && p == "/dev" {
 			sb.WriteString("(allow file-read* (subpath \"/dev\"))\n")
 			sb.WriteString("(deny file-read* (subpath \"/dev/dri\"))\n")
 			sb.WriteString("(deny file-read* (literal \"/dev/opencl\"))\n")

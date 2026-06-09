@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -305,3 +306,112 @@ func TestLandlockNetPortAttr_StructSize(t *testing.T) {
 }
 
 var _ = syscall.CLONE_NEWUSER
+
+// --- TraceLibraries / LD_AUDIT ---
+
+// TestTraceLibraries_ExtractHelper verifies that extractAuditHelper produces a
+// valid C source file containing the Linux rtld-audit interface hook.
+func TestTraceLibraries_ExtractHelper(t *testing.T) {
+	cFile, err := extractAuditHelper()
+	if err != nil {
+		t.Fatalf("extractAuditHelper failed: %v", err)
+	}
+	defer os.Remove(cFile)
+
+	data, err := os.ReadFile(cFile)
+	if err != nil {
+		t.Fatalf("could not read extracted helper: %v", err)
+	}
+	src := string(data)
+
+	// Must contain la_objopen (rtld-audit entry point)
+	if !strings.Contains(src, "la_objopen") {
+		t.Errorf("Linux helper should contain la_objopen, got: %q", src)
+	}
+	// Must output lib-load JSON lines
+	if !strings.Contains(src, "lib-load") {
+		t.Errorf("helper should contain lib-load JSON tag, got: %q", src)
+	}
+}
+
+// TestTraceLibraries_Compilation verifies that the Linux audit helper C source
+// can be compiled into a shared object using gcc or cc.
+func TestTraceLibraries_Compilation(t *testing.T) {
+	compiler := ""
+	for _, c := range []string{"gcc", "cc"} {
+		if _, err := exec.LookPath(c); err == nil {
+			compiler = c
+			break
+		}
+	}
+	if compiler == "" {
+		t.Skip("neither gcc nor cc found")
+	}
+
+	cFile, err := extractAuditHelper()
+	if err != nil {
+		t.Fatalf("extractAuditHelper failed: %v", err)
+	}
+	defer os.Remove(cFile)
+
+	soPath := cFile + ".so"
+	defer os.Remove(soPath)
+
+	cmd := exec.Command(compiler, "-shared", "-fPIC", "-o", soPath, cFile)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", compiler, err, out)
+	}
+
+	if _, err := os.Stat(soPath); err != nil {
+		t.Errorf("expected .so to be produced at %s", soPath)
+	}
+}
+
+// TestTraceLibraries_Run verifies that running with TraceLibraries=true emits
+// the expected LD_AUDIT diagnostic and completes without error.
+// Library load events ({"type":"lib-load",...}) appear on stderr when LD_AUDIT
+// is active and gcc/cc is available to compile the helper.
+func TestTraceLibraries_Run(t *testing.T) {
+	rOut, wOut, _ := os.Pipe()
+	rErr, wErr, _ := os.Pipe()
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = wOut, wErr
+
+	outChan := make(chan string, 1)
+	errChan := make(chan string, 1)
+	go func() { data, _ := io.ReadAll(rOut); outChan <- string(data) }()
+	go func() { data, _ := io.ReadAll(rErr); errChan <- string(data) }()
+
+	runErr := run(config.ExecConfig{
+		Cmd:            "/bin/sh",
+		Args:           []string{"-c", "echo trace-ok"},
+		ReadPaths:      baseReadPaths(),
+		TraceLibraries: true,
+	})
+
+	wOut.Close()
+	wErr.Close()
+	os.Stdout, os.Stderr = oldStdout, oldStderr
+
+	stdout := <-outChan
+	stderr := <-errChan
+
+	if runErr != nil && strings.Contains(stderr, "mount tmpfs: operation not permitted") {
+		t.Skipf("Sandboxing not supported in this environment")
+	}
+
+	if runErr != nil {
+		t.Fatalf("run with TraceLibraries failed: %v\nstderr: %s", runErr, stderr)
+	}
+
+	// Diagnostic message must appear
+	if !strings.Contains(stderr, "safer-exec: trace-libraries:") {
+		t.Errorf("expected trace-libraries diagnostic in stderr, got: %q", stderr)
+	}
+
+	// The command itself must have run
+	if !strings.Contains(stdout, "trace-ok") {
+		t.Errorf("expected 'trace-ok' in stdout, got: %q\nstderr: %q", stdout, stderr)
+	}
+}

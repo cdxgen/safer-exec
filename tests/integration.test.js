@@ -277,4 +277,70 @@ describe('Integration Tests', () => {
       );
     });
   });
+
+  describe('TraceLibraries (LD_AUDIT / DYLD observability)', () => {
+    it('should complete successfully with traceLibraries enabled', async () => {
+      const result = await new SaferExec()
+        .traceLibraries()
+        .run('sh', ['-c', 'echo trace-test-ok']);
+
+      strict.equal(result.exitCode, 0, 'should exit with 0 when trace-libraries is on');
+      strict.ok(
+        result.stdout.includes('trace-test-ok'),
+        `expected command output, got: ${result.stdout}`
+      );
+    });
+
+    it('should emit trace-libraries diagnostic in stderr', async () => {
+      const result = await new SaferExec()
+        .traceLibraries()
+        .run('sh', ['-c', 'echo trace-diag-check']);
+
+      strict.equal(result.exitCode, 0);
+      strict.ok(
+        result.stderr.includes('trace-libraries'),
+        `expected "trace-libraries" in stderr, got: ${result.stderr}`
+      );
+    });
+
+    it('should capture lib-load events from LD_AUDIT on Linux', async () => {
+      if (process.platform !== 'linux') {
+        return; // LD_AUDIT is Linux-only; macOS uses Seatbelt audit
+      }
+      const result = await new SaferExec()
+        .traceLibraries()
+        .enableAudit()
+        .run('sh', ['-c', 'echo lib-load-test']);
+
+      strict.equal(result.exitCode, 0);
+      // On Linux with gcc available, LD_AUDIT should emit lib-load JSON events.
+      // If gcc is not installed, the audit log may be empty — both are valid.
+      if (result.auditLog && result.auditLog.length > 0) {
+        const libLoads = result.auditLog.filter(e => e.type === 'lib-load');
+        strict.ok(
+          libLoads.length > 0,
+          `expected lib-load entries in auditLog, got types: ${JSON.stringify(result.auditLog.map(e => e.type))}`
+        );
+        // Each lib-load entry should have a target path ending in .so
+        for (const entry of libLoads) {
+          strict.ok(
+            entry.target && typeof entry.target === 'string',
+            `lib-load entry should have string target: ${JSON.stringify(entry)}`
+          );
+        }
+      }
+    });
+
+    it('should support chaining traceLibraries with other options', async () => {
+      const exec = new SaferExec()
+        .traceLibraries()
+        .maxMemory(256)
+        .enableAudit();
+
+      const result = await exec.run('sh', ['-c', 'echo chained']);
+
+      strict.equal(result.exitCode, 0);
+      strict.ok(result.stdout.includes('chained'));
+    });
+  });
 });

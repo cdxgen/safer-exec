@@ -160,7 +160,6 @@ func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.PolicyFile 
 	policy.FIPSDetected = hasFIPSRead
 
 	policy.AllowGPU = !hasGPURead
-	policy.BlockGPU = !hasGPURead
 	policy.BlockTPM = hasTPMRead
 	policy.SpoofAntiVM = hasVMRead
 	policy.GPUUsed = hasGPURead
