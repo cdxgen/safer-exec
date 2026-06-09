@@ -2,7 +2,9 @@
 
 // Package httptrace — Linux eBPF implementation.
 // Attaches uprobes to TLS write functions to capture plaintext HTTP/1.x
-// requests before encryption and emits structured events via a ring buffer.
+// and HTTP/2 requests before encryption and emits structured events via a
+// ring buffer.  HTTP/2 HEADERS frames are decoded using per-connection HPACK
+// decoders keyed by the SSL* pointer captured from the uprobe arguments.
 package httptrace
 
 import (
@@ -19,20 +21,30 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"golang.org/x/net/http2/hpack"
 )
 
 const (
 	flagTraceAll uint8 = 0x01
-	maxBufSize         = 512
+	maxBufSize         = 4096
 )
 
 // sslEvent mirrors the BPF-side struct ssl_event (ssl_trace.c).
 // Fields and alignment must match the C struct exactly.
+// Layout: PID(4) + Len(4) + Source(1) + Pad(7) + ConnID(8) + Buf(4096)
+//
+//	offset  0: PID     uint32
+//	offset  4: Len     uint32
+//	offset  8: Source  uint8
+//	offset  9: Pad     [7]uint8
+//	offset 16: ConnID  uint64
+//	offset 24: Buf     [4096]uint8
 type sslEvent struct {
 	PID    uint32
 	Len    uint32
 	Source uint8
-	Pad    [3]uint8
+	Pad    [7]uint8
+	ConnID uint64
 	Buf    [maxBufSize]byte
 }
 
@@ -71,14 +83,17 @@ func (o *bpfObjects) Close() {
 
 // linuxTracer is the Linux eBPF implementation of Tracer.
 type linuxTracer struct {
-	mu           sync.Mutex
-	objs         bpfObjects
-	links        []link.Link
-	reader       *ringbuf.Reader
-	eventsCh     chan HTTPEvent
-	done         chan struct{}
-	closeOnce    sync.Once
-	warnedHTTP2  sync.Once // emits the HTTP/2 advisory at most once per tracer
+	mu        sync.Mutex
+	objs      bpfObjects
+	links     []link.Link
+	reader    *ringbuf.Reader
+	eventsCh  chan HTTPEvent
+	done      chan struct{}
+	closeOnce sync.Once
+
+	// hpackMu protects hpackDecoders.
+	hpackMu       sync.Mutex
+	hpackDecoders map[uint64]*hpack.Decoder // keyed by ConnID (SSL* pointer)
 }
 
 // New loads the pre-compiled BPF object, creates the collection, attaches
@@ -111,10 +126,11 @@ func New() (Tracer, error) {
 	}
 
 	t := &linuxTracer{
-		objs:     objs,
-		reader:   reader,
-		eventsCh: make(chan HTTPEvent, 256),
-		done:     make(chan struct{}),
+		objs:          objs,
+		reader:        reader,
+		eventsCh:      make(chan HTTPEvent, 256),
+		done:          make(chan struct{}),
+		hpackDecoders: make(map[uint64]*hpack.Decoder),
 	}
 
 	if err := t.attachLibraryProbes(); err != nil {
@@ -255,8 +271,32 @@ func (t *linuxTracer) release() {
 	t.objs.Close()
 }
 
+// hpackDecoderFor returns (creating if needed) the per-connection HPACK
+// decoder for the given connID.  The decoder is seeded with a 4096-byte
+// dynamic table limit which matches curl / browsers defaults.
+func (t *linuxTracer) hpackDecoderFor(connID uint64) *hpack.Decoder {
+	t.hpackMu.Lock()
+	defer t.hpackMu.Unlock()
+	if dec, ok := t.hpackDecoders[connID]; ok {
+		return dec
+	}
+	dec := hpack.NewDecoder(4096, nil)
+	t.hpackDecoders[connID] = dec
+	return dec
+}
+
+// removeHPACKDecoder releases the HPACK decoder for connID (call when the
+// TLS connection closes).  Currently unused from the uprobe layer (we have
+// no SSL_free hook), but exposed for future use.
+func (t *linuxTracer) removeHPACKDecoder(connID uint64) {
+	t.hpackMu.Lock()
+	delete(t.hpackDecoders, connID)
+	t.hpackMu.Unlock()
+}
+
 // readLoop consumes records from the BPF ring buffer, parses each one as an
-// ssl_event, attempts HTTP/1.x parsing, and delivers events to eventsCh.
+// ssl_event, attempts HTTP/1.x then HTTP/2 parsing, and delivers events to
+// eventsCh.
 func (t *linuxTracer) readLoop() {
 	defer close(t.eventsCh)
 
@@ -272,15 +312,17 @@ func (t *linuxTracer) readLoop() {
 			continue
 		}
 
-		method, path, host, ok := ParseHTTPRequest(ev.Buf[:ev.Len])
+		payload := ev.Buf[:ev.Len]
+
+		// Fast path: HTTP/1.x plain-text request.
+		method, path, host, ok := ParseHTTPRequest(payload)
+		if !ok && IsHTTP2(payload) {
+			// Slow path: HTTP/2 binary framing — use per-connection HPACK decoder.
+			dec := t.hpackDecoderFor(ev.ConnID)
+			method, path, host, ok = ParseHTTP2Frames(payload, dec)
+		}
+
 		if !ok {
-			if IsHTTP2(ev.Buf[:ev.Len]) {
-				t.warnedHTTP2.Do(func() {
-					fmt.Fprintf(os.Stderr,
-						"safer-exec: http-trace: process is using HTTP/2 (binary framing — not decodable as HTTP/1.x). "+
-							"Pass --http1.1 / --no-alpn to force HTTP/1.1 if you need URL capture.\n")
-				})
-			}
 			continue
 		}
 
@@ -302,8 +344,17 @@ func (t *linuxTracer) readLoop() {
 
 // decodeEvent parses raw ring-buffer bytes into an sslEvent using
 // little-endian byte order (all supported platforms are LE).
+//
+// Wire layout (matches ssl_trace.c struct ssl_event):
+//
+//	[0:4]   PID     uint32 LE
+//	[4:8]   Len     uint32 LE
+//	[8]     Source  uint8
+//	[9:16]  Pad     [7]uint8
+//	[16:24] ConnID  uint64 LE
+//	[24:]   Buf     [maxBufSize]byte
 func decodeEvent(data []byte) *sslEvent {
-	const headerSize = 4 + 4 + 1 + 3 // PID(4) + Len(4) + Source(1) + Pad(3)
+	const headerSize = 4 + 4 + 1 + 7 + 8 // PID(4)+Len(4)+Source(1)+Pad(7)+ConnID(8) = 24
 	if len(data) < headerSize {
 		return nil
 	}
@@ -312,12 +363,13 @@ func decodeEvent(data []byte) *sslEvent {
 	ev.PID = binary.LittleEndian.Uint32(data[0:4])
 	ev.Len = binary.LittleEndian.Uint32(data[4:8])
 	ev.Source = data[8]
-	// data[9:12] = pad, skip
+	// data[9:16] = pad, skip
+	ev.ConnID = binary.LittleEndian.Uint64(data[16:24])
 
 	if ev.Len > maxBufSize {
 		ev.Len = maxBufSize
 	}
-	const payloadStart = 12
+	const payloadStart = 24
 	if len(data) <= payloadStart {
 		return nil
 	}

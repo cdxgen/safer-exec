@@ -1,7 +1,14 @@
 // Package httptrace provides HTTP URL and method tracing for sandboxed processes
 // via eBPF uprobes on TLS write functions (SSL_write, GnuTLS gnutls_record_send,
-// and Go's crypto/tls.(*Conn).Write). Captures plaintext HTTP/1.x requests
-// before TLS encryption, parses the method and URL, and emits structured events.
+// and Go's crypto/tls.(*Conn).Write). Captures plaintext HTTP/1.x and HTTP/2
+// requests before TLS encryption, parses the method and URL, and emits
+// structured events.
+//
+// HTTP/2 support:
+// HTTP/2 uses HPACK-compressed binary framing (RFC 7540/7541). The tracer
+// maintains a per-connection hpack.Decoder (keyed by the SSL* pointer) so
+// that the dynamic compression table stays consistent across multiple writes
+// on the same TLS connection.
 //
 // Platform support:
 //   - Linux (amd64, arm64): full eBPF implementation; requires kernel >= 5.8,

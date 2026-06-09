@@ -2,7 +2,8 @@
  *
  * Attaches to SSL_write (OpenSSL/BoringSSL), gnutls_record_send (GnuTLS),
  * and go_tls_conn_write (Go crypto/tls) to capture plaintext TLS writes
- * before encryption happens in userspace.
+ * before encryption happens in userspace.  Supports HTTP/1.x and HTTP/2
+ * (binary-framed) traffic; HTTP/2 HPACK decoding is performed in userspace.
  *
  * Compile for amd64:
  *   clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
@@ -24,26 +25,35 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-#define MAX_BUF_SIZE 512
+#define MAX_BUF_SIZE 4096
 
 /* Source identifiers embedded in each ring-buffer event. */
 #define SOURCE_SSL_WRITE      0
 #define SOURCE_GO_TLS_WRITE   1
 #define SOURCE_GNUTLS_SEND    2
 
-/* Each SSL write produces one event in the ring buffer. */
+/* Each SSL write produces one event in the ring buffer.
+ * Layout (explicit padding to ensure natural alignment):
+ *   offset  0: pid      u32
+ *   offset  4: len      u32
+ *   offset  8: source   u8
+ *   offset  9: pad      u8[7]  (7 bytes to align conn_id to offset 16)
+ *   offset 16: conn_id  u64
+ *   offset 24: buf      u8[MAX_BUF_SIZE]
+ */
 struct ssl_event {
     __u32 pid;
-    __u32 len;    /* bytes actually captured (capped at MAX_BUF_SIZE) */
-    __u8  source; /* SOURCE_* constant above */
-    __u8  pad[3];
+    __u32 len;      /* bytes actually captured (capped at MAX_BUF_SIZE) */
+    __u8  source;   /* SOURCE_* constant above */
+    __u8  pad[7];   /* explicit padding to align conn_id to 8-byte boundary */
+    __u64 conn_id;  /* SSL* / session pointer — uniquely identifies the TLS connection */
     __u8  buf[MAX_BUF_SIZE];
 };
 
-/* Ring buffer — 512 KB. */
+/* Ring buffer — 4 MB (larger events require more headroom). */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 512 * 1024);
+    __uint(max_entries, 4 * 1024 * 1024);
 } events SEC(".maps");
 
 /*
@@ -98,8 +108,10 @@ struct {
 #define GO_SLICE_LEN_REG(ctx)  (0UL)
 #endif
 
-/* Shared capture logic used by all three probes. */
-static __always_inline int capture(void *buf_ptr, __u32 buf_len, __u8 source)
+/* Shared capture logic used by all three probes.
+ * conn_id is the TLS connection pointer (SSL* / session handle) cast to u64;
+ * userspace uses it to key per-connection HPACK decoder state for HTTP/2. */
+static __always_inline int capture(void *buf_ptr, __u32 buf_len, __u8 source, __u64 conn_id)
 {
     if (!buf_ptr || buf_len == 0)
         return 0;
@@ -118,14 +130,15 @@ static __always_inline int capture(void *buf_ptr, __u32 buf_len, __u8 source)
     if (!ev)
         return 0;
 
-    ev->pid    = pid;
+    ev->pid     = pid;
     /* Store actual write length for userspace; we always read sizeof(ev->buf)
      * bytes below so the BPF verifier sees a compile-time constant size
      * instead of a runtime value — the only reliable way to pass the verifier
      * across kernel versions (5.8 through 6.x). */
-    ev->len    = buf_len < MAX_BUF_SIZE ? buf_len : MAX_BUF_SIZE;
-    ev->source = source;
-    ev->pad[0] = ev->pad[1] = ev->pad[2] = 0;
+    ev->len     = buf_len < MAX_BUF_SIZE ? buf_len : MAX_BUF_SIZE;
+    ev->source  = source;
+    ev->pad[0]  = ev->pad[1] = ev->pad[2] = 0;
+    ev->conn_id = conn_id;
 
     if (bpf_probe_read_user(ev->buf, sizeof(ev->buf), buf_ptr) < 0) {
         bpf_ringbuf_discard(ev, 0);
@@ -138,37 +151,49 @@ static __always_inline int capture(void *buf_ptr, __u32 buf_len, __u8 source)
 
 /* ── OpenSSL / BoringSSL ─────────────────────────────────────────────────
  * int SSL_write(SSL *ssl, const void *buf, int num)
+ * PARM1 = SSL* (used as conn_id to key per-connection HPACK state)
  */
 SEC("uprobe/SSL_write")
 int probe_ssl_write(struct pt_regs *ctx)
 {
-    void  *buf = (void *)PT_REGS_PARM2(ctx);
-    __u32  num = (__u32)(unsigned long)PT_REGS_PARM3(ctx);
-    return capture(buf, num, SOURCE_SSL_WRITE);
+    __u64  conn_id = (unsigned long)PT_REGS_PARM1(ctx);
+    void  *buf     = (void *)PT_REGS_PARM2(ctx);
+    __u32  num     = (__u32)(unsigned long)PT_REGS_PARM3(ctx);
+    return capture(buf, num, SOURCE_SSL_WRITE, conn_id);
 }
 
 /* ── GnuTLS ─────────────────────────────────────────────────────────────
  * ssize_t gnutls_record_send(session, const void *data, size_t sizeofdata)
+ * PARM1 = session handle (used as conn_id)
  */
 SEC("uprobe/gnutls_record_send")
 int probe_gnutls_send(struct pt_regs *ctx)
 {
-    void  *buf = (void *)PT_REGS_PARM2(ctx);
-    __u32  num = (__u32)(unsigned long)PT_REGS_PARM3(ctx);
-    return capture(buf, num, SOURCE_GNUTLS_SEND);
+    __u64  conn_id = (unsigned long)PT_REGS_PARM1(ctx);
+    void  *buf     = (void *)PT_REGS_PARM2(ctx);
+    __u32  num     = (__u32)(unsigned long)PT_REGS_PARM3(ctx);
+    return capture(buf, num, SOURCE_GNUTLS_SEND, conn_id);
 }
 
 /* ── Go crypto/tls (*Conn).Write ─────────────────────────────────────────
  * func (c *Conn) Write(b []byte) (int, error)
  * The symbol name "go_tls_conn_write" is a placeholder; the Go loader
  * resolves the real mangled symbol from the target binary's symbol table.
+ * The receiver pointer (*Conn) serves as conn_id.
  */
 SEC("uprobe/go_tls_conn_write")
 int probe_go_tls_write(struct pt_regs *ctx)
 {
+#if defined(__TARGET_ARCH_x86)
+    __u64  conn_id = (unsigned long)(ctx)->rax;  /* Go AMD64: receiver = rax */
+#elif defined(__TARGET_ARCH_arm64)
+    __u64  conn_id = (unsigned long)PT_REGS_PARM1(ctx);  /* ARM64: receiver = R0 */
+#else
+    __u64  conn_id = 0;
+#endif
     void  *buf_ptr = (void *)(unsigned long)GO_SLICE_DATA_REG(ctx);
     __u32  buf_len = (__u32)(unsigned long)GO_SLICE_LEN_REG(ctx);
-    return capture(buf_ptr, buf_len, SOURCE_GO_TLS_WRITE);
+    return capture(buf_ptr, buf_len, SOURCE_GO_TLS_WRITE, conn_id);
 }
 
 char _license[] SEC("license") = "GPL";

@@ -81,7 +81,7 @@ func main() {
 
 	// Handle version flag
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
-		fmt.Println("safer-exec 0.8.0")
+		fmt.Println("safer-exec 0.8.1")
 		return
 	}
 

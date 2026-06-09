@@ -161,8 +161,11 @@ type ExecConfig struct {
 
 	// TraceHTTPURLs, when true, attaches eBPF uprobes to TLS write functions
 	// (SSL_write, gnutls_record_send, Go crypto/tls.(*Conn).Write) to capture
-	// plaintext HTTP/1.x requests before encryption. Requires Linux kernel >= 5.8
-	// and CAP_BPF + CAP_PERFMON in the init user namespace.
+	// plaintext HTTP/1.x and HTTP/2 requests before encryption. HTTP/2 HEADERS
+	// frames are decoded via per-connection HPACK decoders; the dynamic
+	// compression table is maintained across successive TLS writes on the same
+	// connection. Requires Linux kernel >= 5.8 and CAP_BPF + CAP_PERFMON in the
+	// init user namespace.
 	// Captured requests are emitted as "http-request" audit entries when
 	// EnableAudit is true, and as httpAccess entries in --learn mode output.
 	TraceHTTPURLs bool `json:"traceHTTPURLs"`

@@ -496,7 +496,12 @@ safer-exec --trace-libraries --audit -- python3 script.py
 
 ## HTTPS URL Tracing (`--trace-http-urls`)
 
-Enable opt-in capture of outbound HTTPS request URLs and methods by attaching eBPF uprobes to TLS write functions. Because the uprobes fire _before_ encryption, the plaintext HTTP/1.x request headers are captured without needing a CA certificate or man-in-the-middle proxy.
+Enable opt-in capture of outbound HTTPS request URLs and methods by attaching eBPF uprobes to TLS write functions. Because the uprobes fire _before_ encryption, the plaintext request headers are captured without needing a CA certificate or man-in-the-middle proxy.
+
+Both **HTTP/1.x** and **HTTP/2** are supported:
+
+- HTTP/1.x: request line and `Host` header are parsed directly from the plaintext write buffer.
+- HTTP/2: HEADERS frames are decoded using HPACK (RFC 7541). The tracer maintains a per-connection dynamic compression table (keyed by the `SSL*` pointer) so headers compressed with dynamic table references are correctly decoded across successive writes on the same connection.
 
 **Platform requirements:**
 

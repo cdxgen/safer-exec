@@ -2,7 +2,8 @@ package httptrace
 
 import (
 	"bytes"
-	"encoding/binary"
+
+	"golang.org/x/net/http2/hpack"
 )
 
 // httpMethods is the set of valid HTTP/1.x method tokens (RFC 7230 §3.1.1).
@@ -74,9 +75,10 @@ func ParseHTTPRequest(data []byte) (method, path, host string, ok bool) {
 // http2Preface is the fixed 24-byte client connection preface for HTTP/2 (RFC 7540 §3.5).
 var http2Preface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 
-// http2FrameTypes maps known HTTP/2 frame type bytes to true (RFC 7540 §6).
-var http2FrameTypes = map[byte]bool{
-	0: true, // DATA
+// http2NonDataFrameTypes is the subset of HTTP/2 frame types (RFC 7540 §6) used
+// for binary H2 detection.  DATA (0x0) is excluded because its 3-byte length
+// field can collide with TLS record headers (content-type + version bytes).
+var http2NonDataFrameTypes = map[byte]bool{
 	1: true, // HEADERS
 	2: true, // PRIORITY
 	3: true, // RST_STREAM
@@ -92,6 +94,9 @@ var http2FrameTypes = map[byte]bool{
 // It recognises both the explicit connection preface ("PRI * HTTP/2.0…")
 // and bare binary frame headers (3-byte length + 1-byte type + 1-byte flags
 // + 4-byte stream ID) as defined in RFC 7540.
+//
+// DATA frames (type 0x0) are intentionally excluded from the binary-frame
+// heuristic because their length encoding overlaps with TLS record headers.
 func IsHTTP2(data []byte) bool {
 	if len(data) == 0 {
 		return false
@@ -100,13 +105,13 @@ func IsHTTP2(data []byte) bool {
 	if bytes.HasPrefix(data, http2Preface) {
 		return true
 	}
-	// Binary frame: need at least 9 bytes (frame header)
+	// Binary frame: need at least 9 bytes (frame header).
+	// Only non-DATA frame types are considered to avoid false positives with
+	// TLS record headers whose content-type/version bytes map to type=0.
 	if len(data) >= 9 {
-		frameLen := binary.BigEndian.Uint32(append([]byte{0}, data[:3]...)) // 24-bit BE
+		frameLen := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
 		frameType := data[3]
-		// Stream ID is in data[5:9] (top bit reserved); flags in data[4].
-		// Accept if frame type is a known HTTP/2 type and frame length is plausible.
-		if http2FrameTypes[frameType] && frameLen < 16777216 {
+		if http2NonDataFrameTypes[frameType] && frameLen < 16777216 {
 			_ = frameLen
 			return true
 		}
@@ -136,4 +141,102 @@ func extractHeader(data []byte, headerName string) string {
 		}
 	}
 	return ""
+}
+
+const (
+	http2FrameTypeHeaders      = 0x1
+	http2FrameTypeContinuation = 0x9
+	http2FrameHeaderLen        = 9 // 3-byte length + 1-byte type + 1-byte flags + 4-byte stream ID
+)
+
+// ParseHTTP2Frames scans data for HTTP/2 HEADERS frames (RFC 7540 §6.2) and
+// feeds their block fragments into dec for HPACK decoding (RFC 7541).
+//
+// dec must be a per-connection *hpack.Decoder maintained by the caller across
+// successive TLS writes so that the dynamic table stays consistent.
+//
+// Returns (method, path, host, true) from the first HEADERS frame that
+// contains at least the :method and :path pseudo-headers, or false if no
+// usable HEADERS frame was found.
+//
+// The function skips the 24-byte HTTP/2 client connection preface if present,
+// handles HEADERS frames with the PADDED and PRIORITY flags, and advances
+// through multiple frames in a single buffer.
+func ParseHTTP2Frames(data []byte, dec *hpack.Decoder) (method, path, host string, ok bool) {
+	// Skip the connection preface emitted on the first write of a new h2 session.
+	data = bytes.TrimPrefix(data, http2Preface)
+
+	for len(data) >= http2FrameHeaderLen {
+		// Parse 9-byte frame header.
+		frameLen := int(uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2]))
+		frameType := data[3]
+		frameFlags := data[4]
+		// Stream ID occupies data[5:9]; top bit is reserved.
+
+		total := http2FrameHeaderLen + frameLen
+		if total > len(data) {
+			// Truncated frame — captured buffer ended mid-frame.
+			break
+		}
+
+		payload := data[http2FrameHeaderLen:total]
+		data = data[total:]
+
+		if frameType != http2FrameTypeHeaders && frameType != http2FrameTypeContinuation {
+			continue
+		}
+
+		blockFrag := payload
+
+		if frameType == http2FrameTypeHeaders {
+			// PADDED flag (0x8): first byte is pad length; strip it and the trailing pad.
+			if frameFlags&0x8 != 0 {
+				if len(blockFrag) == 0 {
+					continue
+				}
+				padLen := int(blockFrag[0])
+				blockFrag = blockFrag[1:]
+				if padLen >= len(blockFrag) {
+					continue
+				}
+				blockFrag = blockFrag[:len(blockFrag)-padLen]
+			}
+			// PRIORITY flag (0x20): 5 bytes of stream dependency + weight.
+			if frameFlags&0x20 != 0 {
+				if len(blockFrag) < 5 {
+					continue
+				}
+				blockFrag = blockFrag[5:]
+			}
+		}
+
+		// Feed the block fragment into the HPACK decoder.
+		// The decoder accumulates dynamic table state across calls.
+		fields, err := dec.DecodeFull(blockFrag)
+		if err != nil {
+			// Malformed HPACK or mid-stream capture — skip this frame.
+			continue
+		}
+
+		var m, p, h string
+		for _, f := range fields {
+			switch f.Name {
+			case ":method":
+				m = f.Value
+			case ":path":
+				p = f.Value
+			case ":authority":
+				h = f.Value
+			case "host":
+				if h == "" {
+					h = f.Value
+				}
+			}
+		}
+
+		if m != "" && p != "" {
+			return m, p, h, true
+		}
+	}
+	return
 }

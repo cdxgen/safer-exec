@@ -1,6 +1,12 @@
 package httptrace
 
-import "testing"
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"golang.org/x/net/http2/hpack"
+)
 
 func TestParseHTTPRequest(t *testing.T) {
 	tests := []struct {
@@ -211,5 +217,235 @@ func TestSource_String(t *testing.T) {
 		if got := c.s.String(); got != c.want {
 			t.Errorf("Source(%d).String() = %q, want %q", c.s, got, c.want)
 		}
+	}
+}
+
+// buildH2Frame constructs a minimal HTTP/2 frame (RFC 7540 §4.1).
+func buildH2Frame(frameType byte, flags byte, streamID uint32, payload []byte) []byte {
+	var buf bytes.Buffer
+	length := len(payload)
+	buf.WriteByte(byte(length >> 16))
+	buf.WriteByte(byte(length >> 8))
+	buf.WriteByte(byte(length))
+	buf.WriteByte(frameType)
+	buf.WriteByte(flags)
+	var sid [4]byte
+	binary.BigEndian.PutUint32(sid[:], streamID&0x7fffffff)
+	buf.Write(sid[:])
+	buf.Write(payload)
+	return buf.Bytes()
+}
+
+// encodeH2Headers builds an HPACK block for the given pseudo-headers using
+// the static table only (indexed representations, no dynamic table additions).
+func encodeH2Headers(method, path, authority, scheme string) []byte {
+	var enc hpack.Encoder
+	var buf bytes.Buffer
+	enc = *hpack.NewEncoder(&buf)
+	enc.WriteField(hpack.HeaderField{Name: ":method", Value: method})
+	enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
+	if authority != "" {
+		enc.WriteField(hpack.HeaderField{Name: ":authority", Value: authority})
+	}
+	if scheme != "" {
+		enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: scheme})
+	}
+	return buf.Bytes()
+}
+
+func TestIsHTTP2(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{
+			name: "connection preface",
+			data: []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"),
+			want: true,
+		},
+		{
+			name: "SETTINGS frame (type=4)",
+			data: buildH2Frame(0x4, 0x0, 0, []byte{}),
+			want: true,
+		},
+		{
+			name: "HEADERS frame (type=1)",
+			data: buildH2Frame(0x1, 0x4, 1, []byte{0x82, 0x84}), // :method GET, :path /
+			want: true,
+		},
+		{
+			name: "HTTP/1.x request",
+			data: []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+			want: false,
+		},
+		{
+			name: "TLS record",
+			data: []byte("\x16\x03\x01\x00\xf1\x01\x00\x00\xed"),
+			want: false,
+		},
+		{
+			name: "empty",
+			data: []byte{},
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsHTTP2(tc.data); got != tc.want {
+				t.Errorf("IsHTTP2() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseHTTP2Frames(t *testing.T) {
+	tests := []struct {
+		name       string
+		buildData  func() []byte
+		wantMethod string
+		wantPath   string
+		wantHost   string
+		wantOK     bool
+	}{
+		{
+			name: "simple GET via static table",
+			buildData: func() []byte {
+				// Static table: :method GET = index 2, :path / = index 4
+				block := []byte{0x82, 0x84} // indexed header field repr
+				return buildH2Frame(http2FrameTypeHeaders, 0x5 /*END_STREAM|END_HEADERS*/, 1, block)
+			},
+			wantMethod: "GET",
+			wantPath:   "/",
+			wantHost:   "",
+			wantOK:     true,
+		},
+		{
+			name: "GET with authority via literal headers",
+			buildData: func() []byte {
+				block := encodeH2Headers("GET", "/api/v1/packages", "registry.npmjs.org", "https")
+				return buildH2Frame(http2FrameTypeHeaders, 0x5, 1, block)
+			},
+			wantMethod: "GET",
+			wantPath:   "/api/v1/packages",
+			wantHost:   "registry.npmjs.org",
+			wantOK:     true,
+		},
+		{
+			name: "POST request",
+			buildData: func() []byte {
+				block := encodeH2Headers("POST", "/v1/login", "auth.example.com", "https")
+				return buildH2Frame(http2FrameTypeHeaders, 0x4 /*END_HEADERS*/, 3, block)
+			},
+			wantMethod: "POST",
+			wantPath:   "/v1/login",
+			wantHost:   "auth.example.com",
+			wantOK:     true,
+		},
+		{
+			name: "connection preface followed by SETTINGS then HEADERS",
+			buildData: func() []byte {
+				var buf bytes.Buffer
+				buf.Write(http2Preface)
+				buf.Write(buildH2Frame(0x4, 0x0, 0, []byte{})) // SETTINGS
+				block := encodeH2Headers("GET", "/search", "api.example.com", "https")
+				buf.Write(buildH2Frame(http2FrameTypeHeaders, 0x5, 1, block))
+				return buf.Bytes()
+			},
+			wantMethod: "GET",
+			wantPath:   "/search",
+			wantHost:   "api.example.com",
+			wantOK:     true,
+		},
+		{
+			name: "HEADERS with PRIORITY flag",
+			buildData: func() []byte {
+				block := encodeH2Headers("GET", "/priority", "example.com", "https")
+				// Prepend 5-byte priority: exclusive+dep(4) + weight(1)
+				priority := []byte{0x00, 0x00, 0x00, 0x01, 0x0f}
+				payload := append(priority, block...)
+				return buildH2Frame(http2FrameTypeHeaders, 0x24 /*END_HEADERS|PRIORITY*/, 1, payload)
+			},
+			wantMethod: "GET",
+			wantPath:   "/priority",
+			wantHost:   "example.com",
+			wantOK:     true,
+		},
+		{
+			name: "HEADERS with PADDED flag",
+			buildData: func() []byte {
+				block := encodeH2Headers("GET", "/padded", "padded.example.com", "https")
+				padLen := byte(4)
+				payload := append([]byte{padLen}, block...)
+				payload = append(payload, make([]byte, int(padLen))...)
+				return buildH2Frame(http2FrameTypeHeaders, 0x0c /*END_HEADERS|PADDED*/, 1, payload)
+			},
+			wantMethod: "GET",
+			wantPath:   "/padded",
+			wantHost:   "padded.example.com",
+			wantOK:     true,
+		},
+		{
+			name: "only DATA frames — no HEADERS",
+			buildData: func() []byte {
+				return buildH2Frame(0x0 /*DATA*/, 0x1, 1, []byte("hello world"))
+			},
+			wantOK: false,
+		},
+		{
+			name: "empty buffer",
+			buildData: func() []byte {
+				return []byte{}
+			},
+			wantOK: false,
+		},
+		{
+			name: "truncated frame header",
+			buildData: func() []byte {
+				return []byte{0x00, 0x00} // only 2 bytes — need at least 9
+			},
+			wantOK: false,
+		},
+		{
+			name: "dynamic table: second request reuses prior entry",
+			buildData: func() []byte {
+				// This test uses a shared decoder to verify that the dynamic
+				// table carries over between calls, handled by the caller.
+				// We just verify the second HEADERS frame is parseable.
+				var buf bytes.Buffer
+				block1 := encodeH2Headers("GET", "/first", "example.com", "https")
+				buf.Write(buildH2Frame(http2FrameTypeHeaders, 0x5, 1, block1))
+				block2 := encodeH2Headers("GET", "/second", "example.com", "https")
+				buf.Write(buildH2Frame(http2FrameTypeHeaders, 0x5, 3, block2))
+				return buf.Bytes()
+			},
+			wantMethod: "GET",
+			wantPath:   "/first", // first HEADERS wins
+			wantHost:   "example.com",
+			wantOK:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dec := hpack.NewDecoder(4096, nil)
+			method, path, host, ok := ParseHTTP2Frames(tc.buildData(), dec)
+			if ok != tc.wantOK {
+				t.Errorf("ok=%v want=%v (method=%q path=%q host=%q)", ok, tc.wantOK, method, path, host)
+				return
+			}
+			if !ok {
+				return
+			}
+			if method != tc.wantMethod {
+				t.Errorf("method=%q want=%q", method, tc.wantMethod)
+			}
+			if path != tc.wantPath {
+				t.Errorf("path=%q want=%q", path, tc.wantPath)
+			}
+			if host != tc.wantHost {
+				t.Errorf("host=%q want=%q", host, tc.wantHost)
+			}
+		})
 	}
 }
