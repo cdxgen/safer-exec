@@ -349,7 +349,13 @@ The profile takes effect immediately (no reboot required). Verify with:
 sudo aa-status | grep safer-exec
 ```
 
-### Alternative: system-wide sysctl (not recommended)
+### Alternative 1: Elevate ONLY the SEA binary
+
+```
+sudo setcap 'cap_bpf,cap_perfmon,cap_sys_ptrace,cap_sys_admin+eip' /usr/local/bin/safer-exec
+```
+
+### Alternativ 2: system-wide sysctl (not recommended)
 
 If installing an AppArmor profile is not an option (e.g., in ephemeral CI environments), you can disable the restriction globally:
 
