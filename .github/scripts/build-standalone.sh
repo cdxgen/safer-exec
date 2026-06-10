@@ -24,7 +24,7 @@ if [[ -f go/bin/safer-exec ]]; then
 else
   echo "Building Go engine for $TARGET_OS/$TARGET_ARCH..."
   # Compile Go binary statically
-  (cd go && CGO_ENABLED=0 GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/)
+  (cd go && CGO_ENABLED=0 GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/)
 fi
 
 # Create staging directory

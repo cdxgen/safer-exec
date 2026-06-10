@@ -1,6 +1,6 @@
 # @cdxgen/safer-exec
 
-OS-level sandboxing for process execution. A zero-dependency Node.js library backed by a statically compiled Go binary.
+OS-level sandboxing with tracing, auditing, and learning mode for arbitrary binaries.
 
 On macOS the Go binary generates Seatbelt profiles and runs commands through `sandbox-exec`. On Linux it uses namespace isolation, bind mounts, `pivot_root`, seccomp-bpf filters, Landlock network confinement, and cgroup v2 resource quotas.
 

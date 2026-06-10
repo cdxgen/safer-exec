@@ -40,3 +40,4 @@ go/safer-exec
 # Precompiled audit helpers
 !go/cmd/safer-exec/c/*.so
 
+/.claude/

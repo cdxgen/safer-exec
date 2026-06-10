@@ -36,6 +36,7 @@ jobs:
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
         with:
           go-version: "1.26"
+          cache: false
 
       - name: Cross-compile ${{ matrix.os }}-${{ matrix.arch }}
         run: |
@@ -44,7 +45,7 @@ jobs:
           # -extldflags are Linux-only hardening flags; omit for darwin cross-compile to avoid linker warnings.
           if [[ "${{ matrix.os }}" == "linux" ]]; then
             CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build \
-              -ldflags="-s -w -extldflags=-Wl,-z,now,-z,relro" \
+              -trimpath -ldflags="-s -w" \
               -o bin/safer-exec-${{ matrix.os }}-${{ matrix.arch }} ./cmd/safer-exec/
           else
             CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build \
@@ -92,6 +93,7 @@ jobs:
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
         with:
           go-version: "1.26"
+          cache: false
 
       - name: Allow unprivileged user namespaces (ubuntu-24.04)
         if: startsWith(matrix.os, 'ubuntu-24')
@@ -136,6 +138,7 @@ jobs:
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
         with:
           go-version: "1.26"
+          cache: false
 
       - name: Allow unprivileged user namespaces (ubuntu-24.04)
         if: startsWith(matrix.os, 'ubuntu-24')
@@ -144,7 +147,7 @@ jobs:
       - name: Build Go binary
         run: |
           cd go
-          go build -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/
+          go build -trimpath -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/
 
       - name: Set up Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0

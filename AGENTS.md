@@ -72,7 +72,7 @@ tests/
 
 ```bash
 cd go
-go build -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/
+go build -trimpath -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/
 ```
 
 Cross-compile for other platforms:
