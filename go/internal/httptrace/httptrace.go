@@ -54,6 +54,14 @@ type HTTPEvent struct {
 	Path string
 	// Host is the value of the Host header (e.g. "registry.npmjs.org").
 	Host string
+	// Protocol is the protocol used ("http" or "https").
+	Protocol string
+	// Port is the TCP port of the request.
+	Port int
+	// Query is the query parameters of the request.
+	Query string
+	// Body is the request body.
+	Body string
 	// Source identifies which TLS library was intercepted.
 	Source Source
 }
@@ -72,6 +80,10 @@ type Tracer interface {
 	// Events returns the channel on which HTTPEvents are delivered.
 	// The channel is closed when Close is called.
 	Events() <-chan HTTPEvent
+	// AttachGoTLS attaches a uprobe to Go's crypto/tls.(*Conn).Write in the executable.
+	AttachGoTLS(exePath string) error
+	// AttachStaticOpenSSL attaches the OpenSSL SSL_write uprobe directly to the target executable.
+	AttachStaticOpenSSL(exePath string) error
 	// Close detaches all probes and releases eBPF resources.
 	Close() error
 }

@@ -188,6 +188,14 @@ type HTTPAccessEntry struct {
 	Host string `json:"host"`
 	// Path is the request path (e.g. "/-/npm/v1/security/advisories/bulk").
 	Path string `json:"path,omitempty"`
+	// Protocol is the protocol used ("http" or "https").
+	Protocol string `json:"protocol"`
+	// Port is the TCP port of the request (e.g. 443).
+	Port int `json:"port"`
+	// Query is the request query parameters.
+	Query string `json:"query,omitempty"`
+	// Body is the request body payload.
+	Body string `json:"body,omitempty"`
 	// Source identifies the TLS library that was intercepted.
 	// One of: "ssl_write_uprobe", "go_tls_uprobe", "gnutls_uprobe".
 	Source string `json:"source"`

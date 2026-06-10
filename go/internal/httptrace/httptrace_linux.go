@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -52,6 +53,7 @@ type sslEvent struct {
 type bpfObjects struct {
 	// Programs
 	ProbeSSLWrite   *ebpf.Program `ebpf:"probe_ssl_write"`
+	ProbeSSLWriteEx *ebpf.Program `ebpf:"probe_ssl_write_ex"`
 	ProbeGnuTLSSend *ebpf.Program `ebpf:"probe_gnutls_send"`
 	ProbeGoTLSWrite *ebpf.Program `ebpf:"probe_go_tls_write"`
 	// Maps
@@ -63,6 +65,9 @@ type bpfObjects struct {
 func (o *bpfObjects) Close() {
 	if o.ProbeSSLWrite != nil {
 		o.ProbeSSLWrite.Close()
+	}
+	if o.ProbeSSLWriteEx != nil {
+		o.ProbeSSLWriteEx.Close()
 	}
 	if o.ProbeGnuTLSSend != nil {
 		o.ProbeGnuTLSSend.Close()
@@ -142,13 +147,18 @@ func New() (Tracer, error) {
 	return t, nil
 }
 
-// attachLibraryProbes attaches SSL_write and gnutls_record_send uprobes to
+// attachLibraryProbes attaches SSL_write, SSL_write_ex and gnutls_record_send uprobes to
 // every shared library instance found under standard Linux library paths.
 func (t *linuxTracer) attachLibraryProbes() error {
 	var attached int
 
 	if t.objs.ProbeSSLWrite != nil {
 		n := t.attachUprobes(t.objs.ProbeSSLWrite, sslLibPaths(), "SSL_write")
+		attached += n
+	}
+
+	if t.objs.ProbeSSLWriteEx != nil {
+		n := t.attachUprobes(t.objs.ProbeSSLWriteEx, sslLibPaths(), "SSL_write_ex")
 		attached += n
 	}
 
@@ -193,6 +203,7 @@ func (t *linuxTracer) attachUprobes(prog *ebpf.Program, patterns []string, symbo
 			if err != nil {
 				continue
 			}
+			fmt.Fprintf(os.Stderr, "safer-exec: httptrace: attached to %s symbol %s\n", real, symbol)
 			t.links = append(t.links, l)
 			count++
 		}
@@ -225,6 +236,44 @@ func (t *linuxTracer) AttachGoTLS(exePath string) error {
 	t.mu.Lock()
 	t.links = append(t.links, l)
 	t.mu.Unlock()
+	return nil
+}
+
+// AttachStaticOpenSSL attaches the OpenSSL SSL_write/SSL_write_ex uprobes directly to the target executable.
+// This handles statically linked binaries (like Node.js or Python builds) that export the OpenSSL symbol.
+func (t *linuxTracer) AttachStaticOpenSSL(exePath string) error {
+	ex, err := link.OpenExecutable(exePath)
+	if err != nil {
+		return fmt.Errorf("open target executable: %w", err)
+	}
+
+	var attached bool
+
+	if t.objs.ProbeSSLWrite != nil {
+		l, err := ex.Uprobe("SSL_write", t.objs.ProbeSSLWrite, nil)
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: httptrace: AttachStaticOpenSSL attached to %s symbol SSL_write\n", exePath)
+			t.mu.Lock()
+			t.links = append(t.links, l)
+			t.mu.Unlock()
+			attached = true
+		}
+	}
+
+	if t.objs.ProbeSSLWriteEx != nil {
+		l, err := ex.Uprobe("SSL_write_ex", t.objs.ProbeSSLWriteEx, nil)
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: httptrace: AttachStaticOpenSSL attached to %s symbol SSL_write_ex\n", exePath)
+			t.mu.Lock()
+			t.links = append(t.links, l)
+			t.mu.Unlock()
+			attached = true
+		}
+	}
+
+	if !attached {
+		return fmt.Errorf("could not attach static SSL_write or SSL_write_ex uprobe to %s", exePath)
+	}
 	return nil
 }
 
@@ -315,24 +364,39 @@ func (t *linuxTracer) readLoop() {
 		payload := ev.Buf[:ev.Len]
 
 		// Fast path: HTTP/1.x plain-text request.
-		method, path, host, ok := ParseHTTPRequest(payload)
+		method, path, query, host, body, ok := ParseHTTPRequest(payload)
 		if !ok && IsHTTP2(payload) {
 			// Slow path: HTTP/2 binary framing — use per-connection HPACK decoder.
 			dec := t.hpackDecoderFor(ev.ConnID)
-			method, path, host, ok = ParseHTTP2Frames(payload, dec)
+			var q string
+			method, path, q, host, ok = ParseHTTP2Frames(payload, dec)
+			query = q
 		}
 
 		if !ok {
 			continue
 		}
 
+		parsedHost := host
+		port := 443
+		if h, pStr, err := net.SplitHostPort(host); err == nil {
+			parsedHost = h
+			if p, err := strconv.Atoi(pStr); err == nil {
+				port = p
+			}
+		}
+
 		select {
 		case t.eventsCh <- HTTPEvent{
-			PID:    ev.PID,
-			Method: method,
-			Path:   path,
-			Host:   host,
-			Source: Source(ev.Source),
+			PID:      ev.PID,
+			Method:   method,
+			Path:     path,
+			Host:     parsedHost,
+			Protocol: "https",
+			Port:     port,
+			Query:    query,
+			Body:     body,
+			Source:   Source(ev.Source),
 		}:
 		case <-t.done:
 			return

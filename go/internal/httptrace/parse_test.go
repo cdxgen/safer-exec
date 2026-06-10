@@ -14,7 +14,9 @@ func TestParseHTTPRequest(t *testing.T) {
 		input      string
 		wantMethod string
 		wantPath   string
+		wantQuery  string
 		wantHost   string
+		wantBody   string
 		wantOK     bool
 	}{
 		{
@@ -31,13 +33,15 @@ func TestParseHTTPRequest(t *testing.T) {
 			wantMethod: "POST",
 			wantPath:   "/v1/packages",
 			wantHost:   "registry.npmjs.org",
+			wantBody:   "{\"name\":\"lodash\"}",
 			wantOK:     true,
 		},
 		{
 			name:       "GET with query string",
 			input:      "GET /search?q=react&version=18 HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
 			wantMethod: "GET",
-			wantPath:   "/search?q=react&version=18",
+			wantPath:   "/search",
+			wantQuery:  "q=react&version=18",
 			wantHost:   "api.example.com",
 			wantOK:     true,
 		},
@@ -145,7 +149,7 @@ func TestParseHTTPRequest(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			method, path, host, ok := ParseHTTPRequest([]byte(tc.input))
+			method, path, query, host, body, ok := ParseHTTPRequest([]byte(tc.input))
 			if ok != tc.wantOK {
 				t.Errorf("ok = %v, want %v (method=%q path=%q host=%q)", ok, tc.wantOK, method, path, host)
 				return
@@ -159,8 +163,14 @@ func TestParseHTTPRequest(t *testing.T) {
 			if path != tc.wantPath {
 				t.Errorf("path = %q, want %q", path, tc.wantPath)
 			}
+			if query != tc.wantQuery {
+				t.Errorf("query = %q, want %q", query, tc.wantQuery)
+			}
 			if host != tc.wantHost {
 				t.Errorf("host = %q, want %q", host, tc.wantHost)
+			}
+			if body != tc.wantBody {
+				t.Errorf("body = %q, want %q", body, tc.wantBody)
 			}
 		})
 	}
@@ -429,7 +439,7 @@ func TestParseHTTP2Frames(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			dec := hpack.NewDecoder(4096, nil)
-			method, path, host, ok := ParseHTTP2Frames(tc.buildData(), dec)
+			method, path, query, host, ok := ParseHTTP2Frames(tc.buildData(), dec)
 			if ok != tc.wantOK {
 				t.Errorf("ok=%v want=%v (method=%q path=%q host=%q)", ok, tc.wantOK, method, path, host)
 				return
@@ -446,6 +456,7 @@ func TestParseHTTP2Frames(t *testing.T) {
 			if host != tc.wantHost {
 				t.Errorf("host=%q want=%q", host, tc.wantHost)
 			}
+			_ = query
 		})
 	}
 }

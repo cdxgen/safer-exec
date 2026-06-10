@@ -2,6 +2,7 @@ package httptrace
 
 import (
 	"bytes"
+	"strings"
 
 	"golang.org/x/net/http2/hpack"
 )
@@ -20,12 +21,12 @@ var httpMethods = [][]byte{
 }
 
 // ParseHTTPRequest attempts to parse an HTTP/1.x request from raw bytes
-// captured from a TLS write buffer. Returns (method, path, host, true) on
-// success or ("", "", "", false) when the buffer doesn't look like HTTP/1.x.
+// captured from a TLS write buffer. Returns (method, path, query, host, body, true) on
+// success or ("", "", "", "", "", false) when the buffer doesn't look like HTTP/1.x.
 //
 // Only the first request line and the Host header are extracted; the body
 // and subsequent pipelined requests are ignored.
-func ParseHTTPRequest(data []byte) (method, path, host string, ok bool) {
+func ParseHTTPRequest(data []byte) (method, path, query, host, body string, ok bool) {
 	if len(data) < 14 { // "GET / HTTP/1.1" is 14 bytes
 		return
 	}
@@ -64,9 +65,25 @@ func ParseHTTPRequest(data []byte) (method, path, host string, ok bool) {
 		path = "/"
 	}
 
+	if idx := strings.Index(path, "?"); idx >= 0 {
+		query = path[idx+1:]
+		path = path[:idx]
+	}
+
 	// Scan headers for "Host:".
 	headers := data[lineEnd+1:]
 	host = extractHeader(headers, "Host")
+
+	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
+	if headerEnd >= 0 {
+		body = string(data[headerEnd+4:])
+	} else if headerEnd = bytes.Index(data, []byte("\n\n")); headerEnd >= 0 {
+		body = string(data[headerEnd+2:])
+	}
+	body = strings.TrimSpace(body)
+	if len(body) > 1024 {
+		body = body[:1024]
+	}
 
 	ok = true
 	return
@@ -155,14 +172,14 @@ const (
 // dec must be a per-connection *hpack.Decoder maintained by the caller across
 // successive TLS writes so that the dynamic table stays consistent.
 //
-// Returns (method, path, host, true) from the first HEADERS frame that
+// Returns (method, path, query, host, true) from the first HEADERS frame that
 // contains at least the :method and :path pseudo-headers, or false if no
 // usable HEADERS frame was found.
 //
 // The function skips the 24-byte HTTP/2 client connection preface if present,
 // handles HEADERS frames with the PADDED and PRIORITY flags, and advances
 // through multiple frames in a single buffer.
-func ParseHTTP2Frames(data []byte, dec *hpack.Decoder) (method, path, host string, ok bool) {
+func ParseHTTP2Frames(data []byte, dec *hpack.Decoder) (method, path, query, host string, ok bool) {
 	// Skip the connection preface emitted on the first write of a new h2 session.
 	data = bytes.TrimPrefix(data, http2Preface)
 
@@ -235,7 +252,12 @@ func ParseHTTP2Frames(data []byte, dec *hpack.Decoder) (method, path, host strin
 		}
 
 		if m != "" && p != "" {
-			return m, p, h, true
+			var q string
+			if idx := strings.Index(p, "?"); idx >= 0 {
+				q = p[idx+1:]
+				p = p[:idx]
+			}
+			return m, p, q, h, true
 		}
 	}
 	return

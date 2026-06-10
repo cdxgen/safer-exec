@@ -166,6 +166,12 @@ jobs:
           cd npm
           npm run test:integration
 
+      - name: Run HTTP tracing integration tests
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          cd npm
+          sudo env "PATH=$PATH" node --test ../tests/httptrace.test.js
+
       - name: Run security tests
         run: |
           cd npm

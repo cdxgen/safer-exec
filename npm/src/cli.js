@@ -28,7 +28,7 @@
 import { parseArgs } from 'node:util';
 import { SaferExec } from './index.js';
 import { runPipe, resolveBinaryPath } from './runner.js';
-import { writeFileSync, readFileSync } from 'node:fs';
+import { writeFileSync, readFileSync, appendFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -91,6 +91,7 @@ Options:
   -l, --learn                Enable behavioral auto-profiling (learning mode)
       --learn-output=<file>  Write learned policy to file
   -a, --audit                Enable sandbox violation auditing
+      --audit-output-file=<f> Write audit log to file (implies audit)
   -s, --strict               Treat sandbox setup warnings as errors
 
   -j, --json                 Output results as JSON
@@ -244,6 +245,9 @@ function parseCliArgs() {
       audit: {
         type: 'boolean',
         short: 'a',
+      },
+      'audit-output-file': {
+        type: 'string',
       },
       diff: {
         type: 'boolean',
@@ -412,8 +416,11 @@ function buildExec(values, cmd, args) {
   }
 
   // Features
-  if (values.audit) {
+  if (values.audit || values['audit-output-file']) {
     exec.enableAudit();
+    if (values['audit-output-file']) {
+      exec.suppressLibLoadStderr();
+    }
   }
   if (values.diff) {
     exec.enableDiff();
@@ -493,6 +500,17 @@ async function main() {
 
   // Build the SaferExec instance
   const { exec } = buildExec(values, cmd, args);
+
+  // If audit-output-file is requested, set up a real-time event listener to append audit entries to the file
+  if (values['audit-output-file']) {
+    exec.on('audit', (entry) => {
+      try {
+        appendFileSync(values['audit-output-file'], JSON.stringify(entry) + '\n');
+      } catch (err) {
+        process.stderr.write(`[safer-exec] Warning: failed to write audit entry to file: ${err.message}\n`);
+      }
+    });
+  }
 
   // Run the command
   try {

@@ -527,19 +527,34 @@ const result = await new SaferExec()
   .run("node", ["index.js"]);
 
 // result.auditLog entries with type "http-request":
-// { type: "http-request", method: "GET", host: "registry.npmjs.org", path: "/-/npm/v1/security/advisories/bulk", source: "ssl_write_uprobe", pid: 12345 }
+// { type: "http-request", method: "GET", host: "registry.npmjs.org", path: "/-/npm/v1/security/advisories/bulk", protocol: "https", port: 443, query: "version=18", body: "payload", source: "ssl_write_uprobe", pid: 12345 }
+
+// Real-Time Event-Driven Auditing (e.g. for long-running HTTP servers)
+const exec = new SaferExec()
+  .traceHTTPURLs()
+  .enableAudit()
+  .suppressLibLoadStderr(); // Suppresses raw logs from printing to process.stderr
+
+exec.on("audit", (entry) => {
+  if (entry.type === "http-request") {
+    console.log(
+      `[Real-time] HTTP ${entry.method} ${entry.protocol}://${entry.host}:${entry.port}${entry.path}${entry.query ? "?" + entry.query : ""}`,
+    );
+  } else {
+    console.log(`[Real-time] ${entry.type}: ${entry.target}`);
+  }
+});
+
+await exec.run("node", ["index.js"]);
 ```
 
-Each captured request emits a `{"type":"http-request","method":"...","host":"...","path":"...","source":"...","pid":...}` JSON line to stderr (audit log). In `--learn` mode, deduplicated entries are also written to the `httpAccess` array in the generated policy file.
+Each captured request emits a `{"type":"http-request","method":"...","host":"...","path":"...","protocol":"...","port":...,"query":"...","body":"...","source":"...","pid":...}` JSON line to stderr (audit log). In `--learn` mode, deduplicated entries are also written to the `httpAccess` array in the generated policy file.
 
 | Source value       | TLS library intercepted                |
 | ------------------ | -------------------------------------- |
 | `ssl_write_uprobe` | OpenSSL / BoringSSL (`libssl.so`)      |
 | `go_tls_uprobe`    | Go built-in `crypto/tls` (Go binaries) |
 | `gnutls_uprobe`    | GnuTLS (`libgnutls.so`)                |
-
-> [!NOTE]
-> Only HTTP/1.x requests are parsed. HTTP/2 (binary framing) is not currently decoded.
 
 ## Environment Variables
 

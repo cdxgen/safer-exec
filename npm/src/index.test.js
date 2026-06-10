@@ -679,6 +679,22 @@ describe('SaferExec', () => {
       );
     });
 
+    it('should emit audit events in real-time', async () => {
+      const exec = new SaferExec()
+        .enableAudit()
+        .suppressLibLoadStderr();
+      
+      const events = [];
+      exec.on('audit', (entry) => {
+        events.push(entry);
+      });
+
+      const result = await exec.run('echo', ['test']);
+      
+      strict.ok(Array.isArray(result.auditLog), 'should return an auditLog array');
+      strict.equal(result.auditLog.length, events.length, 'should have emitted all audit events in real-time');
+    });
+
     it('should execute with environment variables', async () => {
       const result = await new SaferExec()
         .env('TEST_VAR', 'test_value')

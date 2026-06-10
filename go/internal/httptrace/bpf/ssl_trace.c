@@ -162,6 +162,20 @@ int probe_ssl_write(struct pt_regs *ctx)
     return capture(buf, num, SOURCE_SSL_WRITE, conn_id);
 }
 
+/* int SSL_write_ex(SSL *s, const void *buf, size_t num, size_t *written)
+ * PARM1 = SSL* (conn_id)
+ * PARM2 = buf
+ * PARM3 = num
+ */
+SEC("uprobe/SSL_write_ex")
+int probe_ssl_write_ex(struct pt_regs *ctx)
+{
+    __u64  conn_id = (unsigned long)PT_REGS_PARM1(ctx);
+    void  *buf     = (void *)PT_REGS_PARM2(ctx);
+    __u32  num     = (__u32)(unsigned long)PT_REGS_PARM3(ctx);
+    return capture(buf, num, SOURCE_SSL_WRITE, conn_id);
+}
+
 /* ── GnuTLS ─────────────────────────────────────────────────────────────
  * ssize_t gnutls_record_send(session, const void *data, size_t sizeofdata)
  * PARM1 = session handle (used as conn_id)

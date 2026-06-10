@@ -42,7 +42,18 @@ const __dirname = dirname(__filename);
  * @throws {Error} If no binary can be found for the current platform
  */
 export function resolveBinaryPath() {
-  // Try locally compiled binary
+  const currentPlatform = platform();
+  const currentArch = arch();
+  const localArch = currentArch === 'x64' ? 'amd64' : currentArch;
+
+  // Try platform-arch specific locally compiled binary first
+  const platformArchBinary = join(__dirname, '..', '..', 'go', 'bin', `safer-exec-${currentPlatform}-${localArch}`);
+  try {
+    readFileSync(platformArchBinary);
+    return platformArchBinary;
+  } catch {}
+
+  // Try standard locally compiled binary
   const localBinary = join(__dirname, '..', '..', 'go', 'bin', 'safer-exec');
   try {
     readFileSync(localBinary);
@@ -52,8 +63,6 @@ export function resolveBinaryPath() {
   }
 
   // Try to resolve from platform-specific optional dependencies
-  const currentPlatform = platform();
-  const currentArch = arch();
   let pkgName = "";
 
   if (currentPlatform === "darwin") {
@@ -159,11 +168,49 @@ export async function run(config, options = {}) {
     }
   }, timeout);
 
-  const { stdout, stderr, status } = await new Promise((resolve, reject) => {
+  const { stdout, stderr, status, realtimeAuditLog } = await new Promise((resolve, reject) => {
     const chunks = { stdout: [], stderr: [] };
+    const realtimeAuditLog = [];
+    let stderrLineBuffer = '';
 
     child.stdout.on('data', (chunk) => chunks.stdout.push(chunk));
-    child.stderr.on('data', (chunk) => chunks.stderr.push(chunk));
+    child.stderr.on('data', (chunk) => {
+      if (options.enableAudit) {
+        stderrLineBuffer += chunk.toString('utf-8');
+        const lines = stderrLineBuffer.split('\n');
+        stderrLineBuffer = lines.pop();
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) {
+            chunks.stderr.push(Buffer.from('\n'));
+            continue;
+          }
+
+          let parsed = null;
+          try {
+            const entry = JSON.parse(trimmed);
+            if (entry.type && (entry.target || entry.host)) {
+              parsed = entry;
+            }
+          } catch {}
+
+          if (parsed) {
+            realtimeAuditLog.push(parsed);
+            if (options.onAudit) {
+              options.onAudit(parsed);
+            }
+            if (!options.suppressLibLoadStderr) {
+              chunks.stderr.push(Buffer.from(line + '\n'));
+            }
+          } else {
+            chunks.stderr.push(Buffer.from(line + '\n'));
+          }
+        }
+      } else {
+        chunks.stderr.push(chunk);
+      }
+    });
 
     child.on('error', (err) => {
       clearTimeout(timeoutId);
@@ -171,10 +218,34 @@ export async function run(config, options = {}) {
     });
     child.on('close', (code) => {
       clearTimeout(timeoutId);
+      if (options.enableAudit && stderrLineBuffer.trim()) {
+        const line = stderrLineBuffer;
+        const trimmed = line.trim();
+        let parsed = null;
+        try {
+          const entry = JSON.parse(trimmed);
+          if (entry.type && (entry.target || entry.host)) {
+            parsed = entry;
+          }
+        } catch {}
+
+        if (parsed) {
+          realtimeAuditLog.push(parsed);
+          if (options.onAudit) {
+            options.onAudit(parsed);
+          }
+          if (!options.suppressLibLoadStderr) {
+            chunks.stderr.push(Buffer.from(line + '\n'));
+          }
+        } else {
+          chunks.stderr.push(Buffer.from(line + '\n'));
+        }
+      }
       resolve({
         stdout: Buffer.concat(chunks.stdout).toString('utf-8'),
         stderr: Buffer.concat(chunks.stderr).toString('utf-8'),
         status: code,
+        realtimeAuditLog,
       });
     });
   });
@@ -185,7 +256,7 @@ export async function run(config, options = {}) {
   // Parse audit log entries from stderr when enabled
   let auditLog = null;
   if (options.enableAudit) {
-    auditLog = parseAuditLog(stderr);
+    auditLog = realtimeAuditLog;
   }
 
   return {
@@ -396,14 +467,50 @@ export async function runPipe(config, options = {}) {
       child.stdout.pipe(outStream);
     }
   }
-  let stderrBuffer = '';
+  const realtimeAuditLog = [];
+  let stderrLineBuffer = '';
   if (options.enableAudit || errStream) {
     child.stderr.on('data', (chunk) => {
       if (options.enableAudit) {
-        stderrBuffer += chunk.toString();
-      }
-      if (errStream) {
-        errStream.write(chunk);
+        stderrLineBuffer += chunk.toString('utf-8');
+        const lines = stderrLineBuffer.split('\n');
+        stderrLineBuffer = lines.pop();
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) {
+            if (errStream) {
+              errStream.write('\n');
+            }
+            continue;
+          }
+
+          let parsed = null;
+          try {
+            const entry = JSON.parse(trimmed);
+            if (entry.type && (entry.target || entry.host)) {
+              parsed = entry;
+            }
+          } catch {}
+
+          if (parsed) {
+            realtimeAuditLog.push(parsed);
+            if (options.onAudit) {
+              options.onAudit(parsed);
+            }
+            if (!options.suppressLibLoadStderr && errStream) {
+              errStream.write(line + '\n');
+            }
+          } else {
+            if (errStream) {
+              errStream.write(line + '\n');
+            }
+          }
+        }
+      } else {
+        if (errStream) {
+          errStream.write(chunk);
+        }
       }
     });
   }
@@ -433,6 +540,32 @@ export async function runPipe(config, options = {}) {
     child.on('close', (code) => {
       clearTimeout(timeoutId);
 
+      if (options.enableAudit && stderrLineBuffer.trim()) {
+        const line = stderrLineBuffer;
+        const trimmed = line.trim();
+        let parsed = null;
+        try {
+          const entry = JSON.parse(trimmed);
+          if (entry.type && (entry.target || entry.host)) {
+            parsed = entry;
+          }
+        } catch {}
+
+        if (parsed) {
+          realtimeAuditLog.push(parsed);
+          if (options.onAudit) {
+            options.onAudit(parsed);
+          }
+          if (!options.suppressLibLoadStderr && errStream) {
+            errStream.write(line + '\n');
+          }
+        } else {
+          if (errStream) {
+            errStream.write(line + '\n');
+          }
+        }
+      }
+
       let fsDiff = null;
       let learnedPolicy = null;
       let profile = null;
@@ -454,7 +587,7 @@ export async function runPipe(config, options = {}) {
 
       let auditLog = null;
       if (options.enableAudit) {
-        auditLog = parseAuditLog(stderrBuffer);
+        auditLog = realtimeAuditLog;
       }
 
       resolve({

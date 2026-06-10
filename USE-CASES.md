@@ -302,19 +302,27 @@ Each captured HTTP/1.x request emits one JSON line to stderr:
   "method": "GET",
   "host": "registry.npmjs.org",
   "path": "/express",
+  "protocol": "https",
+  "port": 443,
+  "query": "q=react",
+  "body": "payload",
   "source": "ssl_write_uprobe",
   "pid": 12345
 }
 ```
 
-| Field    | Type     | Description                                                                                                 |
-| -------- | -------- | ----------------------------------------------------------------------------------------------------------- |
-| `type`   | `string` | Always `"http-request"`                                                                                     |
-| `method` | `string` | HTTP verb: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `CONNECT`, `TRACE`                   |
-| `host`   | `string` | Value of the HTTP `Host` header (e.g. `"registry.npmjs.org"`)                                               |
-| `path`   | `string` | Request-target path (e.g. `"/express"`, `"/-/npm/v1/security/advisories/bulk"`)                             |
-| `source` | `string` | TLS library intercepted: `"ssl_write_uprobe"` (OpenSSL), `"go_tls_uprobe"` (Go), `"gnutls_uprobe"` (GnuTLS) |
-| `pid`    | `number` | Host PID of the process that made the request                                                               |
+| Field      | Type     | Description                                                                                                 |
+| ---------- | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `type`     | `string` | Always `"http-request"`                                                                                     |
+| `method`   | `string` | HTTP verb: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `CONNECT`, `TRACE`                   |
+| `host`     | `string` | Value of the HTTP `Host` header (e.g. `"registry.npmjs.org"`)                                               |
+| `path`     | `string` | Request-target path (e.g. `"/express"`, `"/-/npm/v1/security/advisories/bulk"`)                             |
+| `protocol` | `string` | The protocol used: `"http"` or `"https"`                                                                    |
+| `port`     | `number` | The TCP port of the request (e.g. `443` or parsed from the host header)                                     |
+| `query`    | `string` | Optional URL query parameters string (e.g. `"q=react"`)                                                     |
+| `body`     | `string` | Optional POST/PUT request body payload (truncated at 1024 bytes)                                            |
+| `source`   | `string` | TLS library intercepted: `"ssl_write_uprobe"` (OpenSSL), `"go_tls_uprobe"` (Go), `"gnutls_uprobe"` (GnuTLS) |
+| `pid`      | `number` | Host PID of the process that made the request                                                               |
 
 In `--learn` mode the same entries are deduplicated and written to the `httpAccess` array of the generated policy file:
 
@@ -325,12 +333,18 @@ In `--learn` mode the same entries are deduplicated and written to the `httpAcce
       "method": "GET",
       "host": "registry.npmjs.org",
       "path": "/express",
+      "protocol": "https",
+      "port": 443,
+      "query": "q=react",
+      "body": "payload",
       "source": "ssl_write_uprobe"
     },
     {
       "method": "GET",
       "host": "registry.npmjs.org",
       "path": "/lodash",
+      "protocol": "https",
+      "port": 443,
       "source": "ssl_write_uprobe"
     }
   ]
@@ -370,9 +384,9 @@ console.log(httpRequests);
 /* Output:
 [
   { type: 'http-request', method: 'GET', host: 'registry.npmjs.org',
-    path: '/express', source: 'ssl_write_uprobe', pid: 12345 },
+    path: '/express', protocol: 'https', port: 443, source: 'ssl_write_uprobe', pid: 12345 },
   { type: 'http-request', method: 'GET', host: 'registry.npmjs.org',
-    path: '/-/npm/v1/security/advisories/bulk', source: 'ssl_write_uprobe', pid: 12346 }
+    path: '/-/npm/v1/security/advisories/bulk', protocol: 'https', port: 443, source: 'ssl_write_uprobe', pid: 12346 }
 ]
 */
 ```

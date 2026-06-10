@@ -176,6 +176,25 @@ func run(cfg config.ExecConfig) error {
 	if cfg.TraceHTTPURLs {
 		if tr, err2 := httptrace.New(); err2 == nil {
 			httpTracer = tr
+
+			// Resolve command path to attach static uprobes to target binary
+			var cmdPath string
+			if filepath.IsAbs(cfg.Cmd) {
+				cmdPath = cfg.Cmd
+			} else if cfg.WorkingDir != "" {
+				cmdPath = filepath.Join(cfg.WorkingDir, cfg.Cmd)
+				if _, err := os.Stat(cmdPath); err != nil {
+					cmdPath, _ = exec.LookPath(cfg.Cmd)
+				}
+			} else {
+				cmdPath, _ = exec.LookPath(cfg.Cmd)
+			}
+			if cmdPath == "" {
+				cmdPath = cfg.Cmd
+			}
+
+			_ = httpTracer.AttachStaticOpenSSL(cmdPath)
+			_ = httpTracer.AttachGoTLS(cmdPath)
 		} else {
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: http-trace: %v\n", err2)
 		}
@@ -203,6 +222,7 @@ func run(cfg config.ExecConfig) error {
 
 	if httpTracer != nil {
 		rootPID := uint32(cmd.Process.Pid)
+		_ = httpTracer.AddPID(rootPID)
 		stopPIDRefresh = make(chan struct{})
 		go func() {
 			ticker := time.NewTicker(5 * time.Millisecond)
@@ -222,11 +242,15 @@ func run(cfg config.ExecConfig) error {
 		go func() {
 			for ev := range httpTracer.Events() {
 				entry := config.HTTPAccessEntry{
-					Method: ev.Method,
-					Host:   ev.Host,
-					Path:   ev.Path,
-					Source: ev.Source.String(),
-					PID:    ev.PID,
+					Method:   ev.Method,
+					Host:     ev.Host,
+					Path:     ev.Path,
+					Protocol: ev.Protocol,
+					Port:     ev.Port,
+					Query:    ev.Query,
+					Body:     ev.Body,
+					Source:   ev.Source.String(),
+					PID:      ev.PID,
 				}
 				if cfg.EnableAudit {
 					logAuditHTTPEntry(entry)
@@ -1003,12 +1027,20 @@ func logAuditEntry(entryType, target string) {
 // logAuditHTTPEntry emits an "http-request" audit entry for a captured HTTP call.
 func logAuditHTTPEntry(e config.HTTPAccessEntry) {
 	entry := map[string]interface{}{
-		"type":   "http-request",
-		"method": e.Method,
-		"host":   e.Host,
-		"path":   e.Path,
-		"source": e.Source,
-		"pid":    e.PID,
+		"type":     "http-request",
+		"method":   e.Method,
+		"host":     e.Host,
+		"path":     e.Path,
+		"protocol": e.Protocol,
+		"port":     e.Port,
+		"source":   e.Source,
+		"pid":      e.PID,
+	}
+	if e.Query != "" {
+		entry["query"] = e.Query
+	}
+	if e.Body != "" {
+		entry["body"] = e.Body
 	}
 	data, _ := json.Marshal(entry)
 	auditFD := os.Getenv("SAFER_EXEC_AUDIT_FD")

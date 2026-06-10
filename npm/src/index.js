@@ -55,6 +55,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { EventEmitter } from 'node:events';
 import { resolveHosts } from './net.js';
 import { run as runBinary, runPipe as runBinaryPipe } from './runner.js';
 import { npmPolicy } from './policies/npm.js';
@@ -140,7 +141,7 @@ function expandEnv(str) {
   return str.replace(/\$(TMPDIR|TEMP)\b/g, () => tmpdir());
 }
 
-export class SaferExec {
+export class SaferExec extends EventEmitter {
   /**
    * Create a new SaferExec instance with default configuration.
    *
@@ -163,6 +164,7 @@ export class SaferExec {
    * @param {boolean} [options.resolveSymlinks] - Resolve target command symlink in PATH
    */
   constructor(options = {}) {
+    super();
     /** @type {string[]} */
     this._allowHosts = options.allowHosts || [];
 
@@ -1170,6 +1172,7 @@ export class SaferExec {
       timeout: effectiveTimeout + 2000,
       enableAudit: this._enableAudit || this._traceLibraries || this._traceHTTPURLs,
       suppressLibLoadStderr: this._suppressLibLoadStderr,
+      onAudit: (entry) => this.emit('audit', entry),
     };
     return runBinary(config, options);
   }
@@ -1212,6 +1215,7 @@ export class SaferExec {
       stdout: pipeOptions.stdout !== undefined ? pipeOptions.stdout : process.stdout,
       stderr: pipeOptions.stderr !== undefined ? pipeOptions.stderr : process.stderr,
       suppressLibLoadStderr: this._suppressLibLoadStderr,
+      onAudit: (entry) => this.emit('audit', entry),
     };
     return runBinaryPipe(config, options);
   }
