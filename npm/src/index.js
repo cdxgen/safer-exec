@@ -167,7 +167,7 @@ function _parseURLRule(input) {
       protocol: input.protocol || undefined,
       host: input.host,
       port: typeof input.port === 'number' ? input.port : undefined,
-      pathPrefix: input.pathPrefix || undefined,
+      pathPrefix: input.pathPrefix || input.path || undefined,
       methods: Array.isArray(input.methods) ? input.methods : undefined,
     };
   }
@@ -593,7 +593,7 @@ export class SaferExec extends EventEmitter {
    *
    * Each argument can be:
    * - A URL string: `"https://registry.npmjs.org/-/npm/v1/"` — parsed into a rule.
-   * - An object with fields: `{ protocol, host, port, pathPrefix, methods }`.
+   * - An object with fields: `{ protocol, host, port, pathPrefix, methods }` (`path` is accepted as an alias for `pathPrefix`).
    *
    * Host and pathPrefix support three matching modes:
    * - Exact:    `"registry.npmjs.org"`

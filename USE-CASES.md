@@ -421,11 +421,11 @@ import { SaferExec } from "@cdxgen/safer-exec";
 
 const result = await new SaferExec()
   .traceHTTPURLs()
-  .allowUrls(
-    "https://registry.npmjs.org/-/npm/v1/",
-    "https://*.npmjs.org",
-    { protocol: "https", host: "~^api\\\\.github\\\\.com$", methods: ["GET"] }
-  )
+  .allowUrls("https://registry.npmjs.org/-/npm/v1/", "https://*.npmjs.org", {
+    protocol: "https",
+    host: "~^api\\\\.github\\\\.com$",
+    methods: ["GET"],
+  })
   .enableAudit()
   .run("npm", ["install"]);
 ```

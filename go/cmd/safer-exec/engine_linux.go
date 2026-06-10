@@ -921,7 +921,6 @@ func applyLandlockNetwork(cfg config.ExecConfig) error {
 		ports = []int{80, 443}
 	}
 
-
 	abi, _, errno := syscall.RawSyscall(sysLandlockCreateRuleset, 0, 0, landlockCreateRulesetVersion)
 	if errno != 0 || abi < 4 {
 		return nil

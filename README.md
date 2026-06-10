@@ -64,79 +64,79 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 
 `new SaferExec(options?)`
 
-| Option               | Type       | Default         | Description                                                                |
-| -------------------- | ---------- | --------------- | -------------------------------------------------------------------------- |
-| `allowHosts`         | `string[]` | `[]`            | Hostnames to allow network access to                                       |
-| `allowURLRules`      | `Object[]` | `[]`            | Fine-grained URL rules (Linux only, requires `traceHTTPURLs`)              |
-| `readPaths`          | `string[]` | `[]`            | Filesystem paths to read from                                              |
-| `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to                                               |
-| `env`                | `Object`   | `{}`            | Environment variables to set                                               |
-| `disableNetwork`     | `boolean`  | `false`         | Cut all network access                                                     |
-| `maxMemoryMB`        | `number`   | `0`             | Memory limit in megabytes                                                  |
-| `maxCPUCores`        | `number`   | `0`             | CPU limit as fractional cores                                              |
-| `maxProcesses`       | `number`   | `0`             | Max child processes (anti-fork bomb)                                       |
-| `timeoutMs`          | `number`   | `0`             | Hard kill timeout in milliseconds                                          |
-| `workingDir`         | `string`   | `process.cwd()` | Working directory                                                          |
-| `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                                                    |
-| `enableAudit`        | `boolean`  | `false`         | Enable violation auditing                                                  |
-| `allowPorts`         | `number[]` | `[]`            | TCP ports to allow                                                         |
-| `enableDiff`         | `boolean`  | `false`         | Enable filesystem mutation diffing                                         |
-| `enableLearn`        | `boolean`  | `false`         | Enable behavioral auto-profiling                                           |
-| `allowExec`          | `string[]` | `[]`            | Executables the command is allowed to run                                  |
-| `blockExec`          | `string[]` | `[]`            | Executables to block from running                                          |
-| `blockFork`          | `boolean`  | `false`         | Prevent forking new processes                                              |
-| `traceExec`          | `boolean`  | `false`         | Log every child process spawned                                            |
-| `strict`             | `boolean`  | `false`         | Treat sandbox setup warnings as errors                                     |
-| `allowCrypto`        | `boolean`  | `true`          | Permit cryptographic library/device access                                 |
-| `blockCrypto`        | `boolean`  | `false`         | Block system crypto libraries access                                       |
-| `blockCryptoEntropy` | `boolean`  | `false`         | Block entropy (/dev/random) device access                                  |
-| `detectFIPS`         | `boolean`  | `false`         | Enable FIPS compliance checks/logging                                      |
-| `strictFIPS`         | `boolean`  | `false`         | Force strict FIPS validation                                               |
-| `allowGPU`           | `boolean`  | `false`         | Permit process to utilize host GPU nodes                                   |
-| `blockTPM`           | `boolean`  | `false`         | Restrict hardware access to TPM device                                     |
-| `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks                                 |
-| `traceLibraries`     | `boolean`  | `false`         | Track dynamic library loading (opt-in)                                     |
-| `traceHTTPURLs`      | `boolean`  | `false`         | Capture HTTPS request URLs via eBPF uprobes (Linux only, requires CAP_BPF) |
+| Option               | Type       | Default         | Description                                                                                          |
+| -------------------- | ---------- | --------------- | ---------------------------------------------------------------------------------------------------- |
+| `allowHosts`         | `string[]` | `[]`            | Hostnames to allow network access to                                                                 |
+| `allowURLRules`      | `Object[]` | `[]`            | Fine-grained URL rules — exact, wildcard, regex, path, method (Linux only, requires `traceHTTPURLs`) |
+| `readPaths`          | `string[]` | `[]`            | Filesystem paths to read from                                                                        |
+| `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to                                                                         |
+| `env`                | `Object`   | `{}`            | Environment variables to set                                                                         |
+| `disableNetwork`     | `boolean`  | `false`         | Cut all network access                                                                               |
+| `maxMemoryMB`        | `number`   | `0`             | Memory limit in megabytes                                                                            |
+| `maxCPUCores`        | `number`   | `0`             | CPU limit as fractional cores                                                                        |
+| `maxProcesses`       | `number`   | `0`             | Max child processes (anti-fork bomb)                                                                 |
+| `timeoutMs`          | `number`   | `0`             | Hard kill timeout in milliseconds                                                                    |
+| `workingDir`         | `string`   | `process.cwd()` | Working directory                                                                                    |
+| `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                                                                              |
+| `enableAudit`        | `boolean`  | `false`         | Enable violation auditing                                                                            |
+| `allowPorts`         | `number[]` | `[]`            | TCP ports to allow                                                                                   |
+| `enableDiff`         | `boolean`  | `false`         | Enable filesystem mutation diffing                                                                   |
+| `enableLearn`        | `boolean`  | `false`         | Enable behavioral auto-profiling                                                                     |
+| `allowExec`          | `string[]` | `[]`            | Executables the command is allowed to run                                                            |
+| `blockExec`          | `string[]` | `[]`            | Executables to block from running                                                                    |
+| `blockFork`          | `boolean`  | `false`         | Prevent forking new processes                                                                        |
+| `traceExec`          | `boolean`  | `false`         | Log every child process spawned                                                                      |
+| `strict`             | `boolean`  | `false`         | Treat sandbox setup warnings as errors                                                               |
+| `allowCrypto`        | `boolean`  | `true`          | Permit cryptographic library/device access                                                           |
+| `blockCrypto`        | `boolean`  | `false`         | Block system crypto libraries access                                                                 |
+| `blockCryptoEntropy` | `boolean`  | `false`         | Block entropy (/dev/random) device access                                                            |
+| `detectFIPS`         | `boolean`  | `false`         | Enable FIPS compliance checks/logging                                                                |
+| `strictFIPS`         | `boolean`  | `false`         | Force strict FIPS validation                                                                         |
+| `allowGPU`           | `boolean`  | `false`         | Permit process to utilize host GPU nodes                                                             |
+| `blockTPM`           | `boolean`  | `false`         | Restrict hardware access to TPM device                                                               |
+| `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks                                                           |
+| `traceLibraries`     | `boolean`  | `false`         | Track dynamic library loading (opt-in)                                                               |
+| `traceHTTPURLs`      | `boolean`  | `false`         | Capture HTTPS request URLs via eBPF uprobes (Linux only, requires CAP_BPF)                           |
 
 ### Instance Methods
 
 All methods return `this` for chaining except `.run()`.
 
-| Method                  | Description                                                              |
-| ----------------------- | ------------------------------------------------------------------------ |
-| `.applyPolicy(name)`    | Apply a pre-defined policy. Throws if unknown.                           |
-| `.allowHosts(...hosts)` | Add hostnames to the network allow list                                  |
-| `.allowUrls(...urls)`   | Add fine-grained URL rules (Linux only, regex/wildcard support)          |
-| `.readPaths(...paths)`  | Add filesystem read paths                                                |
-| `.writePaths(...paths)` | Add filesystem write paths                                               |
-| `.env(key, value)`      | Set an environment variable                                              |
-| `.disableNetwork()`     | Disable all network access                                               |
-| `.maxMemory(mb)`        | Set memory limit in megabytes                                            |
-| `.maxCPUCores(cores)`   | Set CPU limit as fractional cores (e.g. 0.5)                             |
-| `.maxProcesses(count)`  | Set maximum child process count                                          |
-| `.timeout(ms)`          | Set hard kill timeout in milliseconds                                    |
-| `.binaryPath(path)`     | Override the Go binary path                                              |
-| `.workingDir(dir)`      | Set the working directory                                                |
-| `.enableAudit()`        | Enable sandbox violation auditing                                        |
-| `.allowPorts(...ports)` | Set allowed TCP ports                                                    |
-| `.enableDiff()`         | Enable filesystem mutation diffing                                       |
-| `.enableLearn()`        | Enable behavioral auto-profiling                                         |
-| `.allowExec(...cmds)`   | Restrict which executables can run                                       |
-| `.blockExec(...cmds)`   | Block specific executables from running                                  |
-| `.blockFork()`          | Prevent the command from forking new processes                           |
-| `.traceExec()`          | Log every child process spawned                                          |
-| `.strict()`             | Treat sandbox setup warnings as hard errors                              |
-| `.resolveSymlinks()`    | Resolve target command symlink in PATH                                   |
-| `.allowCrypto(allow)`   | Allow/disallow cryptographic operations                                  |
-| `.blockCrypto()`        | Restrict system cryptographic libraries                                  |
-| `.blockCryptoEntropy()` | Restrict entropy devices (/dev/random)                                   |
-| `.detectFIPS()`         | Log and watch for FIPS lookups                                           |
-| `.strictFIPS()`         | Restrict runtime to strict FIPS compliant mode                           |
-| `.allowGPU(allow)`      | Allow/disallow access to host GPU nodes                                  |
-| `.blockTPM()`           | Restrict hardware access to TPM device                                   |
-| `.spoofAntiVM()`        | Intercept debugger & virtualization checks                               |
-| `.traceLibraries()`     | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS) |
-| `.traceHTTPURLs()`      | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)     |
+| Method                  | Description                                                                                      |
+| ----------------------- | ------------------------------------------------------------------------------------------------ |
+| `.applyPolicy(name)`    | Apply a pre-defined policy. Throws if unknown.                                                   |
+| `.allowHosts(...hosts)` | Add hostnames to the network allow list                                                          |
+| `.allowUrls(...urls)`   | Add fine-grained URL rules — strings or `{host,protocol,path,methods,port}` objects (Linux only) |
+| `.readPaths(...paths)`  | Add filesystem read paths                                                                        |
+| `.writePaths(...paths)` | Add filesystem write paths                                                                       |
+| `.env(key, value)`      | Set an environment variable                                                                      |
+| `.disableNetwork()`     | Disable all network access                                                                       |
+| `.maxMemory(mb)`        | Set memory limit in megabytes                                                                    |
+| `.maxCPUCores(cores)`   | Set CPU limit as fractional cores (e.g. 0.5)                                                     |
+| `.maxProcesses(count)`  | Set maximum child process count                                                                  |
+| `.timeout(ms)`          | Set hard kill timeout in milliseconds                                                            |
+| `.binaryPath(path)`     | Override the Go binary path                                                                      |
+| `.workingDir(dir)`      | Set the working directory                                                                        |
+| `.enableAudit()`        | Enable sandbox violation auditing                                                                |
+| `.allowPorts(...ports)` | Set allowed TCP ports                                                                            |
+| `.enableDiff()`         | Enable filesystem mutation diffing                                                               |
+| `.enableLearn()`        | Enable behavioral auto-profiling                                                                 |
+| `.allowExec(...cmds)`   | Restrict which executables can run                                                               |
+| `.blockExec(...cmds)`   | Block specific executables from running                                                          |
+| `.blockFork()`          | Prevent the command from forking new processes                                                   |
+| `.traceExec()`          | Log every child process spawned                                                                  |
+| `.strict()`             | Treat sandbox setup warnings as hard errors                                                      |
+| `.resolveSymlinks()`    | Resolve target command symlink in PATH                                                           |
+| `.allowCrypto(allow)`   | Allow/disallow cryptographic operations                                                          |
+| `.blockCrypto()`        | Restrict system cryptographic libraries                                                          |
+| `.blockCryptoEntropy()` | Restrict entropy devices (/dev/random)                                                           |
+| `.detectFIPS()`         | Log and watch for FIPS lookups                                                                   |
+| `.strictFIPS()`         | Restrict runtime to strict FIPS compliant mode                                                   |
+| `.allowGPU(allow)`      | Allow/disallow access to host GPU nodes                                                          |
+| `.blockTPM()`           | Restrict hardware access to TPM device                                                           |
+| `.spoofAntiVM()`        | Intercept debugger & virtualization checks                                                       |
+| `.traceLibraries()`     | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS)                         |
+| `.traceHTTPURLs()`      | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)                             |
 
 ### `.run(cmd, args?)`
 
@@ -557,6 +557,143 @@ Each captured request emits a `{"type":"http-request","method":"...","host":"...
 | `ssl_write_uprobe` | OpenSSL / BoringSSL (`libssl.so`)      |
 | `go_tls_uprobe`    | Go built-in `crypto/tls` (Go binaries) |
 | `gnutls_uprobe`    | GnuTLS (`libgnutls.so`)                |
+
+## URL Access-Control Rules (`allowUrls` / `--allow-url`)
+
+When `traceHTTPURLs()` is enabled on Linux, you can layer **URL-level allow rules** on top of the coarser `allowHosts` list. Rules are matched against every HTTPS request captured by the eBPF tracer. Requests that match _at least one_ rule are allowed; anything else is logged as a `url-violation` audit entry.
+
+Ports declared inside URL rules are **automatically added** to the Landlock network allow-list, so you do not need to call `.allowPorts()` separately.
+
+> [!NOTE]
+> `allowUrls` is a **Linux-only observational enforcement** feature. On macOS a warning is emitted and the rules are ignored. Enforcement currently surfaces violations as audit log entries; network-level blocking still depends on `allowHosts` / `allowPorts` / `disableNetwork()`.
+
+### Pattern types
+
+Each rule can be a URL **string** (parsed automatically) or a **plain object**. All fields are optional — omitting a field means "match anything".
+
+```ts
+interface AllowURLRule {
+  host?: string; // hostname pattern (see matching modes below)
+  protocol?: string; // "https" | "http"  (default: any)
+  port?: number; // TCP port           (default: any)
+  path?: string; // path pattern        (default: any)
+  methods?: string[]; // HTTP verbs          (default: any)
+}
+```
+
+#### 1. Exact match
+
+Plain strings match the full hostname or path exactly (case-insensitive).
+
+```js
+.allowUrls({ host: 'registry.npmjs.org', protocol: 'https' })
+// matches: https://registry.npmjs.org/...
+// rejects: https://api.npmjs.org/...
+```
+
+#### 2. Wildcard (`*`)
+
+A single `*` matches one label in a hostname (cannot span dots) or any sequence of characters in a path.
+
+```js
+// Hostname wildcard — single subdomain level only
+.allowUrls({ host: '*.npmjs.org' })
+// matches: registry.npmjs.org
+// rejects: a.b.npmjs.org        ← * does not span dots
+
+// Path glob
+.allowUrls({ host: 'registry.npmjs.org', path: '/-/npm/v1/*' })
+// matches: /-/npm/v1/security/advisories/bulk
+// rejects: /express              ← wrong prefix
+```
+
+You can also pass a full URL string and it will be parsed automatically:
+
+```js
+.allowUrls('https://*.npmjs.org/')
+.allowUrls('https://registry.npmjs.org/-/npm/v1/*')
+```
+
+#### 3. Regex (prefix `~`)
+
+Patterns that start with `~` are treated as regular expressions. The `~` is stripped before compilation.
+
+```js
+// Regex hostname
+.allowUrls({ host: '~^registry\.npmjs\.org$', protocol: 'https' })
+
+// Regex path
+.allowUrls({ host: 'registry.npmjs.org', path: '~^/-/npm/v[0-9]+/' })
+
+// Combined — regex host + regex path
+.allowUrls({ host: '~^(registry|api)\.npmjs\.org$', path: '~^/[a-z]' })
+```
+
+#### 4. Method-restricted rules
+
+```js
+.allowUrls({ host: 'api.github.com', methods: ['GET', 'POST'] })
+// allows GET and POST; rejects PUT, DELETE, PATCH ...
+```
+
+#### 5. Multiple rules — any match wins
+
+```js
+const result = await new SaferExec()
+  .traceHTTPURLs()
+  .allowHosts("registry.npmjs.org", "api.github.com")
+  .allowUrls(
+    // exact host + path prefix
+    { host: "registry.npmjs.org", protocol: "https", path: "/-/npm/v1/" },
+    // wildcard subdomain
+    "*.npmjs.org",
+    // regex host, GET only
+    { host: "~^api\.github\.com$", protocol: "https", methods: ["GET"] },
+  )
+  .enableAudit()
+  .run("npm", ["install"]);
+
+// Violations surface in the audit log:
+const violations = result.auditLog.filter((e) => e.type === "url-violation");
+console.log(violations);
+// [{type:'url-violation', target:'https://telemetry.example.com/', details:'violation detected at ...'}]
+```
+
+### CLI equivalent
+
+```bash
+# String form — parsed as URL
+sudo safer-exec --trace-http-urls \
+  --allow-url="https://registry.npmjs.org/-/npm/v1/" \
+  --allow-url="https://*.npmjs.org" \
+  --allow-url="https://~^api\.github\.com$" \
+  --audit -- npm install
+```
+
+### Real-time violation streaming
+
+```js
+const exec = new SaferExec()
+  .traceHTTPURLs()
+  .allowUrls({ host: "*.npmjs.org" })
+  .enableAudit();
+
+exec.on("audit", (entry) => {
+  if (entry.type === "url-violation") {
+    console.error("[BLOCKED]", entry.target);
+  }
+});
+
+await exec.run("npm", ["install"]);
+```
+
+### Platform notes
+
+| Platform                      | Behaviour                                                                          |
+| ----------------------------- | ---------------------------------------------------------------------------------- |
+| **Linux ≥ 5.8, root/CAP_BPF** | Full enforcement — violations logged, ports auto-allowed in Landlock               |
+| **Linux — eBPF unavailable**  | Warning printed (`http-trace: eBPF HTTP tracing not supported`); URL rules ignored |
+| **macOS**                     | Warning printed (`http-trace: ... will be ignored on macOS`); URL rules ignored    |
 
 ## Environment Variables
 

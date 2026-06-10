@@ -148,35 +148,54 @@ func matchPathPattern(cr compiledRule, path string) bool {
 // For host patterns:  "*.npmjs.org" matches "registry.npmjs.org" but NOT "a.b.npmjs.org".
 // For path patterns:  "/npm/*" matches "/npm/anything/here".
 func globMatch(pattern, s string) bool {
-	// Normalise: split on "*" and match each segment in order.
 	parts := strings.Split(pattern, "*")
 	if len(parts) == 1 {
-		// No wildcard — exact match
 		return strings.EqualFold(pattern, s)
 	}
 
-	// For host patterns the wildcard must not match a "." in the host label.
-	// Heuristic: if pattern contains a dot we are in host context.
 	hostContext := strings.Contains(pattern, ".")
-
 	remaining := s
+
 	for i, part := range parts {
 		if part == "" {
+			// If trailing "*", ensure the rest of the string is valid
+			if i == len(parts)-1 {
+				if hostContext && strings.Contains(remaining, ".") {
+					return false
+				}
+				return true
+			}
 			continue
 		}
+
 		idx := strings.Index(strings.ToLower(remaining), strings.ToLower(part))
 		if idx < 0 {
 			return false
 		}
+
+		// The characters we skipped over to find 'part'
+		skipped := remaining[:idx]
+
+		// If this is the very first literal segment (and pattern doesn't start with "*"),
+		// it MUST match exactly at the beginning of 's'.
 		if i == 0 && idx > 0 {
-			// First segment must match at the start, or skipped portion must be valid
-			skipped := remaining[:idx]
-			if hostContext && strings.Contains(skipped, ".") {
-				return false
-			}
+			return false
 		}
+
+		// If we are in host context, a wildcard cannot span across a dot (e.g. *.com cannot match a.b.com)
+		// We only enforce this for the 'skipped' portions which correspond to the "*" characters.
+		if hostContext && i > 0 && strings.Contains(skipped, ".") {
+			return false
+		}
+
 		remaining = remaining[idx+len(part):]
 	}
+
+	// Must match the entire string unless the pattern ended with "*"
+	if len(remaining) > 0 && parts[len(parts)-1] != "" {
+		return false
+	}
+
 	return true
 }
 
