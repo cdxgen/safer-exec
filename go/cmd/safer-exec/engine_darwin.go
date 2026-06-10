@@ -126,6 +126,10 @@ func run(cfg config.ExecConfig) error {
 		fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: enabled on macOS. Library loads appear as file-read audit events (.dylib/.framework paths).\n")
 	}
 
+	if cfg.TraceHTTPURLs || len(cfg.AllowURLRules) > 0 {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: http-trace: eBPF HTTP tracing and fine-grained URL rules are only supported on Linux. These settings will be ignored on macOS.\n")
+	}
+
 	// Build the Seatbelt profile (after potentially adding the dylib path to ReadPaths)
 	profile := buildSeatbeltProfile(cfg)
 
