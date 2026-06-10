@@ -297,6 +297,27 @@ describe('SaferExec', () => {
       );
     });
 
+    it('should parse and store allowUrls correctly', () => {
+      const exec = new SaferExec();
+      exec.allowUrls(
+        'https://registry.npmjs.org/-/npm/v1/',
+        '~^api\\\\.github\\\\.com$',
+        { host: '*.example.com', methods: ['GET', 'POST'] }
+      );
+
+      strict.equal(exec._allowURLRules.length, 3, 'should parse 3 URL rules');
+      
+      strict.equal(exec._allowURLRules[0].protocol, 'https');
+      strict.equal(exec._allowURLRules[0].host, 'registry.npmjs.org');
+      strict.equal(exec._allowURLRules[0].port, 443);
+      strict.equal(exec._allowURLRules[0].pathPrefix, '/-/npm/v1/');
+
+      strict.equal(exec._allowURLRules[1].host, '~^api\\\\.github\\\\.com$');
+
+      strict.equal(exec._allowURLRules[2].host, '*.example.com');
+      strict.deepEqual(exec._allowURLRules[2].methods, ['GET', 'POST']);
+    });
+
     it('should accept multiple paths in a single readPaths call', () => {
       const exec = new SaferExec();
       const etc = realpathSync('/etc');

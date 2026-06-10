@@ -404,6 +404,32 @@ const learnResult = await new SaferExec()
 // { "httpAccess": [{ "method": "GET", "host": "registry.npmjs.org", ... }] }
 ```
 
+### Enforcing Fine-grained URL Access Control
+
+When `traceHTTPURLs()` is enabled on Linux, you can enforce URL-level access control. This applies the observed HTTP requests against a list of allow rules, surfacing any violations in the audit log. Ports declared in URL rules are automatically added to the Landlock network allowlist.
+
+```bash
+# Allow only specific URL prefixes and wildcards
+sudo safer-exec --trace-http-urls \
+  --allow-url="https://registry.npmjs.org/-/npm/v1/" \
+  --allow-url="https://*.npmjs.org" \
+  --audit -- npm install
+```
+
+```javascript
+import { SaferExec } from "@cdxgen/safer-exec";
+
+const result = await new SaferExec()
+  .traceHTTPURLs()
+  .allowUrls(
+    "https://registry.npmjs.org/-/npm/v1/",
+    "https://*.npmjs.org",
+    { protocol: "https", host: "~^api\\\\.github\\\\.com$", methods: ["GET"] }
+  )
+  .enableAudit()
+  .run("npm", ["install"]);
+```
+
 ### Troubleshooting
 
 | Symptom                                       | Cause                                                              | Fix                                                                                                       |

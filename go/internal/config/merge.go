@@ -15,6 +15,7 @@ import (
 // Merge rules:
 //
 //   - Slices (ReadPaths, WritePaths, AllowHosts, etc.): union, deduplicated
+//   - AllowURLRules: union by (protocol,host,port,pathPrefix); methods unioned
 //   - Env map: observed keys overwrite base keys
 //   - Booleans (BlockFork, DisableNetwork): base OR observed (true wins)
 //   - Resource limits: base wins if non-zero, else observed fills the gap
@@ -52,6 +53,7 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	merged.AllowHosts = unionStrings(base.AllowHosts, observed.AllowHosts)
 	merged.AllowIPs = unionStrings(base.AllowIPs, observed.AllowIPs)
 	merged.AllowPorts = unionInts(base.AllowPorts, observed.AllowPorts)
+	merged.AllowURLRules = mergeURLRules(base.AllowURLRules, observed.AllowURLRules)
 	merged.DisableNetwork = base.DisableNetwork || observed.DisableNetwork
 	merged.AllowLoopback = base.AllowLoopback || observed.AllowLoopback
 
@@ -229,6 +231,54 @@ func mergeHTTPAccess(a, b []HTTPAccessEntry) []HTTPAccessEntry {
 	}
 	if result == nil {
 		result = []HTTPAccessEntry{}
+	}
+	return result
+}
+
+// mergeURLRules returns the union of two AllowURLRule slices, deduplicated by
+// (protocol, host, port, pathPrefix). Methods are unioned per matching group.
+func mergeURLRules(a, b []AllowURLRule) []AllowURLRule {
+	type key struct {
+		protocol, host, pathPrefix string
+		port                       int
+	}
+	type entry struct {
+		rule    AllowURLRule
+		idx     int
+		methods map[string]bool
+	}
+
+	seen := make(map[key]*entry)
+	var order []key
+
+	for _, r := range append(a, b...) {
+		k := key{r.Protocol, r.Host, r.PathPrefix, r.Port}
+		if e, ok := seen[k]; ok {
+			// Union methods
+			for _, m := range r.Methods {
+				e.methods[m] = true
+			}
+		} else {
+			methods := make(map[string]bool)
+			for _, m := range r.Methods {
+				methods[m] = true
+			}
+			seen[k] = &entry{rule: r, idx: len(order), methods: methods}
+			order = append(order, k)
+		}
+	}
+
+	result := make([]AllowURLRule, len(order))
+	for _, k := range order {
+		e := seen[k]
+		rule := e.rule
+		ms := make([]string, 0, len(e.methods))
+		for m := range e.methods {
+			ms = append(ms, m)
+		}
+		sort.Strings(ms)
+		rule.Methods = ms
+		result[e.idx] = rule
 	}
 	return result
 }

@@ -3,6 +3,45 @@
 // resolves (hosts → IPs, paths, env) before handing off to the OS engine.
 package config
 
+// AllowURLRule specifies a fine-grained URL access rule for outbound HTTP/HTTPS
+// requests observed via eBPF TLS uprobes (TraceHTTPURLs). Rules are matched
+// against captured HTTP requests in real-time and violations are emitted as
+// "url-violation" audit entries.
+//
+// This feature is Linux-only and requires TraceHTTPURLs to be enabled.
+//
+// Host matching supports three formats:
+//
+//	"registry.npmjs.org"     — exact hostname match
+//	"*.npmjs.org"            — wildcard: matches any single subdomain label
+//	"~^registry\.npmjs\.org" — Go regexp (prefix "~"): full-featured regex
+//
+// PathPrefix matching:
+//
+//	"/npm/v1/"   — plain string prefix match
+//	"~^/npm/v[0-9]/" — regexp (prefix "~")
+//
+// An empty string for any field means "match anything" for that dimension.
+type AllowURLRule struct {
+	// Protocol is the URL scheme to match: "http", "https", or "" (any).
+	Protocol string `json:"protocol,omitempty"`
+
+	// Host is the hostname or pattern to match (see package doc for syntax).
+	// Required — an empty host matches every host.
+	Host string `json:"host"`
+
+	// Port is the TCP port to match. 0 matches any port.
+	Port int `json:"port,omitempty"`
+
+	// PathPrefix is the URL path prefix or pattern to match.
+	// "" or "/" matches all paths.
+	PathPrefix string `json:"pathPrefix,omitempty"`
+
+	// Methods lists the allowed HTTP verbs (e.g. ["GET","POST"]).
+	// An empty or nil slice allows any method.
+	Methods []string `json:"methods,omitempty"`
+}
+
 // ExecConfig is the canonical JSON structure the Go binary reads from stdin.
 // The Node.js wrapper populates this after DNS resolution and path expansion.
 type ExecConfig struct {
@@ -41,6 +80,13 @@ type ExecConfig struct {
 	// 0 means any port. Used by Landlock network rules on Linux and
 	// Seatbelt rules on macOS. Default: [80, 443].
 	AllowPorts []int `json:"allowPorts"`
+
+	// AllowURLRules are fine-grained URL access rules matched against HTTP
+	// requests captured by the eBPF TLS uprobe (TraceHTTPURLs).
+	// Linux-only. Each rule can restrict by protocol, host (wildcard/regex),
+	// port, path prefix (wildcard/regex), and HTTP method.
+	// Violations are emitted as "url-violation" audit entries.
+	AllowURLRules []AllowURLRule `json:"allowURLRules,omitempty"`
 
 	// DisableNetwork, when true, cuts all network access. On Linux this
 	// adds CLONE_NEWNET; on macOS it adds (allow network-outbound) rules
@@ -192,6 +238,8 @@ type HTTPAccessEntry struct {
 	Protocol string `json:"protocol"`
 	// Port is the TCP port of the request (e.g. 443).
 	Port int `json:"port"`
+	// Blocked is true when AllowURLRules are set and this request matched no rule.
+	Blocked bool `json:"blocked,omitempty"`
 	// Query is the request query parameters.
 	Query string `json:"query,omitempty"`
 	// Body is the request body payload.
@@ -313,6 +361,11 @@ type PolicyFile struct {
 	// HTTP access log — populated when --trace-http-urls is used with --learn
 	// or --audit. Records observed HTTP requests with method, host, and path.
 	HTTPAccess []HTTPAccessEntry `json:"httpAccess,omitempty"`
+
+	// AllowURLRules are fine-grained URL access rules for HTTP requests.
+	// Linux-only. Populated by learn mode from HTTPAccess observations,
+	// and applied during enforcement when TraceHTTPURLs is active.
+	AllowURLRules []AllowURLRule `json:"allowURLRules,omitempty"`
 
 	// Informational — set by learner, ignored when loading as policy-file
 	Cmd  string   `json:"cmd,omitempty"`

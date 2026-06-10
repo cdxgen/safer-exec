@@ -312,7 +312,25 @@ func run(cfg config.ExecConfig) error {
 	if cfg.EnableAudit && auditR != nil {
 		collectAuditLog(auditR)
 	}
-	_ = httpEvents // collected for future use / audit mode emission
+
+	// Enforce AllowURLRules against captured HTTP events (Linux-only, requires TraceHTTPURLs).
+	// This is observational enforcement: Landlock already restricts ports; we surface
+	// per-URL violations as structured audit entries so callers know exactly which
+	// URL patterns the command tried to reach outside the declared policy.
+	if len(cfg.AllowURLRules) > 0 && len(httpEvents) > 0 {
+		compiledRules := config.CompileURLRules(cfg.AllowURLRules)
+		for i := range httpEvents {
+			e := &httpEvents[i]
+			if !config.MatchesAny(compiledRules, e.Method, e.Protocol, e.Host, e.Port, e.Path) {
+				e.Blocked = true
+				targetURL := e.Protocol + "://" + e.Host + e.Path
+				logAuditEntry("url-violation", targetURL)
+				fmt.Fprintf(os.Stderr, "safer-exec: url-violation: %s %s://%s%s (pid %d) — no matching AllowURLRule\n",
+					e.Method, e.Protocol, e.Host, e.Path, e.PID)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -358,6 +376,9 @@ func runLearn(cfg config.ExecConfig) error {
 	// Merge HTTP access entries into the learned policy.
 	if len(httpEntries) > 0 {
 		policy.HTTPAccess = deduplicateHTTPAccess(httpEntries)
+		// Synthesise AllowURLRules from observed HTTP access for use as an
+		// enforcement policy in subsequent runs with --policy-file.
+		policy.AllowURLRules = config.SynthesiseURLRules(httpEntries)
 	}
 
 	data, _ := json.Marshal(policy)
@@ -877,13 +898,29 @@ func applyLandlockNetwork(cfg config.ExecConfig) error {
 		return nil
 	}
 
-	if len(cfg.AllowIPs) == 0 && len(cfg.AllowPorts) == 0 && !cfg.DisableNetwork {
+	if len(cfg.AllowIPs) == 0 && len(cfg.AllowPorts) == 0 && len(cfg.AllowURLRules) == 0 && !cfg.DisableNetwork {
 		return nil
 	}
 	ports := cfg.AllowPorts
+	// Extract ports declared in AllowURLRules so Landlock allows the necessary TCP ports.
+	for _, r := range cfg.AllowURLRules {
+		if r.Port > 0 {
+			found := false
+			for _, p := range ports {
+				if p == r.Port {
+					found = true
+					break
+				}
+			}
+			if !found {
+				ports = append(ports, r.Port)
+			}
+		}
+	}
 	if len(ports) == 0 {
 		ports = []int{80, 443}
 	}
+
 
 	abi, _, errno := syscall.RawSyscall(sysLandlockCreateRuleset, 0, 0, landlockCreateRulesetVersion)
 	if errno != 0 || abi < 4 {

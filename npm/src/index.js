@@ -141,6 +141,74 @@ function expandEnv(str) {
   return str.replace(/\$(TMPDIR|TEMP)\b/g, () => tmpdir());
 }
 
+/**
+ * Parse a URL string or AllowURLRule object into a normalized AllowURLRule.
+ *
+ * String format: `[protocol://]host[:port][/path]`
+ * Examples:
+ *   - `"https://registry.npmjs.org/-/npm/v1/"` → { protocol:"https", host:"registry.npmjs.org", port:443, pathPrefix:"/-/npm/v1/" }
+ *   - `"https://*.npmjs.org"` → { protocol:"https", host:"*.npmjs.org" }
+ *   - `"~^registry\\.npmjs\\.org$"` → treated as object: { host: "~^registry\\.npmjs\\.org$" }
+ *
+ * Object format: `{ protocol?, host, port?, pathPrefix?, methods? }`
+ *
+ * Returns null if the input cannot be parsed.
+ *
+ * @param {string|Object} input - URL string or AllowURLRule object
+ * @returns {{ protocol?: string, host: string, port?: number, pathPrefix?: string, methods?: string[] }|null}
+ */
+function _parseURLRule(input) {
+  if (!input) return null;
+
+  // Object form — pass through with validation
+  if (typeof input === 'object' && !Array.isArray(input)) {
+    if (typeof input.host !== 'string') return null;
+    return {
+      protocol: input.protocol || undefined,
+      host: input.host,
+      port: typeof input.port === 'number' ? input.port : undefined,
+      pathPrefix: input.pathPrefix || undefined,
+      methods: Array.isArray(input.methods) ? input.methods : undefined,
+    };
+  }
+
+  if (typeof input !== 'string' || !input) return null;
+
+  // Regex shorthand: if the string starts with "~", treat as a host regex rule
+  if (input.startsWith('~')) {
+    return { host: input };
+  }
+
+  // Ensure we have a scheme so new URL() can parse it
+  let raw = input;
+  if (!raw.includes('://')) {
+    raw = 'https://' + raw;
+  }
+
+  try {
+    const u = new URL(raw);
+    const protocol = u.protocol.replace(/:$/, ''); // "https:" → "https"
+    const host = u.hostname;                        // "registry.npmjs.org"
+    const port = u.port
+      ? parseInt(u.port, 10)
+      : (protocol === 'https' ? 443 : protocol === 'http' ? 80 : undefined);
+    const pathPrefix = u.pathname && u.pathname !== '/' ? u.pathname : undefined;
+
+    if (!host) return null;
+    return {
+      protocol,
+      host,
+      port,
+      pathPrefix,
+      methods: undefined,
+    };
+  } catch {
+    // Unparseable — treat entire string as a host pattern
+    return { host: input };
+  }
+}
+
+
 export class SaferExec extends EventEmitter {
   /**
    * Create a new SaferExec instance with default configuration.
@@ -275,6 +343,15 @@ export class SaferExec extends EventEmitter {
 
     /** @type {boolean} Attach eBPF uprobes to TLS write functions to capture HTTP URLs (Linux only, kernel >= 5.8) */
     this._traceHTTPURLs = options.traceHTTPURLs || false;
+
+    /**
+     * Fine-grained URL access rules (Linux-only, requires traceHTTPURLs).
+     * Each entry: { protocol?, host, port?, pathPrefix?, methods? }
+     * Host and pathPrefix accept exact strings, globs ("*.npmjs.org"), or
+     * regexps prefixed with "~" ("~^registry\.npmjs\.org$").
+     * @type {Array<{protocol?: string, host: string, port?: number, pathPrefix?: string, methods?: string[]}>}
+     */
+    this._allowURLRules = options.allowURLRules || [];
   }
 
   /**
@@ -482,6 +559,10 @@ export class SaferExec extends EventEmitter {
     if (raw.traceHTTPURLs) {
       this.traceHTTPURLs();
     }
+    // AllowURLRules (Linux-only URL-level filtering)
+    if (Array.isArray(raw.allowURLRules) && raw.allowURLRules.length > 0) {
+      this.allowUrls(...raw.allowURLRules);
+    }
 
     return this;
   }
@@ -499,6 +580,51 @@ export class SaferExec extends EventEmitter {
       if (!this._allowHosts.includes(host)) {
         this._allowHosts.push(host);
       }
+    }
+    return this;
+  }
+
+  /**
+   * Add fine-grained URL access rules (Linux-only, requires TraceHTTPURLs).
+   *
+   * Requests observed by the eBPF TLS uprobe are validated against these rules.
+   * Requests matching no rule are emitted as "url-violation" audit entries.
+   * Ports declared in URL rules are automatically added to the Landlock allowlist.
+   *
+   * Each argument can be:
+   * - A URL string: `"https://registry.npmjs.org/-/npm/v1/"` — parsed into a rule.
+   * - An object with fields: `{ protocol, host, port, pathPrefix, methods }`.
+   *
+   * Host and pathPrefix support three matching modes:
+   * - Exact:    `"registry.npmjs.org"`
+   * - Glob:     `"*.npmjs.org"`, `"/npm/v1/*"`
+   * - Regex:    `"~^registry\\.npmjs\\.org$"` (prefix `~` triggers regexp)
+   *
+   * @param {...(string|Object)} urlsOrRules - URL strings or AllowURLRule objects
+   * @returns {SaferExec} This instance for chaining
+   *
+   * @example
+   * new SaferExec()
+   *   .allowUrls(
+   *     'https://registry.npmjs.org/-/npm/v1/',
+   *     'https://*.npmjs.org',
+   *     { protocol: 'https', host: 'api.github.com', port: 443, methods: ['GET'] }
+   *   )
+   *   .traceHTTPURLs()
+   *   .run('npm', ['install']);
+   */
+  allowUrls(...urlsOrRules) {
+    for (const input of urlsOrRules) {
+      const rule = _parseURLRule(input);
+      if (!rule) continue;
+      // Auto-register the host for DNS resolution (skip wildcard/regex hosts)
+      const host = rule.host;
+      if (host && !host.startsWith('~') && !host.includes('*')) {
+        if (!this._allowHosts.includes(host)) {
+          this._allowHosts.push(host);
+        }
+      }
+      this._allowURLRules.push(rule);
     }
     return this;
   }
@@ -1116,6 +1242,7 @@ export class SaferExec extends EventEmitter {
       traceLibraries: this._traceLibraries,
       traceTempDir: this._traceTempDir,
       traceHTTPURLs: this._traceHTTPURLs,
+      allowURLRules: this._allowURLRules,
     };
 
     // Determine effective timeout: use explicit timeout or default to 60s

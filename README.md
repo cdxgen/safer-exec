@@ -67,6 +67,7 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 | Option               | Type       | Default         | Description                                                                |
 | -------------------- | ---------- | --------------- | -------------------------------------------------------------------------- |
 | `allowHosts`         | `string[]` | `[]`            | Hostnames to allow network access to                                       |
+| `allowURLRules`      | `Object[]` | `[]`            | Fine-grained URL rules (Linux only, requires `traceHTTPURLs`)              |
 | `readPaths`          | `string[]` | `[]`            | Filesystem paths to read from                                              |
 | `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to                                               |
 | `env`                | `Object`   | `{}`            | Environment variables to set                                               |
@@ -105,6 +106,7 @@ All methods return `this` for chaining except `.run()`.
 | ----------------------- | ------------------------------------------------------------------------ |
 | `.applyPolicy(name)`    | Apply a pre-defined policy. Throws if unknown.                           |
 | `.allowHosts(...hosts)` | Add hostnames to the network allow list                                  |
+| `.allowUrls(...urls)`   | Add fine-grained URL rules (Linux only, regex/wildcard support)          |
 | `.readPaths(...paths)`  | Add filesystem read paths                                                |
 | `.writePaths(...paths)` | Add filesystem write paths                                               |
 | `.env(key, value)`      | Set an environment variable                                              |

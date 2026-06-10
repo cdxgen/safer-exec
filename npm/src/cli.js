@@ -71,6 +71,7 @@ Options:
   -n, --disable-network      Disable all network access
       --allow-loopback       Allow localhost/loopback connections
   -H, --allow-host=<host>    Allow network access to specific host (repeatable)
+      --allow-url=<url>      Allow network access to specific URL/Pattern (Linux only, repeatable)
       --port=<port>          Allow network access to specific TCP port (repeatable)
 
   -r, --read-path=<path>     Allow reading from filesystem path (repeatable)
@@ -204,6 +205,10 @@ function parseCliArgs() {
         type: 'string',
         multiple: true,
         short: 'H',
+      },
+      'allow-url': {
+        type: 'string',
+        multiple: true,
       },
       port: {
         type: 'string',
@@ -373,6 +378,9 @@ function buildExec(values, cmd, args) {
   }
   if (values['allow-host'] && values['allow-host'].length > 0) {
     exec.allowHosts(...values['allow-host']);
+  }
+  if (values['allow-url'] && values['allow-url'].length > 0) {
+    exec.allowUrls(...values['allow-url']);
   }
   if (values.port && values.port.length > 0) {
     exec.allowPorts(...values.port.map((p) => parseNumeric(p, 'port')));
