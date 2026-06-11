@@ -1481,6 +1481,18 @@ func runDiagnostics() config.DiagnosticsResult {
 	// LD_AUDIT for library tracing
 	result.Capabilities["ld_audit"] = config.CapabilityInfo{Available: true, Detail: "LD_AUDIT supported on glibc"}
 
+	// FIPS mode detection on Linux
+	if data, err := os.ReadFile("/proc/sys/crypto/fips_enabled"); err == nil {
+		fipsVal := strings.TrimSpace(string(data))
+		if fipsVal == "1" {
+			result.Capabilities["fips_detection"] = config.CapabilityInfo{Available: true, Detail: "FIPS mode enabled"}
+		} else {
+			result.Capabilities["fips_detection"] = config.CapabilityInfo{Available: true, Detail: "FIPS mode disabled (fips_enabled=0)"}
+		}
+	} else {
+		result.Capabilities["fips_detection"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
 	// Map capabilities to features
 	hasUnshare := result.Capabilities["unshare_command"].Available
 	hasUserNS := result.Capabilities["user_namespace"].Available
@@ -1509,7 +1521,7 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["learning_mode"] = fullIsolation || reducedIsolation
 	result.Features["strict_mode"] = true
 	result.Features["crypto_control"] = fullIsolation || reducedIsolation
-	result.Features["fips_detection"] = false
+	result.Features["fips_detection"] = result.Capabilities["fips_detection"].Available
 	result.Features["gpu_control"] = fullIsolation || reducedIsolation
 	result.Features["tpm_control"] = fullIsolation || reducedIsolation
 	result.Features["antivm_spoofing"] = fullIsolation || reducedIsolation

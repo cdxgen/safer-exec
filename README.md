@@ -348,8 +348,10 @@ sudo tee /etc/apparmor.d/safer-exec > /dev/null << 'EOF'
 abi <abi/4.0>,
 include <tunables/global>
 
-profile safer-exec /** {
+profile safer-exec <path to>/node_modules/@cdxgen/safer-exec-linux-*/bin/safer-exec {
+  # Allow user namespaces
   userns,
+  # Add other necessary rules (ix/px for child processes, file r/w, etc.)
 }
 EOF
 
