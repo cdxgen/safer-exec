@@ -35,6 +35,9 @@ safer-exec --allow-exec=node --allow-exec=npx -- npm run build
 safer-exec --block-exec=sh -- npm install
 safer-exec --block-fork -- npm install
 safer-exec --trace-exec -- npm install
+
+# Strip sensitive environment variables
+safer-exec --sanitize-env -- npm install
 ```
 
 Full help: `safer-exec --help`.
@@ -72,10 +75,10 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 | `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to                                                                         |
 | `env`                | `Object`   | `{}`            | Environment variables to set                                                                         |
 | `disableNetwork`     | `boolean`  | `false`         | Cut all network access                                                                               |
-| `maxMemoryMB`        | `number`   | `0`             | Memory limit in megabytes                                                                            |
-| `maxCPUCores`        | `number`   | `0`             | CPU limit as fractional cores                                                                        |
-| `maxProcesses`       | `number`   | `0`             | Max child processes (anti-fork bomb)                                                                 |
-| `timeoutMs`          | `number`   | `0`             | Hard kill timeout in milliseconds                                                                    |
+| `maxMemoryMB`        | `number`   | `512`           | Memory limit in megabytes (default: 512)                                                             |
+| `maxCPUCores`        | `number`   | `1.0`           | CPU limit as fractional cores (default: 1.0)                                                         |
+| `maxProcesses`       | `number`   | `100`           | Max child processes — anti-fork bomb (default: 100)                                                  |
+| `timeoutMs`          | `number`   | `60000`         | Hard kill timeout in milliseconds (default: 60000)                                                   |
 | `workingDir`         | `string`   | `process.cwd()` | Working directory                                                                                    |
 | `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                                                                              |
 | `enableAudit`        | `boolean`  | `false`         | Enable violation auditing                                                                            |
@@ -97,6 +100,7 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 | `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks                                                           |
 | `traceLibraries`     | `boolean`  | `false`         | Track dynamic library loading (opt-in)                                                               |
 | `traceHTTPURLs`      | `boolean`  | `false`         | Capture HTTPS request URLs via eBPF uprobes (Linux only, requires CAP_BPF)                           |
+| `sanitizeEnv`        | `boolean`  | `false`         | Strip sensitive env vars (TOKEN, SECRET, etc.) before passing to sandbox                             |
 
 ### Instance Methods
 
@@ -137,6 +141,7 @@ All methods return `this` for chaining except `.run()`.
 | `.spoofAntiVM()`        | Intercept debugger & virtualization checks                                                       |
 | `.traceLibraries()`     | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS)                         |
 | `.traceHTTPURLs()`      | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)                             |
+| `.sanitizeEnv(val)`     | Strip sensitive env vars (TOKEN, SECRET, AUTH, etc.) before passing to sandbox                   |
 
 ### `.run(cmd, args?)`
 
@@ -204,9 +209,9 @@ The Node.js layer handles policy resolution, DNS lookups, and config serializati
 4. Map UID/GID to root inside the user namespace for mount privileges
 5. Create cgroup v2 hierarchy for resource quotas
 6. Mount tmpfs root, bind-mount read/write paths, mount proc and sysfs
-7. Apply Landlock v2 network confinement rules
-8. Apply seccomp-bpf filter blocking ptrace, kcmp, unshare, mount, pivot_root
-9. `pivot_root` to the new filesystem tree
+7. Apply Landlock v2 network confinement rules (only explicitly configured ports, no 1-1024 wildcard)
+8. Apply seccomp-bpf filter blocking ptrace, kcmp, unshare, mount, pivot_root, execveat (when TraceExec), clone3 (when BlockFork)
+9. `pivot_root` to the new filesystem tree (failure is a hard error)
 10. `execve` the target command
 
 **Linux path (reduced isolation — user namespaces unavailable):**

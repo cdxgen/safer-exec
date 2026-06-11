@@ -222,6 +222,16 @@ type ExecConfig struct {
 	// JSON lines, one marker per line. When this field is set, the binary's
 	// stdout carries only the raw command output with no marker pollution.
 	StructuredOutputPath string `json:"structuredOutputPath,omitempty"`
+
+	// ConfigFilePath, when set, tells the --init process to read config
+	// from this file instead of the SAFER_EXEC_CONFIG environment variable.
+	// The file is created with 0600 permissions and deleted after reading.
+	ConfigFilePath string `json:"configFilePath,omitempty"`
+
+	// SanitizeEnv, when true, strips sensitive environment variables (containing
+	// TOKEN, PASSWORD, SECRET, API_KEY, etc.) from the environment before passing
+	// them to the sandboxed process.
+	SanitizeEnv bool `json:"sanitizeEnv"`
 }
 
 // HTTPAccessEntry records a single HTTP request observed during eBPF tracing.

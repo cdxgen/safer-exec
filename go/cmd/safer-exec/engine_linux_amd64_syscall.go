@@ -12,4 +12,5 @@ const (
 	sysFORK_unified     = 57
 	sysVFORK_unified    = 58
 	sysEXECVEAT_unified = 322
+	sysCLONE3_unified   = 435
 )

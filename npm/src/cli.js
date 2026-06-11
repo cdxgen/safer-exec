@@ -94,6 +94,7 @@ Options:
   -a, --audit                Enable sandbox violation auditing
       --audit-output-file=<f> Write audit log to file (implies audit)
   -s, --strict               Treat sandbox setup warnings as errors
+      --sanitize-env          Strip sensitive env vars (TOKEN, SECRET, etc.)
 
   -j, --json                 Output results as JSON
   -h, --help                 Show this help message
@@ -269,6 +270,9 @@ function parseCliArgs() {
         type: 'boolean',
         short: 's',
       },
+      'sanitize-env': {
+        type: 'boolean',
+      },
       json: {
         type: 'boolean',
         short: 'j',
@@ -421,6 +425,10 @@ function buildExec(values, cmd, args) {
   }
   if (values['trace-exec']) {
     exec.traceExec();
+  }
+
+    if (values['sanitize-env']) {
+    exec.sanitizeEnv();
   }
 
   // Features

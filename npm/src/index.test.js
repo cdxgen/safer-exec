@@ -28,10 +28,10 @@ describe('SaferExec', () => {
       strict.deepEqual(exec._writePaths, [], 'writePaths should be empty');
       strict.deepEqual(exec._env, {}, 'env should be empty object');
       strict.equal(exec._disableNetwork, false, 'disableNetwork should be false');
-      strict.equal(exec._maxMemoryMB, 0, 'maxMemoryMB should be 0');
-      strict.equal(exec._maxCPUCores, 0, 'maxCPUCores should be 0');
-      strict.equal(exec._maxProcesses, 0, 'maxProcesses should be 0');
-      strict.equal(exec._timeoutMs, 0, 'timeoutMs should be 0');
+      strict.equal(exec._maxMemoryMB, 512, 'maxMemoryMB should be 512');
+      strict.equal(exec._maxCPUCores, 1.0, 'maxCPUCores should be 1.0');
+      strict.equal(exec._maxProcesses, 100, 'maxProcesses should be 100');
+      strict.equal(exec._timeoutMs, 60000, 'timeoutMs should be 60000');
       strict.equal(exec._workingDir, process.cwd(), 'workingDir should be cwd');
       strict.equal(exec._binaryPath, undefined, 'binaryPath should be undefined');
       strict.deepEqual(exec._allowIPs, [], 'allowIPs should be empty');
@@ -120,6 +120,41 @@ describe('SaferExec', () => {
       strict.equal(execCustom._spoofAntiVM, true);
       strict.equal(execCustom._traceLibraries, true);
       strict.equal(execCustom._traceTempDir, '/tmp/my-trace-helper');
+    });
+  });
+
+    describe('sanitizeEnv', () => {
+    it('should default to false', () => {
+      const exec = new SaferExec();
+      strict.equal(exec._sanitizeEnv, false);
+    });
+
+    it('should be settable via constructor option', () => {
+      const exec = new SaferExec({ sanitizeEnv: true });
+      strict.equal(exec._sanitizeEnv, true);
+    });
+
+    it('should return this for chaining', () => {
+      const exec = new SaferExec();
+      strict.equal(exec.sanitizeEnv(), exec);
+    });
+
+    it('should set _sanitizeEnv to true', () => {
+      const exec = new SaferExec();
+      exec.sanitizeEnv();
+      strict.equal(exec._sanitizeEnv, true);
+    });
+
+    it('should set _sanitizeEnv to false when called with false', () => {
+      const exec = new SaferExec();
+      exec.sanitizeEnv(false);
+      strict.equal(exec._sanitizeEnv, false);
+    });
+
+    it('should include sanitizeEnv in _buildConfig output', async () => {
+      const exec = new SaferExec({ sanitizeEnv: true });
+      const { config } = await exec._buildConfig('echo', ['test']);
+      strict.equal(config.sanitizeEnv, true);
     });
   });
 

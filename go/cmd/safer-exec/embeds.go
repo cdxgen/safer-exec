@@ -9,21 +9,30 @@ import (
 // a temporary file and returns its path. The lifecycle/cleanup of this temporary file
 // is managed automatically by the engine callers (e.g. engine_linux.go).
 func extractPrecompiledAuditHelper(dir string) (string, error) {
-	tmpFile, err := os.CreateTemp(dir, "safer-exec-audit-*.so")
+	// Create temp dir with strict permissions
+	tmpDir, err := os.MkdirTemp(dir, "safer-exec-audit-*")
 	if err != nil {
 		return "", err
 	}
-	defer tmpFile.Close()
+
+	tmpFile, err := os.CreateTemp(tmpDir, "helper-*.so")
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return "", err
+	}
 
 	if _, err := tmpFile.Write(auditHelperSo); err != nil {
-		os.Remove(tmpFile.Name())
+		tmpFile.Close()
+		os.RemoveAll(tmpDir)
 		return "", err
 	}
 
-	if err := tmpFile.Chmod(0755); err != nil {
-		os.Remove(tmpFile.Name())
+	if err := tmpFile.Chmod(0644); err != nil {
+		tmpFile.Close()
+		os.RemoveAll(tmpDir)
 		return "", err
 	}
+	tmpFile.Close()
 
 	return tmpFile.Name(), nil
 }

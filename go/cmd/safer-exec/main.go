@@ -92,6 +92,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Sanitize environment variables if requested
+	if cfg.SanitizeEnv {
+		cfg.Env = config.SanitizeEnv(cfg.Env)
+	}
+
 	// Detect and warn about sensitive environment variables prior to execution
 	checkSensitiveEnv(cfg.Env)
 
@@ -155,20 +160,29 @@ func readConfig() (config.ExecConfig, error) {
 }
 
 // initMain is called when the binary re-executes itself with --init.
-// It reads config from the SAFER_EXEC_CONFIG environment variable,
+// It reads config from the SAFER_EXEC_CONFIG_PATH environment variable,
 // sets up namespaces, and executes the target command.
 func initMain() {
-	cfgJSON := os.Getenv("SAFER_EXEC_CONFIG")
-	if cfgJSON == "" {
-		fmt.Fprintln(os.Stderr, "safer-exec: SAFER_EXEC_CONFIG not set")
+	cfgPath := os.Getenv("SAFER_EXEC_CONFIG_PATH")
+	if cfgPath == "" {
+		fmt.Fprintln(os.Stderr, "safer-exec: SAFER_EXEC_CONFIG_PATH not set")
+		os.Exit(1)
+	}
+
+	cfgJSON, err := os.ReadFile(cfgPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: init config read: %v\n", err)
 		os.Exit(1)
 	}
 
 	var cfg config.ExecConfig
-	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err != nil {
+	if err := json.Unmarshal(cfgJSON, &cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "safer-exec: init config parse: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Clean up config file
+	os.Remove(cfgPath)
 
 	if err := runInit(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "safer-exec: init: %v\n", err)
@@ -180,17 +194,26 @@ func initMain() {
 // It applies only seccomp-bpf and Landlock (no namespace or filesystem isolation)
 // and executes the target command directly.
 func initReducedMain() {
-	cfgJSON := os.Getenv("SAFER_EXEC_CONFIG")
-	if cfgJSON == "" {
-		fmt.Fprintln(os.Stderr, "safer-exec: SAFER_EXEC_CONFIG not set")
+	cfgPath := os.Getenv("SAFER_EXEC_CONFIG_PATH")
+	if cfgPath == "" {
+		fmt.Fprintln(os.Stderr, "safer-exec: SAFER_EXEC_CONFIG_PATH not set")
+		os.Exit(1)
+	}
+
+	cfgJSON, err := os.ReadFile(cfgPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: init-reduced config read: %v\n", err)
 		os.Exit(1)
 	}
 
 	var cfg config.ExecConfig
-	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err != nil {
+	if err := json.Unmarshal(cfgJSON, &cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "safer-exec: init-reduced config parse: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Clean up config file
+	os.Remove(cfgPath)
 
 	if err := runInitReduced(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "safer-exec: init-reduced: %v\n", err)

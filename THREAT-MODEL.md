@@ -51,6 +51,7 @@ The Node.js layer serializes an `ExecConfig` object to JSON. The Go struct expec
 | `blockFork`      | boolean  | Prevent forking                   |
 | `traceExec`      | boolean  | Log child processes               |
 | `strict`         | boolean  | Treat warnings as hard errors     |
+| `sanitizeEnv`    | boolean  | Strip sensitive env vars          |
 
 ## 2. Sandbox Mechanisms
 
@@ -67,17 +68,17 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 ### Linux (Namespaces + Seccomp + Landlock + cgroup v2)
 
-| Mechanism         | What it enforces       | How                                                      |
-| ----------------- | ---------------------- | -------------------------------------------------------- |
-| User namespace    | UID isolation          | `CLONE_NEWUSER` + `/proc/self` UID/GID mapping           |
-| Mount namespace   | Filesystem isolation   | `CLONE_NEWNS` + tmpfs root + bind mounts                 |
-| PID namespace     | Process tree isolation | `CLONE_NEWPID`                                           |
-| UTS namespace     | Hostname isolation     | `CLONE_NEWUTS`                                           |
-| Network namespace | Network isolation      | `CLONE_NEWNET` (when `disableNetwork` is true)           |
-| pivot_root        | Root filesystem swap   | Mounts tmpfs, bind-mounts paths, pivots                  |
-| Seccomp-bpf       | Syscall filtering      | Blocks ptrace, kcmp, unshare, mount, pivot_root, syscall |
-| Landlock v2       | Network port filtering | Ruleset version 5 (kernel 6.2+) for TCP connect/bind     |
-| cgroup v2         | Resource quotas        | `cpu.max`, `memory.max`, `pids.max`                      |
+| Mechanism         | What it enforces       | How                                                                                                                    |
+| ----------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| User namespace    | UID isolation          | `CLONE_NEWUSER` + `/proc/self` UID/GID mapping                                                                         |
+| Mount namespace   | Filesystem isolation   | `CLONE_NEWNS` + tmpfs root + bind mounts                                                                               |
+| PID namespace     | Process tree isolation | `CLONE_NEWPID`                                                                                                         |
+| UTS namespace     | Hostname isolation     | `CLONE_NEWUTS`                                                                                                         |
+| Network namespace | Network isolation      | `CLONE_NEWNET` (when `disableNetwork` is true)                                                                         |
+| pivot_root        | Root filesystem swap   | Mounts tmpfs, bind-mounts paths, pivots                                                                                |
+| Seccomp-bpf       | Syscall filtering      | Blocks ptrace, kcmp, unshare, mount, pivot_root, syscall, execveat (when TraceExec/BlockExec), clone3 (when BlockFork) |
+| Landlock v2       | Network port filtering | Ruleset version 5 (kernel 6.2+) for TCP connect/bind                                                                   |
+| cgroup v2         | Resource quotas        | `cpu.max`, `memory.max`, `pids.max`                                                                                    |
 
 ## 3. Threats and Attack Vectors
 
@@ -115,12 +116,11 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **How isolation works:**
 
-- **Linux:** When `disableNetwork` is true, a new network namespace is created. Landlock v2 rules restrict TCP connections to allowed ports (default: 80, 443, plus ports 1-1024).
+- **Linux:** A new network namespace is created by default. Landlock v2 rules restrict TCP connections to explicitly configured ports (defaults: 80, 443). No wildcard range for privileged ports.
 - **macOS:** Seatbelt rules allow outbound connections. Port filtering uses `remote ip "*:PORT"` patterns.
 
 **Residual risk:**
 
-- Landlock rules on Linux allow all ports 1-1024 by default, not just the explicitly allowed ports. The code adds ports 1 through 1024 to the allowed set regardless of configuration.
 - macOS Seatbelt port rules use wildcard IP patterns that match any source IP on the target port.
 
 ### 3.4 Resource Exhaustion
@@ -136,7 +136,7 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **Residual risk:**
 
-- Memory limits are not enforced if `maxMemoryMB` is 0 (the default). CPU and process limits also default to 0 (unlimited).
+- Memory defaults to 512 MB, CPU to 1.0 core, process count to 100, and timeout to 60 seconds. These can be overridden to 0 (unlimited) or any custom value.
 - RLIMIT_CPU on macOS limits total CPU time, not wall clock time. A single-threaded process gets the full allocation.
 - The process count limit on macOS adds 10 to the configured value to account for internal processes. On Linux it adds 2.
 
@@ -146,9 +146,9 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **Impact:** The command may use different configuration, connect to different hosts, or behave differently than expected.
 
-**How isolation works:** When `env()` is called, the sandbox sets only PATH, HOME, and the specified variables. When no env is set, the full parent environment is inherited.
+**How isolation works:** When `env()` is called, the sandbox sets only PATH, HOME, and the specified variables. When no env is set, the full parent environment is inherited. The `sanitizeEnv` flag strips keys containing TOKEN, PASSWORD, SECRET, API_KEY, CLIENT_SECRET, SESSION, COOKIE, AUTH, or KEY before execution.
 
-**Residual risk:** PATH and HOME are always inherited even when a custom environment is set. This means the command uses the same executable search path and home directory as the parent process.
+**Residual risk:** PATH and HOME are always inherited even when a custom environment is set. This means the command uses the same executable search path and home directory as the parent process. The `sanitizeEnv` check is case-insensitive but does not inspect environment variable values, only key names.
 
 ### 3.6 Seatbelt Profile Construction (macOS)
 
@@ -174,9 +174,9 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **Impact:** The target can perform syscalls not typically needed but does not affect isolation quality.
 
-**Blocked syscalls:** ptrace, kcmp, unshare, mount, pivot_root, syscall (meta-syscall). When `blockFork` is set: clone, fork, vfork. When `traceExec` is set: execve.
+**Blocked syscalls:** ptrace, kcmp, unshare, mount, pivot_root, syscall (meta-syscall). When `blockFork` is set: clone, fork, vfork, clone3. When `traceExec` or blockExec wildcard is set: execve, execveat.
 
-**What is not blocked:** All other syscalls including read, write, openat, stat, fstat, lstat, access, connect, socket, recvfrom, sendto, fork, execve, etc.
+**What is not blocked:** All other syscalls including read, write, openat, stat, fstat, lstat, access, connect, socket, recvfrom, sendto, etc.
 
 ### 3.8 Fork and Exec Control
 
@@ -237,7 +237,13 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 1. Unshare additional namespaces to create nested isolation (blocked by seccomp).
 2. Mount new filesystems to discover host state (blocked by seccomp).
 3. Trace sibling processes (blocked by seccomp ptrace rule).
-4. Pivot root again (blocked by seccomp pivot_root rule).
+4. Pivot root again (blocked by seccomp pivot_root rule, and failure is a hard error).
+5. Use clone3 to bypass fork/clone blocking (blocked when BlockFork is enabled).
+6. Use execveat to bypass execve blocking (blocked when TraceExec or BlockExec wildcard is enabled).
+
+**Network namespace:**
+
+A new network namespace is created by default (not only when `disableNetwork` is true). This prevents the sandboxed process from observing host network interfaces, listening sockets, or network connection state. Explicit `allowHosts` / `allowPorts` configuration is required for outbound connectivity.
 
 **macOS escape paths:**
 
@@ -274,11 +280,13 @@ Policies are resolved at runtime based on the operating system. The following pl
 
 ## 6. Recommendations
 
-1. **Set resource limits by default.** The current defaults are unlimited for memory, CPU, and process count. Consider sensible defaults such as 512MB memory and 100 processes.
+1. **Resource limits now have sensible defaults** (512 MB memory, 1 CPU core, 100 processes, 60s timeout). Review and adjust for your workload.
 2. **Strengthen macOS Seatbelt rules.** Remove the blanket `(allow file-read*)` and `(allow file-write*)` rules. Use only the per-path subpath rules for actual confinement.
-3. **Narrow Landlock port ranges.** The Linux engine allows all ports 1-1024 regardless of configuration. Only allow explicitly configured ports.
+3. **Landlock port ranges are now narrowed.** Only explicitly configured ports (defaults: 80, 443) are allowed — the 1-1024 wildcard has been removed.
 4. **Include IPv6 in Landlock rules.** The current implementation adds both IPv4 and IPv6 rules, but DNS resolution may return IPv6 addresses that are not included in the allow list.
 5. **Add a policy validation step.** Before execution, verify that read paths exist and write paths do not overlap with read paths.
 6. **Support policy composition.** Allow combining multiple policies with explicit merge semantics rather than the current additive approach.
 7. **Add Homebrew path detection.** On macOS, detect `/opt/homebrew/bin` and `/opt/homebrew/lib` for Apple Silicon installations.
 8. **Document fork/exec overhead.** The `traceExec` flag adds seccomp `SIGSYS` trapping on every `execve` call. This adds latency to child process spawns. Document the expected overhead.
+9. **Use `--sanitize-env` in CI/CD environments.** Enable sanitize-env to strip sensitive environment variables (API keys, tokens, secrets) before sandboxed execution.
+10. **Keep `pivot_root` failures as hard errors.** Relying on degraded mode without `pivot_root` weakens filesystem isolation. Use `--strict` to enforce this in production.

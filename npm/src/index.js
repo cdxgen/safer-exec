@@ -230,6 +230,7 @@ export class SaferExec extends EventEmitter {
    * @param {boolean} [options.enableDiff] - Enable filesystem mutation diffing
    * @param {boolean} [options.enableLearn] - Enable behavioral auto-profiling (learning mode)
    * @param {boolean} [options.resolveSymlinks] - Resolve target command symlink in PATH
+   * @param {boolean} [options.sanitizeEnv] - Strip sensitive env vars before passing to sandbox
    */
   constructor(options = {}) {
     super();
@@ -252,16 +253,16 @@ export class SaferExec extends EventEmitter {
     this._allowLoopback = options.allowLoopback || false;
 
     /** @type {number} */
-    this._maxMemoryMB = options.maxMemoryMB || 0;
+    this._maxMemoryMB = options.maxMemoryMB || 512;
 
     /** @type {number} */
-    this._maxCPUCores = options.maxCPUCores || 0;
+    this._maxCPUCores = options.maxCPUCores || 1.0;
 
     /** @type {number} */
-    this._maxProcesses = options.maxProcesses || 0;
+    this._maxProcesses = options.maxProcesses || 100;
 
     /** @type {number} */
-    this._timeoutMs = options.timeoutMs || 0;
+    this._timeoutMs = options.timeoutMs || 60000;
 
     /** @type {string} */
     this._workingDir = options.workingDir || process.cwd();
@@ -307,6 +308,9 @@ export class SaferExec extends EventEmitter {
 
     /** @type {boolean} Opt-in to resolve target command symlink */
     this._resolveSymlinks = options.resolveSymlinks || false;
+
+    /** @type {boolean} Strip sensitive env vars before passing to sandbox */
+    this._sanitizeEnv = options.sanitizeEnv || false;
 
     /** @type {boolean} Allow cryptographic library and device access */
     this._allowCrypto = options.allowCrypto !== false;
@@ -981,6 +985,21 @@ export class SaferExec extends EventEmitter {
   }
 
   /**
+   * Strip sensitive environment variables before passing to the sandbox.
+   *
+   * When enabled, environment variable keys containing substrings like
+   * TOKEN, PASSWORD, SECRET, API_KEY, CLIENT_SECRET, SESSION, COOKIE,
+   * AUTH, or KEY are removed from the environment before execution.
+   *
+   * @param {boolean} [val=true] - Whether to sanitize the environment
+   * @returns {SaferExec} This instance for chaining
+   */
+  sanitizeEnv(val = true) {
+    this._sanitizeEnv = val;
+    return this;
+  }
+
+  /**
    * Allow cryptographic library and entropy device access (default).
    *
    * @param {boolean} [allow=true] - Whether to allow crypto operations
@@ -1243,10 +1262,10 @@ export class SaferExec extends EventEmitter {
       traceTempDir: this._traceTempDir,
       traceHTTPURLs: this._traceHTTPURLs,
       allowURLRules: this._allowURLRules,
+      sanitizeEnv: this._sanitizeEnv,
     };
 
-    // Determine effective timeout: use explicit timeout or default to 60s
-    const effectiveTimeout = this._timeoutMs > 0 ? this._timeoutMs : 60000;
+    const effectiveTimeout = this._timeoutMs;
 
     // Resolve binary path: if it's relative (starts with . or ..), resolve
     // it relative to the npm package root (not the current working directory,

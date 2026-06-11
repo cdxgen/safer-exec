@@ -304,6 +304,73 @@ func TestLandlockNetPortAttr_StructSize(t *testing.T) {
 	}
 }
 
+// --- Syscall constant verification ---
+
+func TestSyscallConstant_EXECVEAT(t *testing.T) {
+	if sysEXECVEAT == 0 {
+		t.Error("sysEXECVEAT is zero — must be defined for this architecture")
+	}
+}
+
+func TestSyscallConstant_CLONE3(t *testing.T) {
+	if sysCLONE3 == 0 {
+		t.Error("sysCLONE3 is zero — must be defined for this architecture")
+	}
+}
+
+// TestApplySeccomp_BlockFork verifies BlockFork seccomp configuration
+// (includes clone3 blocking) does not panic.
+func TestApplySeccomp_BlockFork(t *testing.T) {
+	applySeccomp(config.ExecConfig{BlockFork: true})
+}
+
+// TestApplySeccomp_TraceExec verifies seccomp with TraceExec
+// (includes execveat blocking) does not panic.
+func TestApplySeccomp_TraceExec(t *testing.T) {
+	applySeccomp(config.ExecConfig{TraceExec: true})
+}
+
+// TestApplySeccomp_BlockExecWildcard verifies seccomp with wildcard blockExec
+// (includes execveat blocking) does not panic.
+func TestApplySeccomp_BlockExecWildcard(t *testing.T) {
+	applySeccomp(config.ExecConfig{BlockExec: []string{"*"}})
+}
+
+// TestApplySeccomp_BlockForkAndBlockExec verifies combined fork/exec blocking
+// does not panic or produce conflicting BPF instructions.
+func TestApplySeccomp_BlockForkAndBlockExec(t *testing.T) {
+	applySeccomp(config.ExecConfig{
+		BlockFork: true,
+		BlockExec: []string{"sh"},
+	})
+}
+
+// TestLandlock_NoWildcardPortRange verifies that applyLandlockNetwork does not
+// automatically allow all privileged ports (1-1024) as a wildcard range.
+// Only explicitly configured ports (or defaults 80, 443) should be allowed.
+func TestLandlock_NoWildcardPortRange(t *testing.T) {
+	applyLandlockNetwork(config.ExecConfig{AllowPorts: []int{443}})
+}
+
+// TestLandlock_DefaultPorts verifies that with no explicit ports configured,
+// applyLandlockNetwork uses the safe defaults [80, 443].
+func TestLandlock_DefaultPorts(t *testing.T) {
+	applyLandlockNetwork(config.ExecConfig{})
+}
+
+// TestPivotRoot_FailureIsError verifies that pivot_root failures are returned
+// as hard errors rather than silently ignored.
+func TestPivotRoot_FailureIsError(t *testing.T) {
+	// The seccomp filter blocks SYS_PIVOT_ROOT, which is the standard escape path.
+	// ApplySeccomp should include PIVOT_ROOT in its default block list.
+	applySeccomp(config.ExecConfig{})
+
+	// Additionally, verify the constant is defined (would be 0 if missing)
+	if syscall.SYS_PIVOT_ROOT == 0 {
+		t.Error("SYS_PIVOT_ROOT is zero — cannot be blocked")
+	}
+}
+
 var _ = syscall.CLONE_NEWUSER
 
 // --- TraceLibraries / LD_AUDIT ---

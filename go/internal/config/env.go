@@ -6,6 +6,30 @@ import (
 	"strings"
 )
 
+var sensitivePatterns = []string{"TOKEN", "PASSWORD", "SECRET", "API_KEY", "CLIENT_SECRET", "SESSION", "COOKIE", "AUTH", "KEY"}
+
+// SanitizeEnv removes sensitive environment variables from the map.
+func SanitizeEnv(env map[string]string) map[string]string {
+	if len(env) == 0 {
+		return env
+	}
+	result := make(map[string]string, len(env))
+	for k, v := range env {
+		uk := strings.ToUpper(k)
+		sensitive := false
+		for _, p := range sensitivePatterns {
+			if strings.Contains(uk, p) {
+				sensitive = true
+				break
+			}
+		}
+		if !sensitive {
+			result[k] = v
+		}
+	}
+	return result
+}
+
 // FilteredEnviron returns a minimal slice of environment variables from the host environment.
 // This is used to prevent leakage of credentials (like AWS keys, tokens, etc.) when no
 // environment is explicitly specified. It only inherits essential variables:

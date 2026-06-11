@@ -12,4 +12,5 @@ const (
 	sysFORK_unified     = 9999 // Dummy: arm64 uses clone (220)
 	sysVFORK_unified    = 9999 // Dummy: arm64 uses clone (220)
 	sysEXECVEAT_unified = 281
+	sysCLONE3_unified   = 436
 )

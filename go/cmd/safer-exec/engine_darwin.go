@@ -533,14 +533,13 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	// Always allow reading the working directory if specified
 	if cfg.WorkingDir != "" {
 		sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", cfg.WorkingDir))
-		// Add parent dirs of WorkingDir for getcwd() resolution (Bug #3)
 		dir := cfg.WorkingDir
 		for {
 			parent := filepath.Dir(dir)
 			if parent == dir {
-				break // reached root
+				break
 			}
-			sb.WriteString(fmt.Sprintf("(allow file-read* (literal %q))\n", parent))
+			sb.WriteString(fmt.Sprintf("(allow file-read-metadata (literal %q))\n", parent))
 			dir = parent
 		}
 	}
@@ -551,14 +550,13 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		if p != "" {
 			sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", p))
 			sb.WriteString(fmt.Sprintf("(allow file-write* (subpath %q))\n", p))
-			// Add parent dirs of temp directories as literal read allows so getcwd() works (Bug #3)
 			dir := p
 			for {
 				parent := filepath.Dir(dir)
 				if parent == dir {
 					break
 				}
-				sb.WriteString(fmt.Sprintf("(allow file-read* (literal %q))\n", parent))
+				sb.WriteString(fmt.Sprintf("(allow file-read-metadata (literal %q))\n", parent))
 				dir = parent
 			}
 		}
