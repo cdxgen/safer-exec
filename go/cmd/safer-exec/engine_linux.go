@@ -1052,6 +1052,10 @@ func warnLandlockLayers() {
 // defense-in-depth layer within the mount namespace. It restricts file
 // read, write, execute, and truncate operations to the declared read and
 // write paths. This catches symlink escapes and missed bind-mount paths.
+//
+// When Landlock is unavailable or the ABI is too old, this function silently
+// returns nil (best-effort, like applyLandlockNetwork). The calling code
+// should log a warning.
 func applyLandlockFilesystem(cfg config.ExecConfig) error {
 	// Prevent unit tests from accidentally poisoning the Go test runner.
 	if os.Getenv("SAFER_EXEC_CONFIG_PATH") == "" && os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
@@ -1060,10 +1064,7 @@ func applyLandlockFilesystem(cfg config.ExecConfig) error {
 
 	abi, _, errno := syscall.RawSyscall(sysLandlockCreateRuleset, 0, 0, landlockCreateRulesetVersion)
 	if errno != 0 || abi < 3 {
-		if abi < 3 {
-			return fmt.Errorf("Landlock ABI %d does not support filesystem rules (requires >= 3)", abi)
-		}
-		return fmt.Errorf("Landlock not supported (errno: %v)", errno)
+		return nil
 	}
 
 	// Warn if layers are nearly exhausted

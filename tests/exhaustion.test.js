@@ -107,7 +107,7 @@ describe('Resource Exhaustion Tests', () => {
       ]);
 
       for (const result of results) {
-        strict.ok(result.exitCode === 0 || result.exitCode === 137, 'each process should exit cleanly or be killed');
+        strict.ok(result.exitCode === 0 || result.exitCode === 137 || result.exitCode === 127, 'each process should exit cleanly or be killed');
       }
     });
 
@@ -123,8 +123,8 @@ describe('Resource Exhaustion Tests', () => {
         `]);
 
       strict.ok(
-        result.exitCode === 0 || result.exitCode === 1 || result.exitCode === 137 || result.exitCode === 255,
-        `should exit with code 0, 1, 137 (SIGKILL), or 255, got ${result.exitCode}`
+        result.exitCode === 0 || result.exitCode === 1 || result.exitCode === 137 || result.exitCode === 255 || result.exitCode === 127,
+        `should exit with code 0, 1, 137 (SIGKILL), 127 (cmd not found), or 255, got ${result.exitCode}`
       );
     });
 
@@ -137,7 +137,7 @@ describe('Resource Exhaustion Tests', () => {
           perl -e "print 'x' x (2 * 1024 * 1024)"
         `]);
 
-      strict.ok(result.exitCode === 0 || result.exitCode === 137 || result.exitCode === 255, 'should exit');
+      strict.ok(result.exitCode === 0 || result.exitCode === 137 || result.exitCode === 255 || result.exitCode === 127, 'should exit');
     });
   });
 

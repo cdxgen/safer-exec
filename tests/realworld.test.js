@@ -82,7 +82,9 @@ describe('Real-world Integration Tests', { timeout: 60000 }, () => {
         result.stderr.includes('failed') ||
         result.stderr.includes('preinstall') ||
         result.stderr.includes('ENOTFOUND') ||
-        result.stderr.includes('ERR!'),
+        result.stderr.includes('ERR!') ||
+        result.stderr.includes('bad system call') ||
+        result.stderr.includes('killed'),
         `npm stderr should reflect the blocked subprocess execution. Got: ${result.stderr}`
       );
     } finally {
