@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -352,8 +353,12 @@ func (t *linuxTracer) readLoop() {
 	for {
 		record, err := t.reader.Read()
 		if err != nil {
-			// Reader was closed — normal shutdown path.
-			return
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return
+			}
+			// Transient read error (e.g. on custom kernels) — retry.
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 
 		ev := decodeEvent(record.RawSample)

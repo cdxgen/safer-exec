@@ -571,10 +571,14 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 		go monitorMaps(cmd.Process.Pid, stopMonitor)
 	}
 
-	// Start eBPF PID refresh and event capture goroutines (reduced mode)
+	// Start eBPF PID refresh and event capture goroutines (reduced mode).
+	// SetTraceAll is used here because in reduced mode there is no PID namespace
+	// isolation, and the PID filter may not correctly resolve child PIDs on some
+	// kernels (e.g. OrbStack, custom VMM kernels).
 	if httpTracer != nil {
 		rootPID := uint32(cmd.Process.Pid)
 		_ = httpTracer.AddPID(rootPID)
+		_ = httpTracer.SetTraceAll(true)
 		*stopPIDRefresh = make(chan struct{})
 		go func() {
 			ticker := time.NewTicker(5 * time.Millisecond)
