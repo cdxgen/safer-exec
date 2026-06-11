@@ -101,6 +101,16 @@ func isUserNamespaceRestricted() bool {
 	return false
 }
 
+// isUnshareFlagSupported checks whether the system's unshare binary supports
+// the given flag (e.g., "-t" for time namespace, "-i" for IPC namespace).
+// Returns true if `unshare <flag> /bin/true` succeeds.
+func isUnshareFlagSupported(flag string) bool {
+	cmd := exec.Command("unshare", flag, "/bin/true")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	return cmd.Run() == nil
+}
+
 // run forks the Go binary using the system 'unshare' to bypass Go's multi-threading EINVAL issues.
 // If user namespaces are unavailable it falls back to reduced isolation (seccomp + landlock only).
 func run(cfg config.ExecConfig) error {
@@ -148,7 +158,13 @@ func run(cfg config.ExecConfig) error {
 	}
 
 	// Use system unshare to create namespaces before Go starts
-	unshareArgs := []string{"-U", "-m", "-p", "--fork", "-u", "-r", "-t", "-i"}
+	unshareArgs := []string{"-U", "-m", "-p", "--fork", "-u", "-r"}
+	if isUnshareFlagSupported("-t") {
+		unshareArgs = append(unshareArgs, "-t")
+	}
+	if isUnshareFlagSupported("-i") {
+		unshareArgs = append(unshareArgs, "-i")
+	}
 	if cfg.DisableNetwork {
 		unshareArgs = append(unshareArgs, "-n")
 	}
@@ -1613,13 +1629,16 @@ func runDiagnostics() config.DiagnosticsResult {
 		abi := strings.TrimSpace(string(data))
 		result.Capabilities["landlock"] = config.CapabilityInfo{Available: true, Detail: fmt.Sprintf("ABI v%s", abi)}
 		// Landlock filesystem rules require ABI >= 3
-		abiVer := 0
-		if _, convErr := fmt.Sscanf(abi, "%d", &abiVer); convErr == nil {
+		abiVer, convErr := strconv.Atoi(abi)
+		if convErr == nil {
 			fsAvailable := abiVer >= 3
-			result.Capabilities["landlock_filesystem"] = config.CapabilityInfo{Available: fsAvailable, Detail: fmt.Sprintf("ABI v%s supports filesystem rules", abi)}
+			result.Capabilities["landlock_filesystem"] = config.CapabilityInfo{Available: fsAvailable, Detail: fmt.Sprintf("ABI v%d %s filesystem rules", abiVer, map[bool]string{true: "supports", false: "does not support"}[fsAvailable])}
+		} else {
+			result.Capabilities["landlock_filesystem"] = config.CapabilityInfo{Available: false, Detail: fmt.Sprintf("cannot parse ABI version: %s", abi)}
 		}
 	} else {
 		result.Capabilities["landlock"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+		result.Capabilities["landlock_filesystem"] = config.CapabilityInfo{Available: false, Detail: "Landlock not available"}
 	}
 
 	// Landlock layer count
