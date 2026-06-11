@@ -261,6 +261,18 @@ export class SaferExec extends EventEmitter {
     /** @type {number} */
     this._maxProcesses = options.maxProcesses || 0;
 
+    /** @type {number} Max read IO operations per second (Linux only) */
+    this._maxReadIOPS = options.maxReadIOPS || 0;
+
+    /** @type {number} Max write IO operations per second (Linux only) */
+    this._maxWriteIOPS = options.maxWriteIOPS || 0;
+
+    /** @type {number} Max read bandwidth in bytes per second (Linux only) */
+    this._maxReadBps = options.maxReadBps || 0;
+
+    /** @type {number} Max write bandwidth in bytes per second (Linux only) */
+    this._maxWriteBps = options.maxWriteBps || 0;
+
     /** @type {number} */
     this._timeoutMs = options.timeoutMs || 60000;
 
@@ -299,6 +311,9 @@ export class SaferExec extends EventEmitter {
 
     /** @type {boolean} Output generated Seatbelt profile instead of running command */
     this._dumpProfile = options.dumpProfile || false;
+
+    /** @type {boolean} Validate the generated Seatbelt profile syntax */
+    this._validateProfile = options.validateProfile || false;
 
     /** @type {boolean} Treat sandbox setup warnings as errors */
     this._strict = options.strict || false;
@@ -457,6 +472,29 @@ export class SaferExec extends EventEmitter {
       throw new Error(`Invalid policy file: ${filePath}`);
     }
 
+    // Handle policy composition: if a policy file has an "extends" field,
+    // load the base policy first and overlay the current file's rules.
+    if (raw.extends && typeof raw.extends === 'string') {
+      const basePolicyFn = POLICIES[raw.extends];
+      if (!basePolicyFn) {
+        throw new Error(`Unknown extends policy: "${raw.extends}"`);
+      }
+      const basePolicy = basePolicyFn();
+      // Apply base policy paths/hosts/env first
+      if (Array.isArray(basePolicy.readPaths)) {
+        this._readPaths = [...new Set([...basePolicy.readPaths.map(p => expandEnv(p)), ...this._readPaths])];
+      }
+      if (Array.isArray(basePolicy.writePaths)) {
+        this._writePaths = [...new Set([...basePolicy.writePaths.map(p => expandEnv(p)), ...this._writePaths])];
+      }
+      if (Array.isArray(basePolicy.allowHosts)) {
+        this._allowHosts = [...new Set([...basePolicy.allowHosts, ...this._allowHosts])];
+      }
+      if (basePolicy.env) {
+        this._env = { ...basePolicy.env, ...this._env };
+      }
+    }
+
     // Filesystem paths
     if (Array.isArray(raw.readPaths) && raw.readPaths.length > 0) {
       this.readPaths(...raw.readPaths.map(p => expandEnv(p)));
@@ -523,6 +561,18 @@ export class SaferExec extends EventEmitter {
     }
     if (raw.maxProcesses) {
       this.maxProcesses(raw.maxProcesses);
+    }
+    if (raw.maxReadIOPS) {
+      this.maxReadIOPS(raw.maxReadIOPS);
+    }
+    if (raw.maxWriteIOPS) {
+      this.maxWriteIOPS(raw.maxWriteIOPS);
+    }
+    if (raw.maxReadBps) {
+      this.maxReadBps(raw.maxReadBps);
+    }
+    if (raw.maxWriteBps) {
+      this.maxWriteBps(raw.maxWriteBps);
     }
     if (raw.timeoutMs) {
       this.timeout(raw.timeoutMs);
@@ -736,6 +786,50 @@ export class SaferExec extends EventEmitter {
    */
   maxProcesses(count) {
     this._maxProcesses = count;
+    return this;
+  }
+
+  /**
+   * Set maximum read IO operations per second (Linux only).
+   *
+   * @param {number} iops - Max read IOPS (0 = no limit)
+   * @returns {SaferExec} This instance for chaining
+   */
+  maxReadIOPS(iops) {
+    this._maxReadIOPS = iops;
+    return this;
+  }
+
+  /**
+   * Set maximum write IO operations per second (Linux only).
+   *
+   * @param {number} iops - Max write IOPS (0 = no limit)
+   * @returns {SaferExec} This instance for chaining
+   */
+  maxWriteIOPS(iops) {
+    this._maxWriteIOPS = iops;
+    return this;
+  }
+
+  /**
+   * Set maximum read bandwidth in bytes per second (Linux only).
+   *
+   * @param {number} bps - Max read bytes per second (0 = no limit)
+   * @returns {SaferExec} This instance for chaining
+   */
+  maxReadBps(bps) {
+    this._maxReadBps = bps;
+    return this;
+  }
+
+  /**
+   * Set maximum write bandwidth in bytes per second (Linux only).
+   *
+   * @param {number} bps - Max write bytes per second (0 = no limit)
+   * @returns {SaferExec} This instance for chaining
+   */
+  maxWriteBps(bps) {
+    this._maxWriteBps = bps;
     return this;
   }
 
@@ -956,6 +1050,19 @@ export class SaferExec extends EventEmitter {
    */
   dumpProfile() {
     this._dumpProfile = true;
+    return this;
+  }
+
+  /**
+   * Validate the generated Seatbelt profile syntax without executing the command.
+   *
+   * Uses sandbox-exec -n to syntax-check the generated profile. Returns
+   * a validation result with any errors detected. Available on macOS only.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  validateProfile() {
+    this._validateProfile = true;
     return this;
   }
 
@@ -1238,6 +1345,10 @@ export class SaferExec extends EventEmitter {
       maxMemoryMB: this._maxMemoryMB,
       maxCPUCores: this._maxCPUCores,
       maxProcesses: this._maxProcesses,
+      maxReadIOPS: this._maxReadIOPS,
+      maxWriteIOPS: this._maxWriteIOPS,
+      maxReadBps: this._maxReadBps,
+      maxWriteBps: this._maxWriteBps,
       timeoutMs: this._timeoutMs,
       workingDir: this._workingDir,
       enableAudit: this._enableAudit,
@@ -1248,6 +1359,7 @@ export class SaferExec extends EventEmitter {
       blockFork: this._blockFork,
       traceExec: this._traceExec,
       dumpProfile: this._dumpProfile,
+      validateProfile: this._validateProfile,
       strict: this._strict,
       policyFilePath: this._policyFilePath,
       allowCrypto: this._allowCrypto,

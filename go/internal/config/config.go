@@ -111,6 +111,22 @@ type ExecConfig struct {
 	// RLIMIT_NPROC on macOS.
 	MaxProcesses int `json:"maxProcesses"`
 
+	// MaxReadIOPS limits read IO operations per second. 0 means no limit.
+	// Applied via cgroup v2 io.max on Linux. Not enforced on macOS.
+	MaxReadIOPS int `json:"maxReadIOPS"`
+
+	// MaxWriteIOPS limits write IO operations per second. 0 means no limit.
+	// Applied via cgroup v2 io.max on Linux. Not enforced on macOS.
+	MaxWriteIOPS int `json:"maxWriteIOPS"`
+
+	// MaxReadBps limits read bandwidth in bytes per second. 0 means no limit.
+	// Applied via cgroup v2 io.max on Linux. Not enforced on macOS.
+	MaxReadBps int64 `json:"maxReadBps"`
+
+	// MaxWriteBps limits write bandwidth in bytes per second. 0 means no limit.
+	// Applied via cgroup v2 io.max on Linux. Not enforced on macOS.
+	MaxWriteBps int64 `json:"maxWriteBps"`
+
 	// TimeoutMs is a hard kill switch in milliseconds. The parent process
 	// kills the sandboxed command and all descendants after this duration.
 	// 0 means no timeout. Enforced by the JS wrapper layer; also applied
@@ -163,6 +179,12 @@ type ExecConfig struct {
 	// to stdout as "PROFILE:<profile content>" and exits without
 	// running the command. Used for testing profile generation.
 	DumpProfile bool `json:"dumpProfile"`
+
+	// ValidateProfile, when true, uses sandbox-exec -n to syntax-check the
+	// generated Seatbelt profile without executing the command. On macOS,
+	// this validates the profile is well-formed before attempting to run.
+	// Returns any syntax errors in stderr and exits with a non-zero code on failure.
+	ValidateProfile bool `json:"validateProfile"`
 
 	// Strict, when true, treats sandbox initialization warnings as errors
 	// (e.g. cgroup, landlock, or seccomp errors) instead of bypassing them.
@@ -345,7 +367,16 @@ type PolicyFile struct {
 	MaxMemoryMB  int     `json:"maxMemoryMB,omitempty"`
 	MaxCPUCores  float64 `json:"maxCPUCores,omitempty"`
 	MaxProcesses int     `json:"maxProcesses,omitempty"`
+	MaxReadIOPS  int     `json:"maxReadIOPS,omitempty"`
+	MaxWriteIOPS int     `json:"maxWriteIOPS,omitempty"`
+	MaxReadBps   int64   `json:"maxReadBps,omitempty"`
+	MaxWriteBps  int64   `json:"maxWriteBps,omitempty"`
 	TimeoutMs    int     `json:"timeoutMs,omitempty"`
+
+	// Extends specifies the name of a built-in policy to extend.
+	// The base policy is loaded first, then this policy's fields are overlaid.
+	// This enables structured policy composition without duplication.
+	Extends string `json:"extends,omitempty"`
 
 	// Observability
 	TraceExec   bool `json:"traceExec,omitempty"`
@@ -425,4 +456,17 @@ type ExecResult struct {
 	FSDiff *FSDiff `json:"fsDiff,omitempty"`
 	// LearnedPolicy is the auto-generated policy (when EnableLearn is true).
 	LearnedPolicy *LearnedPolicy `json:"learnedPolicy,omitempty"`
+}
+
+// ProfileValidationResult is the output of --validate-profile mode.
+// It reports whether the generated Seatbelt profile passes syntax validation.
+type ProfileValidationResult struct {
+	// Valid is true if the profile passes syntax check.
+	Valid bool `json:"valid"`
+	// Profile is the generated Seatbelt profile text.
+	Profile string `json:"profile,omitempty"`
+	// Errors is a list of validation error messages.
+	Errors []string `json:"errors,omitempty"`
+	// Warning is an informational message (e.g., sandbox-exec not found).
+	Warning string `json:"warning,omitempty"`
 }

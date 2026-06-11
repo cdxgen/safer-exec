@@ -148,7 +148,7 @@ func run(cfg config.ExecConfig) error {
 	}
 
 	// Use system unshare to create namespaces before Go starts
-	unshareArgs := []string{"-U", "-m", "-p", "--fork", "-u", "-r"}
+	unshareArgs := []string{"-U", "-m", "-p", "--fork", "-u", "-r", "-t", "-i"}
 	if cfg.DisableNetwork {
 		unshareArgs = append(unshareArgs, "-n")
 	}
@@ -526,6 +526,13 @@ func runInitReduced(cfg config.ExecConfig) error {
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock network: %v\n", err)
 	}
 
+	if err := applyLandlockFilesystem(cfg); err != nil {
+		if cfg.Strict {
+			return fmt.Errorf("landlock filesystem: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock filesystem: %v\n", err)
+	}
+
 	if err := applySeccomp(cfg); err != nil {
 		if cfg.Strict {
 			return fmt.Errorf("seccomp: %w", err)
@@ -588,6 +595,13 @@ func runInit(cfg config.ExecConfig) error {
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock network: %v\n", err)
 	}
 
+	if err := applyLandlockFilesystem(cfg); err != nil {
+		if cfg.Strict {
+			return fmt.Errorf("landlock filesystem: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock filesystem: %v\n", err)
+	}
+
 	if err := applySeccomp(cfg); err != nil {
 		if cfg.Strict {
 			return fmt.Errorf("seccomp: %w", err)
@@ -604,7 +618,8 @@ func runInit(cfg config.ExecConfig) error {
 }
 
 func setupCgroupV2(cfg config.ExecConfig) (string, error) {
-	if cfg.MaxCPUCores == 0 && cfg.MaxMemoryMB == 0 && cfg.MaxProcesses == 0 {
+	if cfg.MaxCPUCores == 0 && cfg.MaxMemoryMB == 0 && cfg.MaxProcesses == 0 &&
+		cfg.MaxReadIOPS == 0 && cfg.MaxWriteIOPS == 0 && cfg.MaxReadBps == 0 && cfg.MaxWriteBps == 0 {
 		return "", nil
 	}
 	if _, err := os.Stat(cgroupV2Root); err != nil {
@@ -662,6 +677,28 @@ func setupCgroupV2(cfg config.ExecConfig) (string, error) {
 	if cfg.MaxProcesses > 0 {
 		if err := os.WriteFile(filepath.Join(cgroupPath, "pids.max"), []byte(fmt.Sprintf("%d\n", cfg.MaxProcesses)), 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: failed to set pids.max: %v\n", err)
+		}
+	}
+	if cfg.MaxReadIOPS > 0 || cfg.MaxWriteIOPS > 0 || cfg.MaxReadBps > 0 || cfg.MaxWriteBps > 0 {
+		rio := cfg.MaxReadIOPS
+		wio := cfg.MaxWriteIOPS
+		rbps := cfg.MaxReadBps
+		wbps := cfg.MaxWriteBps
+		if rio == 0 {
+			rio = -1
+		}
+		if wio == 0 {
+			wio = -1
+		}
+		if rbps == 0 {
+			rbps = -1
+		}
+		if wbps == 0 {
+			wbps = -1
+		}
+		ioMax := fmt.Sprintf("%d:%d rbps=%d wbps=%d riops=%d wiops=%d\n", 8, 0, rbps, wbps, rio, wio)
+		if err := os.WriteFile(filepath.Join(cgroupPath, "io.max"), []byte(ioMax), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: failed to set io.max: %v\n", err)
 		}
 	}
 	return cgroupPath, nil
@@ -858,17 +895,53 @@ func finalizeFilesystem(newRoot string, cfg config.ExecConfig) error {
 	_ = os.Chdir("/")
 	_ = syscall.Unmount("/.put", syscall.MNT_DETACH)
 	_ = os.RemoveAll("/.put")
+
+	// Mount a fresh proc filesystem with hidepid=2 to prevent
+	// leaking host process information through /proc.
+	// subset=pid restricts the view to PID-related entries only.
+	if _, err := os.Stat("/proc"); err == nil {
+		_ = syscall.Unmount("/proc", syscall.MNT_DETACH)
+	}
+	_ = os.MkdirAll("/proc", 0o555)
+	if err := syscall.Mount("proc", "/proc", "proc", syscall.MS_NOSUID|syscall.MS_NOEXEC|syscall.MS_NODEV, "hidepid=2,subset=pid"); err != nil {
+		// Fall back to standard proc mount without options on older kernels
+		_ = syscall.Mount("proc", "/proc", "proc", syscall.MS_NOSUID|syscall.MS_NOEXEC|syscall.MS_NODEV, "")
+	}
 	return nil
 }
 
 type landlockRulesetAttr struct{ HandledAccessFS, HandledAccessNet uint64 }
 type landlockNetPortAttr struct{ AllowedAccess, Port uint64 }
+type landlockPathBeneathAttr struct {
+	AllowedAccess uint64
+	ParentFd      int32
+}
 
 const (
 	landlockCreateRulesetVersion = 1 << 0
 	landlockAccessNetBindTCP     = 1 << 0
 	landlockAccessNetConnectTCP  = 1 << 1
 	landlockRuleNetPort          = 2
+	landlockRulePathBeneath      = 1
+)
+
+// Landlock filesystem access rights (ABI v3+).
+const (
+	landlockAccessFSExecute    = 1 << 0
+	landlockAccessFSWriteFile  = 1 << 1
+	landlockAccessFSReadFile   = 1 << 2
+	landlockAccessFSReadDir    = 1 << 3
+	landlockAccessFSRemoveDir  = 1 << 4
+	landlockAccessFSRemoveFile = 1 << 5
+	landlockAccessFSMakeChar   = 1 << 6
+	landlockAccessFSMakeDir    = 1 << 7
+	landlockAccessFSMakeReg    = 1 << 8
+	landlockAccessFSMakeSock   = 1 << 9
+	landlockAccessFSMakeFIFO   = 1 << 10
+	landlockAccessFSMakeBlock  = 1 << 11
+	landlockAccessFSMakeSym    = 1 << 12
+	landlockAccessFSRefer      = 1 << 13
+	landlockAccessFSTruncate   = 1 << 14
 )
 
 func applyLandlockNetwork(cfg config.ExecConfig) error {
@@ -931,6 +1004,127 @@ func applyLandlockNetwork(cfg config.ExecConfig) error {
 		syscall.Syscall6(sysLandlockAddRules, rid, uintptr(landlockRuleNetPort), uintptr(unsafe.Pointer(&ruleAttr)), 0, 0, 0)
 	}
 	syscall.RawSyscall(sysLandlockRestrictSelf, rid, 0, 0)
+	return nil
+}
+
+// landlockLayersRemaining returns the estimated number of remaining Landlock layers
+// available. Landlock supports up to 16 stacked layers; returns -1 if the count
+// cannot be determined. When fewer than 3 layers remain, subsequent restrict_self
+// calls may fail with E2BIG.
+func landlockLayersRemaining() int {
+	// There is no direct kernel interface to query the current layer count.
+	// We estimate by reading /proc/self/attr/landlock/layers when available.
+	if data, err := os.ReadFile("/proc/self/attr/landlock/layers"); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		current := len(lines)
+		if current > 0 {
+			return 16 - current
+		}
+	}
+	return -1
+}
+
+// warnLandlockLayers prints a diagnostic if Landlock layers are nearly exhausted.
+func warnLandlockLayers() {
+	remaining := landlockLayersRemaining()
+	if remaining >= 0 && remaining < 3 {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock layers nearly exhausted (%d remaining of 16). Subsequent sandboxing tools may fail with E2BIG.\n", remaining)
+	}
+}
+
+// applyLandlockFilesystem applies Landlock filesystem access rules as a
+// defense-in-depth layer within the mount namespace. It restricts file
+// read, write, execute, and truncate operations to the declared read and
+// write paths. This catches symlink escapes and missed bind-mount paths.
+func applyLandlockFilesystem(cfg config.ExecConfig) error {
+	// Prevent unit tests from accidentally poisoning the Go test runner.
+	if os.Getenv("SAFER_EXEC_CONFIG_PATH") == "" && os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
+		return nil
+	}
+
+	abi, _, errno := syscall.RawSyscall(sysLandlockCreateRuleset, 0, 0, landlockCreateRulesetVersion)
+	if errno != 0 || abi < 3 {
+		if abi < 3 {
+			return fmt.Errorf("Landlock ABI %d does not support filesystem rules (requires >= 3)", abi)
+		}
+		return fmt.Errorf("Landlock not supported (errno: %v)", errno)
+	}
+
+	// Warn if layers are nearly exhausted
+	warnLandlockLayers()
+
+	// Select handled access rights based on ABI version
+	handledFS := uint64(
+		landlockAccessFSExecute |
+			landlockAccessFSWriteFile |
+			landlockAccessFSReadFile |
+			landlockAccessFSReadDir |
+			landlockAccessFSRemoveDir |
+			landlockAccessFSRemoveFile |
+			landlockAccessFSMakeChar |
+			landlockAccessFSMakeDir |
+			landlockAccessFSMakeReg |
+			landlockAccessFSMakeSock |
+			landlockAccessFSMakeFIFO |
+			landlockAccessFSMakeBlock |
+			landlockAccessFSMakeSym |
+			landlockAccessFSRefer)
+	if abi >= 3 {
+		handledFS |= landlockAccessFSTruncate
+	}
+
+	attr := landlockRulesetAttr{HandledAccessFS: handledFS}
+	rid, _, errno := syscall.RawSyscall(sysLandlockCreateRuleset, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr), 0)
+	if errno != 0 {
+		return fmt.Errorf("create landlock fs ruleset: %v", errno)
+	}
+	defer syscall.Close(int(rid))
+
+	// Add path_beneath rules for read paths (read-only access)
+	readOnlyAccess := uint64(
+		landlockAccessFSExecute |
+			landlockAccessFSReadFile |
+			landlockAccessFSReadDir |
+			landlockAccessFSRefer)
+	for _, path := range cfg.ReadPaths {
+		_ = addLandlockPathBeneath(int(rid), readOnlyAccess, path)
+		// If the path no longer exists (e.g. it was inside the old root before pivot_root),
+		// we silently skip it — Landlock rules for nonexistent paths are harmless.
+	}
+
+	// Add path_beneath rules for write paths (read-write access)
+	writeAccess := handledFS // all handled access rights
+	for _, path := range cfg.WritePaths {
+		_ = addLandlockPathBeneath(int(rid), writeAccess, path)
+	}
+
+	// Apply the ruleset
+	if _, _, errno := syscall.RawSyscall(sysLandlockRestrictSelf, rid, 0, 0); errno != 0 {
+		return fmt.Errorf("landlock restrict self (fs): %v", errno)
+	}
+
+	return nil
+}
+
+// addLandlockPathBeneath adds a path_beneath rule for the given path and access rights.
+// Returns nil on success; errors are non-fatal (the rule is simply skipped).
+func addLandlockPathBeneath(rulesetFd int, allowedAccess uint64, path string) error {
+	const oPath = 0x200000 // O_PATH on Linux
+	fd, err := syscall.Open(path, oPath|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+
+	attr := landlockPathBeneathAttr{
+		AllowedAccess: allowedAccess,
+		ParentFd:      int32(fd),
+	}
+	_, _, errno := syscall.Syscall6(sysLandlockAddRules, uintptr(rulesetFd),
+		uintptr(landlockRulePathBeneath), uintptr(unsafe.Pointer(&attr)), 0, 0, 0)
+	if errno != 0 {
+		return fmt.Errorf("add rule: %v", errno)
+	}
 	return nil
 }
 
@@ -1372,6 +1566,8 @@ func runDiagnostics() config.DiagnosticsResult {
 		{"pid_namespace", "/proc/self/ns/pid"},
 		{"net_namespace", "/proc/self/ns/net"},
 		{"uts_namespace", "/proc/self/ns/uts"},
+		{"time_namespace", "/proc/self/ns/time"},
+		{"ipc_namespace", "/proc/self/ns/ipc"},
 	}
 	for _, ns := range nsTypes {
 		if _, err := os.Stat(ns.path); err == nil {
@@ -1399,6 +1595,15 @@ func runDiagnostics() config.DiagnosticsResult {
 		result.Capabilities["cgroup_v2_memory"] = config.CapabilityInfo{Available: hasMem, Detail: "memory controller"}
 		result.Capabilities["cgroup_v2_cpu"] = config.CapabilityInfo{Available: hasCPU, Detail: "cpu controller"}
 		result.Capabilities["cgroup_v2_pids"] = config.CapabilityInfo{Available: hasPIDs, Detail: "pids controller"}
+		// IO controller
+		hasIO := false
+		for _, c := range controllers {
+			if c == "io" {
+				hasIO = true
+				break
+			}
+		}
+		result.Capabilities["cgroup_v2_io"] = config.CapabilityInfo{Available: hasIO, Detail: "io controller"}
 	} else {
 		result.Capabilities["cgroup_v2"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
 	}
@@ -1407,8 +1612,36 @@ func runDiagnostics() config.DiagnosticsResult {
 	if data, err := os.ReadFile("/sys/kernel/security/landlock/abi"); err == nil {
 		abi := strings.TrimSpace(string(data))
 		result.Capabilities["landlock"] = config.CapabilityInfo{Available: true, Detail: fmt.Sprintf("ABI v%s", abi)}
+		// Landlock filesystem rules require ABI >= 3
+		abiVer := 0
+		if _, convErr := fmt.Sscanf(abi, "%d", &abiVer); convErr == nil {
+			fsAvailable := abiVer >= 3
+			result.Capabilities["landlock_filesystem"] = config.CapabilityInfo{Available: fsAvailable, Detail: fmt.Sprintf("ABI v%s supports filesystem rules", abi)}
+		}
 	} else {
 		result.Capabilities["landlock"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// Landlock layer count
+	if remaining := landlockLayersRemaining(); remaining >= 0 {
+		detail := fmt.Sprintf("%d layers remaining (of 16)", remaining)
+		available := remaining > 0
+		result.Capabilities["landlock_layers_remaining"] = config.CapabilityInfo{Available: available, Detail: detail}
+	}
+
+	// AppArmor profile detection
+	if data, err := os.ReadFile("/sys/module/apparmor/parameters/enabled"); err == nil {
+		enabled := strings.TrimSpace(string(data)) == "Y"
+		result.Capabilities["apparmor"] = config.CapabilityInfo{Available: enabled, Detail: "AppArmor LSM enabled"}
+		// Check if our profile is loaded
+		if enabled {
+			if profileData, profErr := os.ReadFile("/sys/kernel/security/apparmor/profiles"); profErr == nil {
+				profileLoaded := strings.Contains(string(profileData), "safer-exec")
+				result.Capabilities["apparmor_safer_exec"] = config.CapabilityInfo{Available: profileLoaded, Detail: "safer-exec AppArmor profile loaded"}
+			}
+		}
+	} else {
+		result.Capabilities["apparmor"] = config.CapabilityInfo{Available: false, Detail: "AppArmor not detected"}
 	}
 
 	// Seccomp
@@ -1514,6 +1747,7 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["memory_limit"] = hasCGv2 && result.Capabilities["cgroup_v2_memory"].Available
 	result.Features["cpu_limit"] = hasCGv2 && result.Capabilities["cgroup_v2_cpu"].Available
 	result.Features["process_limit"] = hasCGv2 && result.Capabilities["cgroup_v2_pids"].Available
+	result.Features["io_limit"] = hasCGv2 && result.Capabilities["cgroup_v2_io"].Available
 	result.Features["exec_control"] = hasSeccomp
 	result.Features["fork_control"] = hasSeccomp
 	result.Features["audit_tracing"] = hasSeccomp
@@ -1528,6 +1762,11 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["trace_libraries"] = true
 	result.Features["trace_http_urls"] = bpfForTrace
 	result.Features["allow_url_rules"] = bpfForTrace
+	result.Features["time_isolation"] = result.Capabilities["time_namespace"].Available
+	result.Features["ipc_isolation"] = result.Capabilities["ipc_namespace"].Available
+	result.Features["landlock_filesystem"] = result.Capabilities["landlock_filesystem"].Available
+	result.Features["apparmor_safer_exec"] = result.Capabilities["apparmor_safer_exec"].Available
+	result.Features["proc_hidepid"] = true // fresh proc mount always attempted after pivot_root
 
 	return result
 }

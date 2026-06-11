@@ -1070,3 +1070,147 @@ describe('saferExec convenience function', () => {
     strict.equal(typeof result.stderr, 'string', 'stderr should be a string');
   });
 });
+
+describe('IO Limiting', () => {
+  it('should accept maxReadIOPS option', () => {
+    const exec = new SaferExec({ maxReadIOPS: 100 });
+    strict.equal(exec._maxReadIOPS, 100);
+  });
+
+  it('should accept maxWriteIOPS option', () => {
+    const exec = new SaferExec({ maxWriteIOPS: 200 });
+    strict.equal(exec._maxWriteIOPS, 200);
+  });
+
+  it('should accept maxReadBps option', () => {
+    const exec = new SaferExec({ maxReadBps: 1048576 });
+    strict.equal(exec._maxReadBps, 1048576);
+  });
+
+  it('should accept maxWriteBps option', () => {
+    const exec = new SaferExec({ maxWriteBps: 2097152 });
+    strict.equal(exec._maxWriteBps, 2097152);
+  });
+
+  it('should pass IO limits in config', async () => {
+    const exec = new SaferExec({ maxReadIOPS: 100, maxWriteBps: 1048576 });
+    const { config } = await exec._buildConfig('echo', []);
+    strict.equal(config.maxReadIOPS, 100);
+    strict.equal(config.maxWriteBps, 1048576);
+  });
+
+  it('should support chaining IO methods', () => {
+    const exec = new SaferExec();
+    exec.maxReadIOPS(100).maxWriteIOPS(200).maxReadBps(1024).maxWriteBps(2048);
+    strict.equal(exec._maxReadIOPS, 100);
+    strict.equal(exec._maxWriteIOPS, 200);
+    strict.equal(exec._maxReadBps, 1024);
+    strict.equal(exec._maxWriteBps, 2048);
+  });
+
+  it('should default IO limits to 0', () => {
+    const exec = new SaferExec();
+    strict.equal(exec._maxReadIOPS, 0);
+    strict.equal(exec._maxWriteIOPS, 0);
+    strict.equal(exec._maxReadBps, 0);
+    strict.equal(exec._maxWriteBps, 0);
+  });
+});
+
+describe('Profile Validation', () => {
+  it('should accept validateProfile option', () => {
+    const exec = new SaferExec({ validateProfile: true });
+    strict.equal(exec._validateProfile, true);
+  });
+
+  it('should default validateProfile to false', () => {
+    const exec = new SaferExec();
+    strict.equal(exec._validateProfile, false);
+  });
+
+  it('should support chaining validateProfile', () => {
+    const exec = new SaferExec();
+    exec.validateProfile();
+    strict.equal(exec._validateProfile, true);
+  });
+
+  it('should include validateProfile in config', async () => {
+    const exec = new SaferExec();
+    exec.validateProfile();
+    const { config } = await exec._buildConfig('echo', []);
+    strict.equal(config.validateProfile, true);
+  });
+});
+
+describe('Policy Composition (extends)', () => {
+  it('should reject unknown extends policy', () => {
+    const policyPath = join(tmpdir(), 'test-extends-unknown.json');
+    writeFileSync(policyPath, JSON.stringify({ extends: 'nonexistent' }));
+    try {
+      const exec = new SaferExec();
+      strict.throws(
+        () => exec.applyPolicyFile(policyPath),
+        /Unknown extends policy/,
+        'should throw for unknown extends'
+      );
+    } finally {
+      try { unlinkSync(policyPath); } catch {}
+    }
+  });
+
+  it('should apply base policy from extends', () => {
+    const policyPath = join(tmpdir(), 'test-extends-npm.json');
+    writeFileSync(policyPath, JSON.stringify({
+      extends: 'npm',
+      allowHosts: ['custom.registry.com'],
+      readPaths: ['/custom/path'],
+    }));
+    try {
+      const exec = new SaferExec();
+      exec.applyPolicyFile(policyPath);
+      // Should have both npm policy hosts and custom hosts
+      strict.ok(exec._allowHosts.includes('custom.registry.com'), 'should include custom host');
+      strict.ok(exec._allowHosts.includes('registry.npmjs.org'), 'should include npm base host');
+      strict.ok(exec._readPaths.includes('/custom/path'), 'should include custom path');
+    } finally {
+      try { unlinkSync(policyPath); } catch {}
+    }
+  });
+
+  it('should merge env from base and custom', () => {
+    const policyPath = join(tmpdir(), 'test-extends-env.json');
+    writeFileSync(policyPath, JSON.stringify({
+      extends: 'npm',
+      env: { CUSTOM_VAR: 'custom_value' },
+    }));
+    try {
+      const exec = new SaferExec();
+      exec.applyPolicyFile(policyPath);
+      strict.equal(exec._env.CUSTOM_VAR, 'custom_value', 'should include custom env var');
+    } finally {
+      try { unlinkSync(policyPath); } catch {}
+    }
+  });
+
+  it('should apply extends in policy file along with all other fields', () => {
+    const policyPath = join(tmpdir(), 'test-extends-full.json');
+    writeFileSync(policyPath, JSON.stringify({
+      extends: 'npm',
+      allowHosts: ['override.registry.com'],
+      readPaths: ['/override/read'],
+      writePaths: ['/override/write'],
+      maxMemoryMB: 2048,
+      maxReadIOPS: 500,
+    }));
+    try {
+      const exec = new SaferExec();
+      exec.applyPolicyFile(policyPath);
+      strict.equal(exec._maxMemoryMB, 2048, 'should set custom memory limit');
+      strict.equal(exec._maxReadIOPS, 500, 'should set custom read IOPS');
+      strict.ok(exec._allowHosts.includes('override.registry.com'), 'should include override host');
+      strict.ok(exec._readPaths.includes('/override/read'), 'should include override read path');
+    } finally {
+      try { unlinkSync(policyPath); } catch {}
+    }
+  });
+});

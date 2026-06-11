@@ -546,6 +546,9 @@ func TestRunDiagnostics_Features(t *testing.T) {
 		"crypto_control", "fips_detection", "gpu_control",
 		"tpm_control", "antivm_spoofing", "trace_libraries",
 		"trace_http_urls", "allow_url_rules",
+		"profile_validation", "time_isolation", "ipc_isolation",
+		"io_limit", "landlock_filesystem", "landlock_layers",
+		"apparmor_safer_exec", "proc_hidepid",
 	}
 	for _, name := range expectedFeatures {
 		if _, ok := result.Features[name]; !ok {
@@ -560,6 +563,30 @@ func TestRunDiagnostics_Features(t *testing.T) {
 	if result.Features["allow_url_rules"] {
 		t.Error("allow_url_rules should be false on macOS")
 	}
+	// macOS should never have Linux-specific features
+	if result.Features["landlock_filesystem"] {
+		t.Error("landlock_filesystem should be false on macOS")
+	}
+	if result.Features["apparmor_safer_exec"] {
+		t.Error("apparmor_safer_exec should be false on macOS")
+	}
+	if result.Features["time_isolation"] {
+		t.Error("time_isolation should be false on macOS")
+	}
+	if result.Features["ipc_isolation"] {
+		t.Error("ipc_isolation should be false on macOS")
+	}
+	if result.Features["io_limit"] {
+		t.Error("io_limit should be false on macOS")
+	}
+	if result.Features["proc_hidepid"] {
+		t.Error("proc_hidepid should be false on macOS")
+	}
+
+	// Profile validation should be available on macOS (sandbox-exec -n)
+	if !result.Features["profile_validation"] {
+		t.Error("profile_validation should be available on macOS")
+	}
 
 	// Most features should be available on macOS
 	if !result.Features["network_isolation"] {
@@ -570,6 +597,44 @@ func TestRunDiagnostics_Features(t *testing.T) {
 	}
 	if !result.Features["strict_mode"] {
 		t.Error("strict_mode should always be available")
+	}
+}
+
+// TestRunValidateProfile verifies the Seatbelt profile validation mode.
+func TestRunValidateProfile(t *testing.T) {
+	cfg := config.ExecConfig{
+		Cmd:             "echo",
+		ReadPaths:       []string{"/usr", "/etc"},
+		WritePaths:      []string{"/tmp"},
+		ValidateProfile: true,
+	}
+
+	// Redirect stdout to capture structured output
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := run(cfg)
+
+	w.Close()
+	os.Stdout = oldStdout
+
+	out, _ := io.ReadAll(r)
+	output := string(out)
+
+	// Should get a PROFILE: marker with validation result
+	if !strings.Contains(output, "PROFILE:") {
+		t.Error("expected PROFILE: marker in output")
+	}
+
+	// Parse the validation result
+	if strings.Contains(output, `"valid":true`) {
+		t.Log("Seatbelt profile validated successfully")
+	} else if strings.Contains(output, `"valid":false`) {
+		t.Logf("Seatbelt profile validation warning (sandbox-exec may not be available): %v", err)
+	} else {
+		// Profile may have been emitted without validation result (no sandbox-exec)
+		t.Log("sandbox-exec not available for validation")
 	}
 }
 

@@ -2,7 +2,7 @@
 
 OS-level sandboxing with tracing, auditing, and learning mode for arbitrary binaries.
 
-On macOS the Go binary generates Seatbelt profiles and runs commands through `sandbox-exec`. On Linux it uses namespace isolation, bind mounts, `pivot_root`, seccomp-bpf filters, Landlock network confinement, and cgroup v2 resource quotas.
+On macOS the Go binary generates Seatbelt profiles and runs commands through `sandbox-exec`. On Linux it uses namespace isolation, bind mounts, `pivot_root`, seccomp-bpf filters, Landlock network and filesystem confinement, and cgroup v2 resource quotas (memory, CPU, PID, IO). OpenBSD support is available via `unveil(2)` and `pledge(2)`.
 
 ## Install
 
@@ -20,6 +20,7 @@ safer-exec --policy=npm -- npm install
 
 # Resource limits
 safer-exec --max-memory=512 --max-cpu=1.0 -- npm run build
+safer-exec --max-read-iops=1000 --max-write-bps=104857600 -- npm install
 
 # Disable network, enable auditing
 safer-exec --disable-network --audit -- cat package.json
@@ -38,6 +39,13 @@ safer-exec --trace-exec -- npm install
 
 # Strip sensitive environment variables
 safer-exec --sanitize-env -- npm install
+
+# Validate Seatbelt profile syntax (macOS)
+safer-exec --validate-profile -- cat /etc/hosts
+
+# Policy composition — extend a built-in policy
+echo '{"extends":"npm","allowHosts":["custom.registry.com"]}' > custom.json
+safer-exec --policy-file=custom.json -- npm install
 
 # Diagnostics mode — probe OS capabilities and feature support
 safer-exec diagnostics
@@ -81,6 +89,10 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 | `maxMemoryMB`        | `number`   | `512`           | Memory limit in megabytes (default: 512)                                                             |
 | `maxCPUCores`        | `number`   | `1.0`           | CPU limit as fractional cores (default: 1.0)                                                         |
 | `maxProcesses`       | `number`   | `100`           | Max child processes — anti-fork bomb (default: 100)                                                  |
+| `maxReadIOPS`        | `number`   | `0`             | Max read IO operations per second — I/O bomb prevention (Linux only)                                 |
+| `maxWriteIOPS`       | `number`   | `0`             | Max write IO operations per second — I/O bomb prevention (Linux only)                                |
+| `maxReadBps`         | `number`   | `0`             | Max read bandwidth in bytes per second (Linux only)                                                  |
+| `maxWriteBps`        | `number`   | `0`             | Max write bandwidth in bytes per second (Linux only)                                                 |
 | `timeoutMs`          | `number`   | `60000`         | Hard kill timeout in milliseconds (default: 60000)                                                   |
 | `workingDir`         | `string`   | `process.cwd()` | Working directory                                                                                    |
 | `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                                                                              |
@@ -88,6 +100,7 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 | `allowPorts`         | `number[]` | `[]`            | TCP ports to allow                                                                                   |
 | `enableDiff`         | `boolean`  | `false`         | Enable filesystem mutation diffing                                                                   |
 | `enableLearn`        | `boolean`  | `false`         | Enable behavioral auto-profiling                                                                     |
+| `validateProfile`    | `boolean`  | `false`         | Validate Seatbelt profile syntax without executing (macOS only)                                      |
 | `allowExec`          | `string[]` | `[]`            | Executables the command is allowed to run                                                            |
 | `blockExec`          | `string[]` | `[]`            | Executables to block from running                                                                    |
 | `blockFork`          | `boolean`  | `false`         | Prevent forking new processes                                                                        |
@@ -121,6 +134,10 @@ All methods return `this` for chaining except `.run()`.
 | `.maxMemory(mb)`        | Set memory limit in megabytes                                                                    |
 | `.maxCPUCores(cores)`   | Set CPU limit as fractional cores (e.g. 0.5)                                                     |
 | `.maxProcesses(count)`  | Set maximum child process count                                                                  |
+| `.maxReadIOPS(iops)`    | Set max read IO operations per second (Linux only)                                               |
+| `.maxWriteIOPS(iops)`   | Set max write IO operations per second (Linux only)                                              |
+| `.maxReadBps(bps)`      | Set max read bytes per second (Linux only)                                                       |
+| `.maxWriteBps(bps)`     | Set max write bytes per second (Linux only)                                                      |
 | `.timeout(ms)`          | Set hard kill timeout in milliseconds                                                            |
 | `.binaryPath(path)`     | Override the Go binary path                                                                      |
 | `.workingDir(dir)`      | Set the working directory                                                                        |
@@ -128,6 +145,7 @@ All methods return `this` for chaining except `.run()`.
 | `.allowPorts(...ports)` | Set allowed TCP ports                                                                            |
 | `.enableDiff()`         | Enable filesystem mutation diffing                                                               |
 | `.enableLearn()`        | Enable behavioral auto-profiling                                                                 |
+| `.validateProfile()`    | Validate Seatbelt profile syntax without executing (macOS)                                       |
 | `.allowExec(...cmds)`   | Restrict which executables can run                                                               |
 | `.blockExec(...cmds)`   | Block specific executables from running                                                          |
 | `.blockFork()`          | Prevent the command from forking new processes                                                   |
@@ -795,6 +813,54 @@ safer-exec: warning: sensitive environment variables detected: GITHUB_TOKEN, MY_
 - **Linux**: When `detectFIPS` or `strictFIPS` is enabled, the sandbox checks the host state `/proc/sys/crypto/fips_enabled` and mirrors this virtualized file inside the container. If `strictFIPS` is configured and the host lacks FIPS compliance, execution is blocked and a `fips-violation` is audited.
 - **macOS**: On macOS, FIPS state is verified by reading Apple's security preference plist (`FIPSMode`). If `strictFIPS` is active and FIPSMode is disabled on the host, a validation failure is triggered.
 - **Auto-Discovery**: During learn mode, if a process attempts to query the FIPS status or dynamic FIPS module providers (e.g. `fips.so` or `fips.dylib`), the generated policy automatically sets `fipsDetected: true`.
+
+## Linux-Specific Features
+
+### AppArmor Profile
+
+On Ubuntu 24.04+ and other distributions that restrict unprivileged user namespaces, `safer-exec` falls back to reduced isolation mode (seccomp + Landlock only, no filesystem isolation). To enable full sandbox isolation, install the bundled AppArmor profile:
+
+```bash
+sudo cp apparmor/safer-exec /etc/apparmor.d/
+sudo apparmor_parser -r /etc/apparmor.d/safer-exec
+```
+
+Verify the profile is loaded with `safer-exec diagnostics` — look for "AppArmor Profile" under SaferExec Features.
+
+### Landlock Filesystem Rules
+
+In addition to Landlock network confinement, v0.9.1 adds Landlock filesystem access rules as a defense-in-depth layer. Read and write paths declared in the policy are enforced at the kernel level, catching symlink escapes and missed bind-mount paths. Requires Landlock ABI v3+ (Linux kernel >= 5.13).
+
+### Cgroup v2 IO Limiting
+
+Prevent I/O bomb scenarios by limiting read/write IOPS and bandwidth:
+
+```bash
+safer-exec --max-read-iops=1000 --max-write-iops=1000 \
+           --max-read-bps=104857600 --max-write-bps=104857600 \
+           -- npm install
+```
+
+### Policy Composition
+
+Policy files can extend built-in policies using the `extends` field. The base policy is loaded first, then the file's rules are overlaid on top:
+
+```json
+{
+  "extends": "npm",
+  "allowHosts": ["custom.internal.registry.com"],
+  "readPaths": ["/usr/local/custom-certs"],
+  "maxMemoryMB": 2048
+}
+```
+
+## Platform Support
+
+| Platform | Sandbox Mechanism                        | Status       |
+| -------- | ---------------------------------------- | ------------ |
+| macOS    | Seatbelt profiles + `sandbox-exec`       | Production   |
+| Linux    | Namespaces + seccomp + Landlock + cgroup | Production   |
+| OpenBSD  | `unveil(2)` + `pledge(2)`                | Experimental |
 
 ## Development
 

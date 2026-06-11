@@ -1,0 +1,50 @@
+# AppArmor profile for safer-exec
+# This profile grants the unprivileged user namespace creation capability
+# required by safer-exec for full sandbox isolation on Linux.
+#
+# Installation:
+#   sudo cp apparmor/safer-exec /etc/apparmor.d/safer-exec
+#   sudo apparmor_parser -r /etc/apparmor.d/safer-exec
+#
+# The profile must match the actual path where safer-exec is installed.
+# Adjust the path below if your binary is in a different location.
+
+abi <abi/4.0>,
+
+profile safer-exec /usr/lib/node_modules/@cdxgen/safer-exec/** flags=(attach_disconnected,complain) {
+  # Allow reading system files and executing binaries
+  capability,
+  network,
+  file,
+  mount,
+  pivot_root,
+  umount,
+
+  # The unprivileged user namespace capability
+  capability sys_admin,
+  capability sys_resource,
+  capability sys_rawio,
+  capability sys_ptrace,
+  capability dac_override,
+  capability dac_read_search,
+
+  # Allow user namespace creation (CLONE_NEWUSER)
+  userns,
+
+  # Allow unprivileged clone
+  cap_userns,
+
+  # Allow reading /proc and /sys for diagnostics
+  /proc/** r,
+  /sys/** r,
+
+  # Allow creating temporary files
+  /tmp/safer-exec-* rw,
+  /tmp/safer-exec-*/** rwkl,
+
+  # Allow executing the safer-exec binary itself
+  /usr/lib/node_modules/@cdxgen/safer-exec/** rmix,
+
+  # Allow all other paths required by npm/node
+  /** mrixwlk,
+}

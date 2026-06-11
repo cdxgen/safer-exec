@@ -74,6 +74,11 @@ func run(cfg config.ExecConfig) error {
 		return nil
 	}
 
+	// Handle validate profile mode: syntax-check the Seatbelt profile
+	if cfg.ValidateProfile {
+		return runValidateProfile(cfg)
+	}
+
 	// Handle learning mode separately
 	if cfg.EnableLearn {
 		return runLearn(cfg)
@@ -230,6 +235,68 @@ func run(cfg config.ExecConfig) error {
 		}
 	}
 
+	return nil
+}
+
+// runValidateProfile validates the generated Seatbelt profile using sandbox-exec -n.
+// This syntax-checks the profile without executing the command, reporting any errors.
+func runValidateProfile(cfg config.ExecConfig) error {
+	profile := buildSeatbeltProfile(cfg)
+
+	sandboxPath, err := exec.LookPath("sandbox-exec")
+	if err != nil {
+		result := config.ProfileValidationResult{
+			Valid:   false,
+			Profile: profile,
+			Warning: fmt.Sprintf("sandbox-exec not found: %v", err),
+		}
+		data, _ := json.Marshal(result)
+		writeStructured(cfg, "PROFILE:", data)
+		return fmt.Errorf("sandbox-exec not found: %w", err)
+	}
+
+	// Write profile to temp file
+	tmpFile, err := os.CreateTemp("", "safer-exec-validate-*.sb")
+	if err != nil {
+		return fmt.Errorf("creating temp profile: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(profile); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("writing profile: %w", err)
+	}
+	tmpFile.Close()
+
+	// Run sandbox-exec -n to syntax-check the profile without executing
+	cmd := exec.Command(sandboxPath, "-n", "-f", tmpFile.Name(), "/bin/true")
+	var stderrBuf strings.Builder
+	cmd.Stderr = &stderrBuf
+
+	runErr := cmd.Run()
+	stderrStr := stderrBuf.String()
+
+	result := config.ProfileValidationResult{
+		Profile: profile,
+	}
+
+	if runErr != nil {
+		result.Valid = false
+		if stderrStr != "" {
+			result.Errors = strings.Split(strings.TrimSpace(stderrStr), "\n")
+		} else {
+			result.Errors = []string{runErr.Error()}
+		}
+	} else {
+		result.Valid = true
+	}
+
+	data, _ := json.Marshal(result)
+	writeStructured(cfg, "PROFILE:", data)
+
+	if !result.Valid {
+		return fmt.Errorf("seatbelt profile validation failed: %s", stderrStr)
+	}
 	return nil
 }
 
@@ -764,6 +831,14 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["trace_libraries"] = true
 	result.Features["trace_http_urls"] = false
 	result.Features["allow_url_rules"] = false
+	result.Features["profile_validation"] = hasSandbox // sandbox-exec -n validates profiles
+	result.Features["time_isolation"] = false          // not applicable on macOS
+	result.Features["ipc_isolation"] = false           // not applicable on macOS
+	result.Features["io_limit"] = false                // not applicable on macOS
+	result.Features["landlock_filesystem"] = false     // Linux-only
+	result.Features["landlock_layers"] = false         // Linux-only
+	result.Features["apparmor_safer_exec"] = false     // Linux-only
+	result.Features["proc_hidepid"] = false            // Linux-only
 
 	return result
 }

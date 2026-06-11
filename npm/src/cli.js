@@ -67,6 +67,10 @@ Options:
   -m, --max-memory=<mb>      Memory limit in megabytes
   -c, --max-cpu=<cores>      CPU limit as fractional cores (e.g. 0.5)
       --max-processes=<n>    Max child processes (anti-fork bomb)
+      --max-read-iops=<n>    Max read IOPS (Linux only)
+      --max-write-iops=<n>   Max write IOPS (Linux only)
+      --max-read-bps=<n>     Max read bandwidth in bytes/s (Linux only)
+      --max-write-bps=<n>    Max write bandwidth in bytes/s (Linux only)
   -t, --timeout=<ms>         Hard kill timeout in milliseconds
 
   -n, --disable-network      Disable all network access
@@ -92,6 +96,7 @@ Options:
   -d, --diff                 Enable filesystem mutation diffing
   -l, --learn                Enable behavioral auto-profiling (learning mode)
       --learn-output=<file>  Write learned policy to file
+      --validate-profile     Validate Seatbelt profile syntax (macOS only)
   -a, --audit                Enable sandbox violation auditing
       --audit-output-file=<f> Write audit log to file (implies audit)
   -s, --strict               Treat sandbox setup warnings as errors
@@ -202,6 +207,18 @@ function parseCliArgs() {
       'max-processes': {
         type: 'string',
       },
+      'max-read-iops': {
+        type: 'string',
+      },
+      'max-write-iops': {
+        type: 'string',
+      },
+      'max-read-bps': {
+        type: 'string',
+      },
+      'max-write-bps': {
+        type: 'string',
+      },
       timeout: {
         type: 'string',
         short: 't',
@@ -270,6 +287,9 @@ function parseCliArgs() {
       'learn-output': {
         type: 'string',
       },
+      'validate-profile': {
+        type: 'boolean',
+      },
       strict: {
         type: 'boolean',
         short: 's',
@@ -296,6 +316,10 @@ function parseCliArgs() {
       'max-memory',
       'max-cpu',
       'max-processes',
+      'max-read-iops',
+      'max-write-iops',
+      'max-read-bps',
+      'max-write-bps',
       'timeout',
       'allow-host',
       'port',
@@ -373,6 +397,18 @@ function buildExec(values, cmd, args) {
   if (values['max-processes']) {
     exec.maxProcesses(parseNumeric(values['max-processes'], 'max-processes'));
   }
+  if (values['max-read-iops']) {
+    exec.maxReadIOPS(parseNumeric(values['max-read-iops'], 'max-read-iops'));
+  }
+  if (values['max-write-iops']) {
+    exec.maxWriteIOPS(parseNumeric(values['max-write-iops'], 'max-write-iops'));
+  }
+  if (values['max-read-bps']) {
+    exec.maxReadBps(parseNumeric(values['max-read-bps'], 'max-read-bps'));
+  }
+  if (values['max-write-bps']) {
+    exec.maxWriteBps(parseNumeric(values['max-write-bps'], 'max-write-bps'));
+  }
   if (values.timeout) {
     exec.timeout(parseNumeric(values.timeout, 'timeout'));
   }
@@ -447,6 +483,9 @@ function buildExec(values, cmd, args) {
   }
   if (values.learn) {
     exec.enableLearn();
+  }
+  if (values['validate-profile']) {
+    exec.validateProfile();
   }
   if (values.strict) {
     exec.strict();
@@ -542,6 +581,7 @@ async function runDiagnosticsAndPrint() {
     memory_limit: 'Memory Limit',
     cpu_limit: 'CPU Limit',
     process_limit: 'Process Limit',
+    io_limit: 'IO Limit (Cgroup v2)',
     exec_control: 'Exec Control',
     fork_control: 'Fork Control',
     audit_tracing: 'Audit Tracing',
@@ -556,6 +596,13 @@ async function runDiagnosticsAndPrint() {
     trace_libraries: 'Library Tracing',
     trace_http_urls: 'HTTP URL Tracing',
     allow_url_rules: 'Allow URL Rules',
+    time_isolation: 'Time Namespace',
+    ipc_isolation: 'IPC Namespace',
+    landlock_filesystem: 'Landlock Filesystem',
+    landlock_layers: 'Landlock Layer Info',
+    apparmor_safer_exec: 'AppArmor Profile',
+    proc_hidepid: 'Proc Hidepid',
+    profile_validation: 'Profile Validation',
   };
   for (const [key, label] of Object.entries(featureLabels)) {
     const available = data.features && data.features[key] === true;

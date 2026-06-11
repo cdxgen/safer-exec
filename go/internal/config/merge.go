@@ -44,6 +44,10 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	if merged.Description == "" {
 		merged.Description = observed.Description
 	}
+	merged.Extends = base.Extends
+	if merged.Extends == "" {
+		merged.Extends = observed.Extends
+	}
 
 	// Filesystem — union, dedup
 	merged.ReadPaths = unionStrings(base.ReadPaths, observed.ReadPaths)
@@ -78,6 +82,10 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	merged.MaxMemoryMB = pickNonZero(base.MaxMemoryMB, observed.MaxMemoryMB)
 	merged.MaxCPUCores = pickNonZeroFloat(base.MaxCPUCores, observed.MaxCPUCores)
 	merged.MaxProcesses = pickNonZero(base.MaxProcesses, observed.MaxProcesses)
+	merged.MaxReadIOPS = pickNonZero(base.MaxReadIOPS, observed.MaxReadIOPS)
+	merged.MaxWriteIOPS = pickNonZero(base.MaxWriteIOPS, observed.MaxWriteIOPS)
+	merged.MaxReadBps = pickNonZeroInt64(base.MaxReadBps, observed.MaxReadBps)
+	merged.MaxWriteBps = pickNonZeroInt64(base.MaxWriteBps, observed.MaxWriteBps)
 	merged.TimeoutMs = pickNonZero(base.TimeoutMs, observed.TimeoutMs)
 
 	// Observability — base OR observed
@@ -210,6 +218,14 @@ func pickNonZero(a, b int) int {
 
 // pickNonZeroFloat returns a if a != 0, else b.
 func pickNonZeroFloat(a, b float64) float64 {
+	if a != 0 {
+		return a
+	}
+	return b
+}
+
+// pickNonZeroInt64 returns a if a != 0, else b.
+func pickNonZeroInt64(a, b int64) int64 {
 	if a != 0 {
 		return a
 	}

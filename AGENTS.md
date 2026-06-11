@@ -30,7 +30,8 @@ go/                           — Go engine (platform-specific sandboxing)
   cmd/safer-exec/             — Entry point + platform engines
     main.go                   — Reads JSON config from stdin, dispatches
     engine_darwin.go          — macOS: Seatbelt + RLIMIT engine
-    engine_linux.go           — Linux: namespaces + seccomp + Landlock + cgroup
+    engine_linux.go           — Linux: namespaces + seccomp + Landlock (net + fs) + cgroup
+    engine_openbsd.go         — OpenBSD: unveil(2) + pledge(2) engine
     engine_linux_amd64.go     — x86_64 syscall numbers
     engine_linux_arm64.go     — arm64 syscall numbers
     engine_linux_*_syscall.go — Architecture-specific syscall constants
@@ -41,6 +42,8 @@ go/                           — Go engine (platform-specific sandboxing)
     learner/                  — Linux strace-based behavioral learner
     learnermac/               — macOS Seatbelt trace parser (learning mode)
     fsdiff/                   — Filesystem snapshot + SHA-256 diff utilities
+apparmor/                     — AppArmor profile for unprivileged user namespace creation
+  safer-exec                  — Bundled AppArmor profile
 npm/
   package.json                — npm package definition (@cdxgen/safer-exec)
   src/
@@ -126,7 +129,8 @@ The `ExecConfig` struct is the canonical JSON contract between Node.js and Go. A
 ### Platform-Specific Engines
 
 - **macOS** uses Go build tags (`//go:build darwin`) — Seatbelt profiles + RLIMIT
-- **Linux** uses Go build tags (`//go:build linux`) — namespaces + seccomp + Landlock + cgroup v2
+- **Linux** uses Go build tags (`//go:build linux`) — namespaces + seccomp + Landlock (net + fs) + cgroup v2
+- **OpenBSD** uses Go build tags (`//go:build openbsd`) — unveil(2) + pledge(2)
 - Architecture-specific syscall numbers use build tags (`linux && amd64`, `linux && arm64`)
 - The `run()` function signature is the same across platforms — the implementation differs
 

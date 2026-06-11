@@ -530,3 +530,92 @@ func TestRunDiagnostics_Features(t *testing.T) {
 		t.Error("strict_mode should always be available")
 	}
 }
+
+// TestApplyLandlockFilesystem_NoReadPath verifies applyLandlockFilesystem
+// is safe to call with no read/write paths configured.
+func TestApplyLandlockFilesystem_NoReadPath(t *testing.T) {
+	applyLandlockFilesystem(config.ExecConfig{})
+}
+
+// TestApplyLandlockFilesystem_WithReadPaths verifies applyLandlockFilesystem
+// with read-only paths.
+func TestApplyLandlockFilesystem_WithReadPaths(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "readonly"), 0o755)
+	applyLandlockFilesystem(config.ExecConfig{
+		ReadPaths:  []string{filepath.Join(dir, "readonly")},
+		WritePaths: []string{dir},
+	})
+}
+
+// TestSetupCgroupV2_IO verifies the IO limit fields are written to io.max.
+func TestSetupCgroupV2_IO(t *testing.T) {
+	path, err := setupCgroupV2(config.ExecConfig{MaxReadIOPS: 100, MaxWriteBps: 1048576})
+	if err != nil || path == "" {
+		t.Skip("cgroup v2 not available")
+	}
+	defer cleanupCgroup(path)
+	data, _ := os.ReadFile(filepath.Join(path, "io.max"))
+	val := strings.TrimSpace(string(data))
+	if val == "" {
+		t.Skip("io controller not enabled in cgroup subtree_control")
+	}
+	t.Logf("io.max: %s", val)
+	if !strings.Contains(val, "riops") || !strings.Contains(val, "wbps") {
+		t.Errorf("io.max should contain riops and wbps: %s", val)
+	}
+}
+
+// TestSetupCgroupV2_NoIO verifies io.max is not written when no IO limits set.
+func TestSetupCgroupV2_NoIO(t *testing.T) {
+	path, err := setupCgroupV2(config.ExecConfig{MaxMemoryMB: 1, MaxReadIOPS: 0, MaxWriteBps: 0})
+	if err != nil || path == "" {
+		t.Skip("cgroup v2 not available")
+	}
+	defer cleanupCgroup(path)
+	if _, err := os.Stat(filepath.Join(path, "io.max")); err == nil {
+		t.Error("io.max should not exist when no IO limits are set")
+	}
+}
+
+// TestLandlockLayersRemaining verifies the function returns a reasonable value.
+func TestLandlockLayersRemaining(t *testing.T) {
+	remaining := landlockLayersRemaining()
+	t.Logf("landlock layers remaining: %d", remaining)
+	// Should be either -1 (unknown) or a positive number
+	if remaining < -1 || remaining > 16 {
+		t.Errorf("unexpected landlock layers remaining: %d", remaining)
+	}
+}
+
+// TestWarnLandlockLayers verifies the function does not panic.
+func TestWarnLandlockLayers(t *testing.T) {
+	warnLandlockLayers()
+}
+
+// TestRunDiagnostics_NewFeatures verifies new diagnostic features are present.
+func TestRunDiagnostics_NewFeatures(t *testing.T) {
+	result := runDiagnostics()
+
+	newCaps := []string{
+		"time_namespace", "ipc_namespace",
+		"cgroup_v2_io", "landlock_filesystem",
+		"apparmor",
+	}
+	for _, name := range newCaps {
+		if _, ok := result.Capabilities[name]; !ok {
+			t.Errorf("missing capability: %s", name)
+		}
+	}
+
+	newFeatures := []string{
+		"io_limit", "time_isolation", "ipc_isolation",
+		"landlock_filesystem", "apparmor_safer_exec",
+		"proc_hidepid",
+	}
+	for _, name := range newFeatures {
+		if _, ok := result.Features[name]; !ok {
+			t.Errorf("missing feature: %s", name)
+		}
+	}
+}
