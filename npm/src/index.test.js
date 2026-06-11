@@ -353,6 +353,72 @@ describe('SaferExec', () => {
       strict.deepEqual(exec._allowURLRules[2].methods, ['GET', 'POST']);
     });
 
+    it('should merge allowUrls when called multiple times', () => {
+      const exec = new SaferExec();
+      exec.allowUrls('https://registry.npmjs.org/packages/');
+      exec.allowUrls('https://api.github.com/repos/');
+
+      strict.equal(exec._allowURLRules.length, 2, 'should accumulate URL rules');
+      strict.equal(exec._allowURLRules[0].host, 'registry.npmjs.org');
+      strict.equal(exec._allowURLRules[1].host, 'api.github.com');
+      strict.ok(
+        exec._allowHosts.includes('registry.npmjs.org'),
+        'should auto-register host from URL rule'
+      );
+      strict.ok(
+        exec._allowHosts.includes('api.github.com'),
+        'should auto-register host from URL rule'
+      );
+    });
+
+    it('should merge allowUrls with objects when called multiple times', () => {
+      const exec = new SaferExec();
+      exec.allowUrls({ host: 'registry.npmjs.org', port: 443 });
+      exec.allowUrls({ host: '*.npmjs.org', methods: ['GET'] });
+
+      strict.equal(exec._allowURLRules.length, 2, 'should accumulate object rules');
+      strict.equal(exec._allowURLRules[0].host, 'registry.npmjs.org');
+      strict.equal(exec._allowURLRules[1].host, '*.npmjs.org');
+    });
+
+    it('should merge all builder methods cumulatively', () => {
+      const exec = new SaferExec();
+      exec.allowHosts('a.com');
+      exec.readPaths('/path/a');
+      exec.writePaths('/tmp/a');
+      exec.allowPorts(80);
+      exec.allowExec('node');
+      exec.blockExec('sh');
+
+      // Second round of calls — merges, doesn't replace
+      exec.allowHosts('b.com');
+      exec.readPaths('/path/b');
+      exec.writePaths('/tmp/b');
+      exec.allowPorts(443);
+      exec.allowExec('npx');
+      exec.blockExec('bash');
+
+      strict.deepEqual(exec._allowHosts, ['a.com', 'b.com'], 'hosts should merge');
+      strict.deepEqual(exec._readPaths, ['/path/a', '/path/b'], 'readPaths should merge');
+      strict.deepEqual(exec._writePaths, ['/tmp/a', '/tmp/b'], 'writePaths should merge');
+      strict.deepEqual(exec._allowPorts, [80, 443], 'ports should merge');
+      strict.deepEqual(exec._allowExec, ['node', 'npx'], 'allowExec should merge');
+      strict.deepEqual(exec._blockExec, ['sh', 'bash'], 'blockExec should merge');
+    });
+
+    it('should merge multiple allowHosts calls with deduplication', () => {
+      const exec = new SaferExec();
+      exec.allowHosts('a.com', 'b.com');
+      exec.allowHosts('b.com', 'c.com');
+      exec.allowHosts('a.com');
+
+      strict.deepEqual(
+        exec._allowHosts,
+        ['a.com', 'b.com', 'c.com'],
+        'should merge and deduplicate across multiple calls'
+      );
+    });
+
     it('should accept multiple paths in a single readPaths call', () => {
       const exec = new SaferExec();
       const etc = realpathSync('/etc');
@@ -915,6 +981,61 @@ describe('SaferExec', () => {
         strict.ok(err.message.includes('FIPS strict enforcement failed') || err.message.includes('exit'));
       }
     });
+  });
+});
+
+describe('SaferExec.diagnostics', () => {
+  it('should be a static method', () => {
+    strict.equal(typeof SaferExec.diagnostics, 'function', 'diagnostics should be a static method');
+  });
+
+  it('should return an object with platform, capabilities, and features', async () => {
+    const result = await SaferExec.diagnostics();
+
+    strict.equal(typeof result, 'object', 'should return an object');
+    strict.equal(typeof result.platform, 'string', 'should have platform string');
+    strict.equal(typeof result.arch, 'string', 'should have arch string');
+    strict.equal(typeof result.nodeVersion, 'string', 'should have nodeVersion');
+    strict.ok(result.nodeVersion.startsWith('v'), 'nodeVersion should start with v');
+
+    strict.ok(typeof result.capabilities === 'object' && !Array.isArray(result.capabilities),
+      'capabilities should be an object');
+    strict.ok(typeof result.features === 'object' && !Array.isArray(result.features),
+      'features should be an object');
+
+    // Every capability should have available and detail fields
+    for (const [key, cap] of Object.entries(result.capabilities)) {
+      strict.equal(typeof cap.available, 'boolean', `capability ${key} should have available boolean`);
+      strict.equal(typeof cap.detail, 'string', `capability ${key} should have detail string`);
+    }
+
+    // Features should all be booleans
+    for (const [key, val] of Object.entries(result.features)) {
+      strict.equal(typeof val, 'boolean', `feature ${key} should be boolean`);
+    }
+
+    // Core features that should exist
+    strict.ok('network_isolation' in result.features, 'should have network_isolation');
+    strict.ok('file_read_restriction' in result.features, 'should have file_read_restriction');
+    strict.ok('file_write_restriction' in result.features, 'should have file_write_restriction');
+    strict.ok('memory_limit' in result.features, 'should have memory_limit');
+    strict.ok('strict_mode' in result.features, 'should have strict_mode');
+    strict.ok('trace_http_urls' in result.features, 'should have trace_http_urls');
+    strict.ok('allow_url_rules' in result.features, 'should have allow_url_rules');
+  });
+
+  it('should have platform-specific capabilities', async () => {
+    const result = await SaferExec.diagnostics();
+
+    if (result.platform === 'darwin') {
+      strict.ok('sandbox_exec' in result.capabilities, 'macOS should have sandbox_exec capability');
+      strict.ok('seatbelt_profile' in result.capabilities, 'macOS should have seatbelt_profile capability');
+      strict.ok('rlimit_as' in result.capabilities, 'macOS should have rlimit_as capability');
+    } else if (result.platform === 'linux') {
+      strict.ok('user_namespace' in result.capabilities, 'Linux should have user_namespace capability');
+      strict.ok('cgroup_v2' in result.capabilities, 'Linux should have cgroup_v2 capability');
+      strict.ok('seccomp' in result.capabilities, 'Linux should have seccomp capability');
+    }
   });
 });
 

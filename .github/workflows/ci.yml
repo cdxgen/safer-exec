@@ -179,6 +179,10 @@ jobs:
         run: |
           cd npm
           npm run test:security
+      - name: Run diagnostics
+        run: |
+          cd npm
+          node src/cli.js diagnostics
 
   publish:
     needs: [build-go, check-bpf-objects, test-go, test-node]

@@ -58,6 +58,7 @@ function printHelp() {
   const help = `
 Usage:
   safer-exec [OPTIONS] -- COMMAND [ARGS...]
+  safer-exec diagnostics
 
 Options:
   -p, --policy=<name>        Apply a built-in policy preset
@@ -99,6 +100,9 @@ Options:
   -j, --json                 Output results as JSON
   -h, --help                 Show this help message
   -v, --version              Show version
+
+Diagnostics:
+  safer-exec diagnostics        Show OS capabilities and feature support
 
 Examples:
   # Run npm install with the NPM policy
@@ -488,6 +492,87 @@ function buildExec(values, cmd, args) {
 }
 
 /**
+ * Format a capability/feature row with a tick or cross.
+ */
+function formatCheck(available, label, detail) {
+  const mark = available ? '\u2713' : '\u2717';
+  const detailStr = detail ? '  ' + detail : '';
+  return '  ' + mark + ' ' + label.padEnd(26) + detailStr;
+}
+
+/**
+ * Run diagnostics and print a formatted report to stdout.
+ */
+async function runDiagnosticsAndPrint() {
+  let data;
+  try {
+    data = await SaferExec.diagnostics();
+  } catch (err) {
+    process.stderr.write('[safer-exec] Diagnostics error: ' + err.message + '\n');
+    process.exit(1);
+  }
+
+  const out = [];
+  out.push('');
+  out.push('safer-exec v' + readPackageVersion() + ' \u2014 Diagnostics');
+  out.push('='.repeat(56));
+  out.push('');
+  out.push('  Platform:    ' + data.platform + ' (' + data.arch + ')');
+  out.push('  Kernel:      ' + data.kernel);
+  out.push('  Release:     ' + (data.release || 'N/A'));
+  out.push('  Node.js:     ' + (data.nodeVersion || process.version));
+  out.push('');
+
+  // OS Capabilities
+  out.push('OS Capabilities');
+  out.push('\u2500'.repeat(56));
+  for (const [key, cap] of Object.entries(data.capabilities || {})) {
+    const label = key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    out.push(formatCheck(cap.available, label, cap.detail || ''));
+  }
+  out.push('');
+
+  // SaferExec Features
+  out.push('SaferExec Features');
+  out.push('\u2500'.repeat(56));
+  const featureLabels = {
+    network_isolation: 'Network Isolation',
+    file_read_restriction: 'File Read Restriction',
+    file_write_restriction: 'File Write Restriction',
+    memory_limit: 'Memory Limit',
+    cpu_limit: 'CPU Limit',
+    process_limit: 'Process Limit',
+    exec_control: 'Exec Control',
+    fork_control: 'Fork Control',
+    audit_tracing: 'Audit Tracing',
+    filesystem_diff: 'Filesystem Diff',
+    learning_mode: 'Learning Mode',
+    strict_mode: 'Strict Mode',
+    crypto_control: 'Crypto Control',
+    fips_detection: 'FIPS Detection',
+    gpu_control: 'GPU Control',
+    tpm_control: 'TPM Control',
+    antivm_spoofing: 'Anti-VM Spoofing',
+    trace_libraries: 'Library Tracing',
+    trace_http_urls: 'HTTP URL Tracing',
+    allow_url_rules: 'Allow URL Rules',
+  };
+  for (const [key, label] of Object.entries(featureLabels)) {
+    const available = data.features && data.features[key] === true;
+    out.push(formatCheck(available, label, ''));
+  }
+  out.push('');
+
+  // Summary
+  const totalFeatures = Object.keys(featureLabels).length;
+  const supported = Object.entries(data.features || {}).filter(([k, v]) => featureLabels[k] && v === true).length;
+  out.push('  Summary: ' + supported + '/' + totalFeatures + ' features supported');
+  out.push('');
+
+  process.stdout.write(out.join('\n') + '\n');
+}
+
+/**
  * Main CLI entry point.
  */
 async function main() {
@@ -502,6 +587,12 @@ async function main() {
   // Handle --help
   if (values.help) {
     printHelp();
+    process.exit(0);
+  }
+
+  // Handle diagnostics command
+  if (positionals.length === 1 && positionals[0] === 'diagnostics') {
+    await runDiagnosticsAndPrint();
     process.exit(0);
   }
 

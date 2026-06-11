@@ -1387,4 +1387,56 @@ export async function saferExec(cmd, args = [], options = {}) {
   return exec.run(cmd, args);
 }
 
+/**
+ * Run diagnostics and return OS capabilities and safer-exec feature support.
+ *
+ * Spawns the Go binary with `--diagnostics` and parses the JSON output.
+ * The result includes platform info, OS capabilities (with availability and
+ * detail), and safer-exec feature flags.
+ *
+ * @returns {Promise<Object>} Diagnostics result with platform, capabilities, and features
+ *
+ * @example
+ * const info = await SaferExec.diagnostics();
+ * console.log(info.platform);              // 'darwin'
+ * console.log(info.capabilities.sandbox_exec); // { available: true, detail: '...' }
+ * console.log(info.features.network_isolation); // true
+ */
+SaferExec.diagnostics = async function () {
+  const { resolveBinaryPath } = await import('./runner.js');
+  const binaryPath = resolveBinaryPath();
+  const { spawn } = await import('node:child_process');
+
+  return new Promise((resolvePromise, reject) => {
+    const proc = spawn(binaryPath, ['--diagnostics'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10000,
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+
+    proc.on('error', (err) => {
+      reject(new Error(`Failed to run diagnostics: ${err.message}`));
+    });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`Diagnostics failed (exit ${code}): ${stderr.trim()}`));
+        return;
+      }
+      try {
+        const data = JSON.parse(stdout);
+        data.nodeVersion = process.version;
+        resolvePromise(data);
+      } catch (err) {
+        reject(new Error(`Failed to parse diagnostics output: ${err.message}. Raw: ${stdout}`));
+      }
+    });
+  });
+};
+
 export default SaferExec;

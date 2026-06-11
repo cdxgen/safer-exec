@@ -497,6 +497,82 @@ func TestTraceLibraries_Run(t *testing.T) {
 	}
 }
 
+func TestRunDiagnostics_Structure(t *testing.T) {
+	result := runDiagnostics()
+
+	if result.Platform != "darwin" {
+		t.Errorf("Platform = %q, want 'darwin'", result.Platform)
+	}
+	if result.Arch == "" {
+		t.Error("Arch should not be empty")
+	}
+	if result.Kernel == "" {
+		t.Error("Kernel should not be empty")
+	}
+	if len(result.Capabilities) == 0 {
+		t.Error("Capabilities should not be empty")
+	}
+	if len(result.Features) == 0 {
+		t.Error("Features should not be empty")
+	}
+}
+
+func TestRunDiagnostics_Capabilities(t *testing.T) {
+	result := runDiagnostics()
+
+	expectedCaps := []string{"sandbox_exec", "seatbelt_profile", "rlimit_as", "rlimit_cpu", "rlimit_nproc", "fips_detection", "dyld_insert_libraries"}
+	for _, name := range expectedCaps {
+		cap, ok := result.Capabilities[name]
+		if !ok {
+			t.Errorf("missing capability: %s", name)
+			continue
+		}
+		// All macOS capabilities should be available (they're OS features)
+		if !cap.Available {
+			t.Logf("capability %s unavailable: %s", name, cap.Detail)
+		}
+		_ = cap.Detail // detail should be present (no need to check type in Go)
+	}
+}
+
+func TestRunDiagnostics_Features(t *testing.T) {
+	result := runDiagnostics()
+
+	expectedFeatures := []string{
+		"network_isolation", "file_read_restriction", "file_write_restriction",
+		"memory_limit", "cpu_limit", "process_limit",
+		"exec_control", "fork_control", "audit_tracing",
+		"filesystem_diff", "learning_mode", "strict_mode",
+		"crypto_control", "fips_detection", "gpu_control",
+		"tpm_control", "antivm_spoofing", "trace_libraries",
+		"trace_http_urls", "allow_url_rules",
+	}
+	for _, name := range expectedFeatures {
+		if _, ok := result.Features[name]; !ok {
+			t.Errorf("missing feature: %s", name)
+		}
+	}
+
+	// macOS should never have eBPF-based features
+	if result.Features["trace_http_urls"] {
+		t.Error("trace_http_urls should be false on macOS")
+	}
+	if result.Features["allow_url_rules"] {
+		t.Error("allow_url_rules should be false on macOS")
+	}
+
+	// Most features should be available on macOS
+	if !result.Features["network_isolation"] {
+		t.Error("network_isolation should be available on macOS with sandbox-exec")
+	}
+	if !result.Features["filesystem_diff"] {
+		t.Error("filesystem_diff should always be available")
+	}
+	if !result.Features["strict_mode"] {
+		t.Error("strict_mode should always be available")
+	}
+}
+
 func TestCheckSensitiveEnv(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -445,3 +445,88 @@ func TestTraceLibraries_Run(t *testing.T) {
 		t.Errorf("expected 'trace-ok' in stdout, got: %q\nstderr: %q", stdout, stderr)
 	}
 }
+
+func TestParseKernelVersion(t *testing.T) {
+	tests := []struct {
+		input string
+		want  float64
+	}{
+		{"6.8.0-arch1", 6.08},
+		{"5.15.0-91-generic", 5.15},
+		{"4.18.0", 4.18},
+		{"6.10.0-rc2", 6.10},
+		{"5.8.0", 5.08},
+	}
+	for _, tc := range tests {
+		got := parseKernelVersion(tc.input)
+		if got != tc.want {
+			t.Errorf("parseKernelVersion(%q) = %.2f, want %.2f", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestRunDiagnostics_Structure(t *testing.T) {
+	result := runDiagnostics()
+
+	if result.Platform != "linux" {
+		t.Errorf("Platform = %q, want 'linux'", result.Platform)
+	}
+	if result.Arch == "" {
+		t.Error("Arch should not be empty")
+	}
+	if result.Kernel == "" {
+		t.Error("Kernel should not be empty")
+	}
+	if len(result.Capabilities) == 0 {
+		t.Error("Capabilities should not be empty")
+	}
+	if len(result.Features) == 0 {
+		t.Error("Features should not be empty")
+	}
+}
+
+func TestRunDiagnostics_Capabilities(t *testing.T) {
+	result := runDiagnostics()
+
+	expectedCaps := []string{
+		"user_namespace", "mount_namespace", "pid_namespace", "net_namespace", "uts_namespace",
+		"cgroup_v2", "landlock", "seccomp", "pivot_root", "tmpfs", "unshare_command",
+	}
+	for _, name := range expectedCaps {
+		cap, ok := result.Capabilities[name]
+		if !ok {
+			t.Errorf("missing capability: %s", name)
+			continue
+		}
+		if cap.Detail == "" {
+			t.Errorf("capability %s has empty detail", name)
+		}
+	}
+}
+
+func TestRunDiagnostics_Features(t *testing.T) {
+	result := runDiagnostics()
+
+	expectedFeatures := []string{
+		"network_isolation", "file_read_restriction", "file_write_restriction",
+		"memory_limit", "cpu_limit", "process_limit",
+		"exec_control", "fork_control", "audit_tracing",
+		"filesystem_diff", "learning_mode", "strict_mode",
+		"crypto_control", "fips_detection", "gpu_control",
+		"tpm_control", "antivm_spoofing", "trace_libraries",
+		"trace_http_urls", "allow_url_rules",
+	}
+	for _, name := range expectedFeatures {
+		if _, ok := result.Features[name]; !ok {
+			t.Errorf("missing feature: %s", name)
+		}
+	}
+
+	// strict_mode and filesystem_diff should always be available
+	if !result.Features["filesystem_diff"] {
+		t.Error("filesystem_diff should always be available")
+	}
+	if !result.Features["strict_mode"] {
+		t.Error("strict_mode should always be available")
+	}
+}

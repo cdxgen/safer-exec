@@ -79,6 +79,18 @@ func main() {
 		}
 	}
 
+	// Handle diagnostics flag
+	if len(os.Args) > 1 && os.Args[1] == "--diagnostics" {
+		result := runDiagnostics()
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(result); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: diagnostics encoding error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// Handle version flag
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
 		fmt.Println("safer-exec 0.8.5")

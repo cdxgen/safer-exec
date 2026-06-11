@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -674,6 +675,96 @@ func dedupPaths(paths []string) []string {
 			result = append(result, p)
 		}
 	}
+	return result
+}
+
+// runDiagnostics probes macOS capabilities and returns a structured report.
+func runDiagnostics() config.DiagnosticsResult {
+	result := config.DiagnosticsResult{
+		Platform:     "darwin",
+		Arch:         runtime.GOARCH,
+		Capabilities: make(map[string]config.CapabilityInfo),
+		Features:     make(map[string]bool),
+	}
+
+	// Kernel version
+	if uname, err := exec.Command("uname", "-r").Output(); err == nil {
+		result.Kernel = strings.TrimSpace(string(uname))
+	}
+	if swVers, err := exec.Command("sw_vers", "-productVersion").Output(); err == nil {
+		result.Release = "macOS " + strings.TrimSpace(string(swVers))
+	}
+
+	// sandbox-exec
+	if _, err := exec.LookPath("sandbox-exec"); err == nil {
+		result.Capabilities["sandbox_exec"] = config.CapabilityInfo{Available: true, Detail: "sandbox-exec is in PATH"}
+	} else {
+		result.Capabilities["sandbox_exec"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// Seatbelt profile
+	if result.Capabilities["sandbox_exec"].Available {
+		result.Capabilities["seatbelt_profile"] = config.CapabilityInfo{Available: true, Detail: "Seatbelt (Sandbox) profile generation via sandbox-exec"}
+	} else {
+		result.Capabilities["seatbelt_profile"] = config.CapabilityInfo{Available: false, Detail: "sandbox-exec not found"}
+	}
+
+	// RLIMIT_AS
+	var rlim syscall.Rlimit
+	if err := syscall.Getrlimit(rlimitAS, &rlim); err == nil {
+		result.Capabilities["rlimit_as"] = config.CapabilityInfo{Available: true, Detail: fmt.Sprintf("max address space: %d bytes", rlim.Max)}
+	} else {
+		result.Capabilities["rlimit_as"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// RLIMIT_CPU
+	if err := syscall.Getrlimit(rlimitCPU, &rlim); err == nil {
+		result.Capabilities["rlimit_cpu"] = config.CapabilityInfo{Available: true, Detail: fmt.Sprintf("max CPU time: %d seconds", rlim.Max)}
+	} else {
+		result.Capabilities["rlimit_cpu"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// RLIMIT_NPROC
+	if err := syscall.Getrlimit(rlimitNPROC, &rlim); err == nil {
+		result.Capabilities["rlimit_nproc"] = config.CapabilityInfo{Available: true, Detail: fmt.Sprintf("max processes: %d", rlim.Max)}
+	} else {
+		result.Capabilities["rlimit_nproc"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// FIPS detection
+	_, err := exec.Command("/usr/bin/defaults", "read", "/Library/Preferences/com.apple.security", "FIPSMode").Output()
+	detail := "defaults read available"
+	if err == nil {
+		detail = "FIPSMode plist key found"
+	}
+	result.Capabilities["fips_detection"] = config.CapabilityInfo{Available: true, Detail: detail}
+
+	// DYLD_INSERT_LIBRARIES
+	result.Capabilities["dyld_insert_libraries"] = config.CapabilityInfo{Available: true, Detail: "DYLD_INSERT_LIBRARIES supported (SIP-restricted for protected binaries)"}
+
+	// Map capabilities to features
+	hasSandbox := result.Capabilities["sandbox_exec"].Available
+	result.Features["network_isolation"] = hasSandbox
+	result.Features["file_read_restriction"] = hasSandbox
+	result.Features["file_write_restriction"] = hasSandbox
+	result.Features["memory_limit"] = result.Capabilities["rlimit_as"].Available
+	result.Features["cpu_limit"] = result.Capabilities["rlimit_cpu"].Available
+	result.Features["process_limit"] = result.Capabilities["rlimit_nproc"].Available
+	result.Features["exec_control"] = hasSandbox
+	result.Features["fork_control"] = hasSandbox
+	result.Features["audit_tracing"] = hasSandbox
+	result.Features["filesystem_diff"] = true
+	result.Features["learning_mode"] = hasSandbox
+	result.Features["strict_mode"] = true
+	result.Features["crypto_control"] = hasSandbox
+	result.Features["fips_detection"] = true
+	result.Features["gpu_control"] = hasSandbox
+	result.Features["tpm_control"] = hasSandbox
+	result.Features["antivm_spoofing"] = hasSandbox
+	result.Features["trace_libraries"] = true
+	result.Features["trace_http_urls"] = false
+	result.Features["allow_url_rules"] = false
+
 	return result
 }
 

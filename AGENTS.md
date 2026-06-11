@@ -106,6 +106,7 @@ node npm/src/cli.js --policy=npm -- npm install
 node npm/src/cli.js --max-memory=512 -- npm run build
 node npm/src/cli.js --diff --write-path=/tmp -- npm install
 node npm/src/cli.js --learn -- npm install
+node npm/src/cli.js diagnostics
 ```
 
 ---
@@ -204,6 +205,7 @@ Policies are plain JavaScript functions that return config objects. They are pla
 - Check stderr for `safer-exec:` prefixed messages
 - On macOS, inspect generated Seatbelt profiles (temp `.sb` files)
 - On Linux, check `/proc/self/ns/` for namespace state
+- Run `safer-exec diagnostics` or `SaferExec.diagnostics()` to verify platform readiness and detect sandbox configuration issues
 
 ### Policy Files in Agentic Workflows
 

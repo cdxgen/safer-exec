@@ -38,6 +38,9 @@ safer-exec --trace-exec -- npm install
 
 # Strip sensitive environment variables
 safer-exec --sanitize-env -- npm install
+
+# Diagnostics mode — probe OS capabilities and feature support
+safer-exec diagnostics
 ```
 
 Full help: `safer-exec --help`.
@@ -142,6 +145,12 @@ All methods return `this` for chaining except `.run()`.
 | `.traceLibraries()`     | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS)                         |
 | `.traceHTTPURLs()`      | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)                             |
 | `.sanitizeEnv(val)`     | Strip sensitive env vars (TOKEN, SECRET, AUTH, etc.) before passing to sandbox                   |
+
+### Static Methods
+
+| Method                    | Description                                                                                                                               |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `SaferExec.diagnostics()` | Probe OS capabilities and safer-exec feature support. Returns a promise of `{ platform, arch, kernel, release, capabilities, features }`. |
 
 ### `.run(cmd, args?)`
 
@@ -463,6 +472,59 @@ console.log(result.auditLog);
 ```
 
 Each audit entry contains a type (`file-read`, `file-write`, `network-connect`, `syscall`, `process-exec`), the target resource, and optional details.
+
+## Diagnostics
+
+Probe the host machine for OS-level sandboxing capabilities and safer-exec feature support.
+
+```bash
+safer-exec diagnostics
+```
+
+Sample output on macOS:
+
+```
+safer-exec v0.9.0 — Diagnostics
+========================================================
+
+  Platform:    darwin (arm64)
+  Kernel:      25.5.0
+  Release:     macOS 26.5.1
+  Node.js:     v24.16.0
+
+OS Capabilities
+────────────────────────────────────────────────────────
+  ✓ Sandbox Exec              sandbox-exec is in PATH
+  ✓ Seatbelt Profile          Seatbelt (Sandbox) profile generation via sandbox-exec
+  ✓ Rlimit As                 max address space: 9223372036854775807 bytes
+  ✓ Rlimit Cpu                max CPU time: 9223372036854775807 seconds
+  ✓ Rlimit Nproc              max processes: 9223372036854775807
+  ✓ Dyld Insert Libraries     DYLD_INSERT_LIBRARIES supported (SIP-restricted)
+  ✓ Fips Detection            defaults read available
+
+SaferExec Features
+────────────────────────────────────────────────────────
+  ✓ Network Isolation         ✓ Exec Control               ✓ Audit Tracing
+  ✓ File Read Restriction     ✓ Fork Control               ✓ Filesystem Diff
+  ✓ File Write Restriction    ✓ Memory Limit               ✓ Learning Mode
+  ✓ CPU Limit                 ✓ Process Limit              ✓ Strict Mode
+  ✓ Crypto Control            ✓ FIPS Detection             ✓ GPU Control
+  ✓ TPM Control               ✓ Anti-VM Spoofing           ✓ Library Tracing
+  ✗ HTTP URL Tracing          ✗ Allow URL Rules
+
+  Summary: 18/20 features supported
+```
+
+Use the API to get structured data:
+
+```js
+const diag = await SaferExec.diagnostics();
+console.log(diag.platform); // 'darwin'
+console.log(diag.capabilities.sandbox_exec.available); // true
+console.log(diag.features.network_isolation); // true
+```
+
+Capabilities are OS-level primitives (sandbox-exec, namespaces, cgroups, seccomp, etc.). Features are safer-exec capabilities built on top of those primitives (network isolation, file restriction, memory limits, etc.). When a feature shows ✗, its underlying primitive is unavailable on the current platform — for example, `trace_http_urls` and `allow_url_rules` require Linux with eBPF (kernel ≥ 5.8 + CAP_BPF).
 
 ## Library Tracing (Dynamic Link Observability)
 

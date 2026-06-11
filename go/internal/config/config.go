@@ -387,6 +387,31 @@ type PolicyFile struct {
 // Deprecated: use PolicyFile instead.
 type LearnedPolicy = PolicyFile
 
+// DiagnosticsResult is the output of the --diagnostics command.
+// It reports OS-level capabilities and safer-exec feature support.
+type DiagnosticsResult struct {
+	// Platform is the operating system (e.g. "darwin", "linux").
+	Platform string `json:"platform"`
+	// Arch is the CPU architecture (e.g. "arm64", "amd64").
+	Arch string `json:"arch"`
+	// Kernel is the full kernel version string (e.g. "24.0.0").
+	Kernel string `json:"kernel"`
+	// Release is the OS release name/version (e.g. "24.0.0" on Darwin, "6.8.0-arch" on Linux).
+	Release string `json:"release"`
+	// Capabilities is a map of feature name to CapabilityInfo.
+	Capabilities map[string]CapabilityInfo `json:"capabilities"`
+	// Features maps safer-exec feature names to their support status.
+	Features map[string]bool `json:"features"`
+}
+
+// CapabilityInfo describes a single OS capability.
+type CapabilityInfo struct {
+	// Available indicates whether the capability is present.
+	Available bool `json:"available"`
+	// Detail is an optional human-readable description or version info.
+	Detail string `json:"detail,omitempty"`
+}
+
 // ExecResult is the output returned to the JS runner after execution.
 // It contains stdout, stderr, exit code, and optional additional data.
 type ExecResult struct {

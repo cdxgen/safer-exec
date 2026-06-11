@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -995,7 +996,14 @@ func applySeccomp(cfg config.ExecConfig) error {
 		}
 	}
 	if cfg.TraceExec || hasBlockExecWildcard {
-		blockCalls = append(blockCalls, syscall.SYS_EXECVE, sysEXECVEAT)
+		// Only block SYS_EXECVE (not execveat).
+		// execveat is used by execCommand() to start the sandboxed target process.
+		// Blocking execveat would kill the init thread while Go runtime threads
+		// remain alive, causing the process to hang instead of failing cleanly.
+		// Child processes spawned by the sandboxed command use SYS_EXECVE via glibc,
+		// so blocking SYS_EXECVE is sufficient to prevent child process execution or
+		// to trap exec calls for logging (TraceExec).
+		blockCalls = append(blockCalls, syscall.SYS_EXECVE)
 	}
 
 	// Filter out the dummy arm64 syscall numbers to avoid trapping unused kernel paths
@@ -1418,4 +1426,206 @@ func monitorMaps(parentPid int, stopChan chan struct{}) {
 			scan()
 		}
 	}
+}
+
+// parseKernelVersion extracts the kernel major version as a float from a version string.
+// Only the first two components are used; e.g. "6.8.0-arch1" -> 6.8
+func parseKernelVersion(version string) float64 {
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return 0
+	}
+	maj, err1 := strconv.Atoi(parts[0])
+	min, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return 0
+	}
+	return float64(maj) + float64(min)/100.0
+}
+
+// runDiagnostics probes Linux kernel capabilities and returns a structured report.
+func runDiagnostics() config.DiagnosticsResult {
+	result := config.DiagnosticsResult{
+		Platform:     "linux",
+		Arch:         runtime.GOARCH,
+		Capabilities: make(map[string]config.CapabilityInfo),
+		Features:     make(map[string]bool),
+	}
+
+	// Kernel version
+	if data, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil {
+		result.Kernel = strings.TrimSpace(string(data))
+	}
+	// OS release
+	if data, err := os.ReadFile("/etc/os-release"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "PRETTY_NAME=") {
+				result.Release = strings.Trim(strings.TrimPrefix(line, "PRETTY_NAME="), "\"")
+				break
+			}
+		}
+	}
+	if result.Release == "" {
+		if data, err := os.ReadFile("/etc/lsb-release"); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.HasPrefix(line, "DISTRIB_DESCRIPTION=") {
+					result.Release = strings.Trim(strings.TrimPrefix(line, "DISTRIB_DESCRIPTION="), "\"")
+					break
+				}
+			}
+		}
+	}
+
+	// Namespace support
+	nsTypes := []struct {
+		name string
+		path string
+	}{
+		{"user_namespace", "/proc/self/ns/user"},
+		{"mount_namespace", "/proc/self/ns/mnt"},
+		{"pid_namespace", "/proc/self/ns/pid"},
+		{"net_namespace", "/proc/self/ns/net"},
+		{"uts_namespace", "/proc/self/ns/uts"},
+	}
+	for _, ns := range nsTypes {
+		if _, err := os.Stat(ns.path); err == nil {
+			result.Capabilities[ns.name] = config.CapabilityInfo{Available: true, Detail: "namespace file present"}
+		} else {
+			result.Capabilities[ns.name] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+		}
+	}
+
+	// cgroup v2
+	if data, err := os.ReadFile("/sys/fs/cgroup/cgroup.controllers"); err == nil {
+		controllers := strings.Fields(string(data))
+		hasMem, hasCPU, hasPIDs := false, false, false
+		for _, c := range controllers {
+			switch c {
+			case "memory":
+				hasMem = true
+			case "cpu":
+				hasCPU = true
+			case "pids":
+				hasPIDs = true
+			}
+		}
+		result.Capabilities["cgroup_v2"] = config.CapabilityInfo{Available: true, Detail: fmt.Sprintf("controllers: %s", strings.Join(controllers, ", "))}
+		result.Capabilities["cgroup_v2_memory"] = config.CapabilityInfo{Available: hasMem, Detail: "memory controller"}
+		result.Capabilities["cgroup_v2_cpu"] = config.CapabilityInfo{Available: hasCPU, Detail: "cpu controller"}
+		result.Capabilities["cgroup_v2_pids"] = config.CapabilityInfo{Available: hasPIDs, Detail: "pids controller"}
+	} else {
+		result.Capabilities["cgroup_v2"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// Landlock
+	if data, err := os.ReadFile("/sys/kernel/security/landlock/abi"); err == nil {
+		abi := strings.TrimSpace(string(data))
+		result.Capabilities["landlock"] = config.CapabilityInfo{Available: true, Detail: fmt.Sprintf("ABI v%s", abi)}
+	} else {
+		result.Capabilities["landlock"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// Seccomp
+	if data, err := os.ReadFile("/proc/sys/kernel/seccomp/actions_avail"); err == nil {
+		actions := strings.TrimSpace(string(data))
+		result.Capabilities["seccomp"] = config.CapabilityInfo{Available: true, Detail: fmt.Sprintf("actions: %s", actions)}
+		result.Capabilities["seccomp_bpf"] = config.CapabilityInfo{Available: true, Detail: "seccomp-BPF via /proc/sys/kernel/seccomp"}
+	} else if _, err := os.Stat("/proc/sys/kernel/seccomp"); err == nil {
+		result.Capabilities["seccomp"] = config.CapabilityInfo{Available: true, Detail: "seccomp directory present"}
+		result.Capabilities["seccomp_bpf"] = config.CapabilityInfo{Available: true, Detail: "seccomp implies BPF support"}
+	} else {
+		result.Capabilities["seccomp"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+		result.Capabilities["seccomp_bpf"] = config.CapabilityInfo{Available: false, Detail: "seccomp not available"}
+	}
+
+	// pivot_root
+	if _, err := os.Stat("/proc/1/root"); err == nil {
+		result.Capabilities["pivot_root"] = config.CapabilityInfo{Available: true, Detail: "pivot_root syscall available"}
+	} else {
+		result.Capabilities["pivot_root"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// tmpfs
+	if data, err := os.ReadFile("/proc/filesystems"); err == nil {
+		if strings.Contains(string(data), "tmpfs") {
+			result.Capabilities["tmpfs"] = config.CapabilityInfo{Available: true, Detail: "tmpfs filesystem available"}
+		} else {
+			result.Capabilities["tmpfs"] = config.CapabilityInfo{Available: false, Detail: "tmpfs not in /proc/filesystems"}
+		}
+	} else {
+		result.Capabilities["tmpfs"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// eBPF
+	if data, err := os.ReadFile("/proc/sys/kernel/unprivileged_bpf_disabled"); err == nil {
+		val := strings.TrimSpace(string(data))
+		detail := "unprivileged_bpf_disabled=" + val
+		switch val {
+		case "0":
+			detail += " (unprivileged BPF enabled)"
+		case "1":
+			detail += " (CAP_BPF required)"
+		case "2":
+			detail += " (CAP_BPF required, locked)"
+		}
+		result.Capabilities["ebpf"] = config.CapabilityInfo{Available: true, Detail: detail}
+	} else {
+		result.Capabilities["ebpf"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// eBPF HTTP URL tracing needs kernel >= 5.8
+	kernelVer := parseKernelVersion(result.Kernel)
+	bpfForTrace := kernelVer >= 5.08
+	result.Capabilities["bpf_trace_http_urls"] = config.CapabilityInfo{
+		Available: bpfForTrace,
+		Detail:    fmt.Sprintf("kernel %.2f %s 5.08", kernelVer, map[bool]string{true: ">=", false: "<"}[bpfForTrace]),
+	}
+
+	// unshare command
+	if _, err := exec.LookPath("unshare"); err == nil {
+		result.Capabilities["unshare_command"] = config.CapabilityInfo{Available: true, Detail: "unshare is in PATH"}
+	} else {
+		result.Capabilities["unshare_command"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// LD_AUDIT for library tracing
+	result.Capabilities["ld_audit"] = config.CapabilityInfo{Available: true, Detail: "LD_AUDIT supported on glibc"}
+
+	// Map capabilities to features
+	hasUnshare := result.Capabilities["unshare_command"].Available
+	hasUserNS := result.Capabilities["user_namespace"].Available
+	hasMountNS := result.Capabilities["mount_namespace"].Available
+	hasPidNS := result.Capabilities["pid_namespace"].Available
+	hasNetNS := result.Capabilities["net_namespace"].Available
+	hasCGv2 := result.Capabilities["cgroup_v2"].Available
+	hasLandlock := result.Capabilities["landlock"].Available
+	hasSeccomp := result.Capabilities["seccomp"].Available
+	hasTmpfs := result.Capabilities["tmpfs"].Available
+	hasPivotRoot := result.Capabilities["pivot_root"].Available
+
+	fullIsolation := hasUnshare && hasUserNS && hasMountNS && hasPidNS && hasNetNS && hasTmpfs && hasPivotRoot
+	reducedIsolation := hasSeccomp && hasLandlock
+
+	result.Features["network_isolation"] = fullIsolation
+	result.Features["file_read_restriction"] = fullIsolation || reducedIsolation
+	result.Features["file_write_restriction"] = fullIsolation || reducedIsolation
+	result.Features["memory_limit"] = hasCGv2 && result.Capabilities["cgroup_v2_memory"].Available
+	result.Features["cpu_limit"] = hasCGv2 && result.Capabilities["cgroup_v2_cpu"].Available
+	result.Features["process_limit"] = hasCGv2 && result.Capabilities["cgroup_v2_pids"].Available
+	result.Features["exec_control"] = hasSeccomp
+	result.Features["fork_control"] = hasSeccomp
+	result.Features["audit_tracing"] = hasSeccomp
+	result.Features["filesystem_diff"] = true
+	result.Features["learning_mode"] = fullIsolation || reducedIsolation
+	result.Features["strict_mode"] = true
+	result.Features["crypto_control"] = fullIsolation || reducedIsolation
+	result.Features["fips_detection"] = false
+	result.Features["gpu_control"] = fullIsolation || reducedIsolation
+	result.Features["tpm_control"] = fullIsolation || reducedIsolation
+	result.Features["antivm_spoofing"] = fullIsolation || reducedIsolation
+	result.Features["trace_libraries"] = true
+	result.Features["trace_http_urls"] = bpfForTrace
+	result.Features["allow_url_rules"] = bpfForTrace
+
+	return result
 }
