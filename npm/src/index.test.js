@@ -28,9 +28,9 @@ describe('SaferExec', () => {
       strict.deepEqual(exec._writePaths, [], 'writePaths should be empty');
       strict.deepEqual(exec._env, {}, 'env should be empty object');
       strict.equal(exec._disableNetwork, false, 'disableNetwork should be false');
-      strict.equal(exec._maxMemoryMB, 512, 'maxMemoryMB should be 512');
-      strict.equal(exec._maxCPUCores, 1.0, 'maxCPUCores should be 1.0');
-      strict.equal(exec._maxProcesses, 100, 'maxProcesses should be 100');
+      strict.equal(exec._maxMemoryMB, 0, 'maxMemoryMB should be 0');
+      strict.equal(exec._maxCPUCores, 0, 'maxCPUCores should be 0');
+      strict.equal(exec._maxProcesses, 0, 'maxProcesses should be 0');
       strict.equal(exec._timeoutMs, 60000, 'timeoutMs should be 60000');
       strict.equal(exec._workingDir, process.cwd(), 'workingDir should be cwd');
       strict.equal(exec._binaryPath, undefined, 'binaryPath should be undefined');

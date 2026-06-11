@@ -116,7 +116,7 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **How isolation works:**
 
-- **Linux:** A new network namespace is created by default. Landlock v2 rules restrict TCP connections to explicitly configured ports (defaults: 80, 443). No wildcard range for privileged ports.
+- **Linux:** A new network namespace is created when `disableNetwork` is true. Landlock v2 rules restrict TCP connections to explicitly configured ports (defaults: 80, 443). No wildcard range for privileged ports.
 - **macOS:** Seatbelt rules allow outbound connections. Port filtering uses `remote ip "*:PORT"` patterns.
 
 **Residual risk:**
@@ -136,7 +136,7 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **Residual risk:**
 
-- Memory defaults to 512 MB, CPU to 1.0 core, process count to 100, and timeout to 60 seconds. These can be overridden to 0 (unlimited) or any custom value.
+- Memory, CPU, and process limits default to 0 (unlimited). The timeout defaults to 60 seconds. Users should explicitly set `maxMemory`, `maxCPUCores`, and `maxProcesses` for production use. Sensible recommendations: 512 MB memory, 1.0 CPU core, 100 processes.
 - RLIMIT_CPU on macOS limits total CPU time, not wall clock time. A single-threaded process gets the full allocation.
 - The process count limit on macOS adds 10 to the configured value to account for internal processes. On Linux it adds 2.
 
@@ -243,7 +243,7 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **Network namespace:**
 
-A new network namespace is created by default (not only when `disableNetwork` is true). This prevents the sandboxed process from observing host network interfaces, listening sockets, or network connection state. Explicit `allowHosts` / `allowPorts` configuration is required for outbound connectivity.
+A new network namespace is created when `disableNetwork` is true. This prevents the sandboxed process from observing host network interfaces, listening sockets, or network connection state. When a new network namespace is active, explicit `allowHosts` / `allowPorts` configuration is required for outbound connectivity.
 
 **macOS escape paths:**
 
@@ -280,7 +280,7 @@ Policies are resolved at runtime based on the operating system. The following pl
 
 ## 6. Recommendations
 
-1. **Resource limits now have sensible defaults** (512 MB memory, 1 CPU core, 100 processes, 60s timeout). Review and adjust for your workload.
+1. **Set resource limits for production use.** Resource limits (memory, CPU, process count) default to 0 (unlimited). Configure `maxMemory`, `maxCPUCores`, and `maxProcesses` explicitly. Sensible defaults for most workloads: 512 MB memory, 1.0 CPU core, 100 processes. The timeout defaults to 60 seconds.
 2. **Strengthen macOS Seatbelt rules.** Remove the blanket `(allow file-read*)` and `(allow file-write*)` rules. Use only the per-path subpath rules for actual confinement.
 3. **Landlock port ranges are now narrowed.** Only explicitly configured ports (defaults: 80, 443) are allowed — the 1-1024 wildcard has been removed.
 4. **Include IPv6 in Landlock rules.** The current implementation adds both IPv4 and IPv6 rules, but DNS resolution may return IPv6 addresses that are not included in the allow list.

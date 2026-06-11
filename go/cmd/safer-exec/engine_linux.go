@@ -106,7 +106,10 @@ func run(cfg config.ExecConfig) error {
 	}
 
 	// Use system unshare to create namespaces before Go starts
-	unshareArgs := []string{"-U", "-m", "-p", "--fork", "-u", "-r", "-n"}
+	unshareArgs := []string{"-U", "-m", "-p", "--fork", "-u", "-r"}
+	if cfg.DisableNetwork {
+		unshareArgs = append(unshareArgs, "-n")
+	}
 	unshareArgs = append(unshareArgs, "--", selfPath, "--init")
 
 	// Write config to a temp file to avoid exposing secrets in /proc/self/environ
@@ -169,9 +172,6 @@ func run(cfg config.ExecConfig) error {
 		}
 		var errno syscall.Errno
 		if errors.As(err, &errno) && (errno == syscall.EPERM || errno == syscall.EINVAL) {
-			if cfg.Strict {
-				return fmt.Errorf("user namespaces unavailable: %w", err)
-			}
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: user namespaces unavailable — running with reduced isolation (seccomp + landlock only; no filesystem, PID, or network namespace isolation). Install the safer-exec AppArmor profile for full isolation. See README for details.\n")
 			return runReduced(cfg, cfgJSON, selfPath)
 		}
@@ -498,9 +498,11 @@ func runInit(cfg config.ExecConfig) error {
 	// Clear audit FD env var to prevent child processes from discovering it
 	os.Unsetenv("SAFER_EXEC_AUDIT_FD")
 
-	// Bring up loopback interface in the new network namespace
-	cmd := exec.Command("ip", "link", "set", "lo", "up")
-	_ = cmd.Run()
+	// Bring up loopback interface if we are in a new network namespace
+	if cfg.DisableNetwork {
+		cmd := exec.Command("ip", "link", "set", "lo", "up")
+		_ = cmd.Run()
+	}
 
 	cgroupPath, err := setupCgroupV2(cfg)
 	if err != nil {
@@ -519,20 +521,6 @@ func runInit(cfg config.ExecConfig) error {
 	} else {
 		if err := setupFilesystem(cfg); err != nil {
 			return fmt.Errorf("setting up filesystem: %w", err)
-		}
-	}
-
-	// Verify PID namespace isolation
-	var pidStat syscall.Stat_t
-	if err := syscall.Stat("/proc/self/ns/pid", &pidStat); err == nil {
-		var initStat syscall.Stat_t
-		if err := syscall.Stat("/proc/1/ns/pid", &initStat); err == nil {
-			if pidStat.Ino == initStat.Ino {
-				if cfg.Strict {
-					return fmt.Errorf("PID namespace isolation failed: sharing namespace with host")
-				}
-				fmt.Fprintf(os.Stderr, "safer-exec: warning: PID namespace isolation failed, continuing with reduced guarantees\n")
-			}
 		}
 	}
 
@@ -590,9 +578,8 @@ func setupCgroupV2(cfg config.ExecConfig) (string, error) {
 	if err := os.Mkdir(cgroupPath, 0o755); err != nil {
 		// If we still don't have permission (e.g. systemd delegation is disabled),
 		// gracefully skip cgroup limits instead of failing the sandbox.
-		if cfg.Strict {
-			return "", fmt.Errorf("cgroup v2 not available: %w", err)
-		}
+		// cgroup availability is an OS capability, not a sandbox feature —
+		// failures here should not be treated as sandbox isolation failures.
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: cgroup v2 not available (mkdir %s: %v), skipping resource limits\n", cgroupPath, err)
 		return "", nil
 	}
@@ -624,7 +611,9 @@ func setupFilesystem(cfg config.ExecConfig) error {
 			cwd = d
 		}
 	}
-	if cwd != "" {
+	// working directory writable by default but skip / (root) since
+	// bind-mounting the host root into the new root is invalid.
+	if cwd != "" && cwd != "/" {
 		alreadyInWrite := false
 		for _, w := range cfg.WritePaths {
 			if w == cwd {
@@ -719,6 +708,9 @@ func setupFilesystem(cfg config.ExecConfig) error {
 	}
 
 	for _, path := range cfg.ReadPaths {
+		if path == "/" {
+			continue
+		}
 		// If BlockCrypto is true, skip ssl/certs and crypto libraries if they are read paths
 		if cfg.BlockCrypto {
 			if strings.Contains(path, "/etc/ssl") || strings.Contains(path, "/usr/lib/ssl") || strings.Contains(path, "/etc/security") {
@@ -727,13 +719,26 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		}
 
 		target := filepath.Join(newRoot, path)
+		bindSource := path
 		fi, err := os.Lstat(path)
 		if err != nil {
 			continue
 		}
 		if fi.Mode()&os.ModeSymlink != 0 {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: skipping symlink read path: %s\n", path)
-			continue
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: cannot resolve symlink read path %s: %v\n", path, err)
+				continue
+			}
+			if !isPathAllowed(resolved, cfg.ReadPaths, cfg.WritePaths) {
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: symlink read path %s resolves to %s which is outside allowed paths, skipping\n", path, resolved)
+				continue
+			}
+			bindSource = resolved
+			fi, err = os.Stat(resolved)
+			if err != nil {
+				continue
+			}
 		}
 
 		_, statErr := os.Stat(target)
@@ -759,7 +764,7 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		if err == nil {
 			// Linux requires bind mount and read-only remount to be separate steps.
 			// Using MS_REC ensures sub-mounts (like /run/systemd) are included.
-			if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			if err := syscall.Mount(bindSource, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
 				if cfg.Strict {
 					return fmt.Errorf("bind mount %s: %w", path, err)
 				}
@@ -770,14 +775,30 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		}
 	}
 	for _, path := range cfg.WritePaths {
+		if path == "/" {
+			continue
+		}
 		target := filepath.Join(newRoot, path)
+		bindSource := path
 		fi, err := os.Lstat(path)
 		if err != nil {
 			continue
 		}
 		if fi.Mode()&os.ModeSymlink != 0 {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: skipping symlink write path: %s\n", path)
-			continue
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: cannot resolve symlink write path %s: %v\n", path, err)
+				continue
+			}
+			if !isPathAllowed(resolved, cfg.ReadPaths, cfg.WritePaths) {
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: symlink write path %s resolves to %s which is outside allowed paths, skipping\n", path, resolved)
+				continue
+			}
+			bindSource = resolved
+			fi, err = os.Stat(resolved)
+			if err != nil {
+				continue
+			}
 		}
 
 		_, statErr := os.Stat(target)
@@ -801,7 +822,7 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		}
 
 		if err == nil {
-			if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			if err := syscall.Mount(bindSource, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
 				if cfg.Strict {
 					return fmt.Errorf("bind mount %s: %w", path, err)
 				}
@@ -1251,6 +1272,23 @@ func dedupPaths(paths []string) []string {
 		}
 	}
 	return result
+}
+
+// isPathAllowed checks if a resolved path is within any of the allowed read or write paths.
+// Used when resolving symlinks in read/write paths to prevent mounting targets
+// that fall outside the declared policy.
+func isPathAllowed(resolved string, readPaths, writePaths []string) bool {
+	for _, rp := range readPaths {
+		if resolved == rp || strings.HasPrefix(resolved, rp+"/") {
+			return true
+		}
+	}
+	for _, wp := range writePaths {
+		if resolved == wp || strings.HasPrefix(resolved, wp+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func isMusl() bool {

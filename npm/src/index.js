@@ -253,13 +253,13 @@ export class SaferExec extends EventEmitter {
     this._allowLoopback = options.allowLoopback || false;
 
     /** @type {number} */
-    this._maxMemoryMB = options.maxMemoryMB || 512;
+    this._maxMemoryMB = options.maxMemoryMB || 0;
 
     /** @type {number} */
-    this._maxCPUCores = options.maxCPUCores || 1.0;
+    this._maxCPUCores = options.maxCPUCores || 0;
 
     /** @type {number} */
-    this._maxProcesses = options.maxProcesses || 100;
+    this._maxProcesses = options.maxProcesses || 0;
 
     /** @type {number} */
     this._timeoutMs = options.timeoutMs || 60000;
@@ -1185,7 +1185,7 @@ export class SaferExec extends EventEmitter {
       }
     }
     let effectiveReadPaths = [...this._readPaths];
-    if (this._workingDir && !effectiveReadPaths.includes(this._workingDir)) {
+    if (this._workingDir && this._workingDir !== '/' && !effectiveReadPaths.includes(this._workingDir)) {
       effectiveReadPaths.push(this._workingDir);
     }
     if (process.platform === 'linux') {
