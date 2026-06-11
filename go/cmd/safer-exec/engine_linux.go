@@ -30,6 +30,7 @@ const (
 	sysFORK     = sysFORK_unified
 	sysVFORK    = sysVFORK_unified
 	sysEXECVEAT = sysEXECVEAT_unified
+	sysCLONE3   = sysCLONE3_unified
 )
 
 const (
