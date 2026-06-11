@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -1235,7 +1236,7 @@ func parseKernelVersion(version string) float64 {
 func runDiagnostics() config.DiagnosticsResult {
 	result := config.DiagnosticsResult{
 		Platform:     "linux",
-		Arch:         "",
+		Arch:         runtime.GOARCH,
 		Capabilities: make(map[string]config.CapabilityInfo),
 		Features:     make(map[string]bool),
 	}
