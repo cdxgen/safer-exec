@@ -1425,10 +1425,14 @@ func runDiagnostics() config.DiagnosticsResult {
 	}
 
 	// pivot_root
-	if _, err := os.Stat("/proc/1/root"); err == nil {
-		result.Capabilities["pivot_root"] = config.CapabilityInfo{Available: true, Detail: "pivot_root syscall available"}
+	// stat /proc/1/root fails in containers (permission denied) even though
+	// pivot_root works fine from within a mount namespace. Check mount namespace
+	// availability as a reliable proxy: pivot_root has been available on all
+	// Linux kernels since 2.3.99 and always works with a mount namespace.
+	if result.Capabilities["mount_namespace"].Available {
+		result.Capabilities["pivot_root"] = config.CapabilityInfo{Available: true, Detail: "pivot_root available via mount namespace"}
 	} else {
-		result.Capabilities["pivot_root"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+		result.Capabilities["pivot_root"] = config.CapabilityInfo{Available: false, Detail: "mount namespace not available"}
 	}
 
 	// tmpfs
