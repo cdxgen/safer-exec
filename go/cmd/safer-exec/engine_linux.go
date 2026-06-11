@@ -984,10 +984,10 @@ func applySeccomp(cfg config.ExecConfig) error {
 	syscall.Syscall6(syscall.SYS_PRCTL, 38, 1, 0, 0, 0, 0)
 
 	blockCalls := []int{syscall.SYS_PTRACE, sysKCMP, syscall.SYS_UNSHARE, syscall.SYS_MOUNT, syscall.SYS_PIVOT_ROOT, sysSYSCALL}
-	if cfg.BlockFork {
-		// SYS_CLONE is handled separately below with a flag check to allow thread creation.
-		blockCalls = append(blockCalls, sysFORK, sysVFORK)
-	}
+	// SYS_CLONE and SYS_CLONE3 are handled separately below with a flag check.
+	// sysFORK and sysVFORK are intentionally NOT blocked here — they are redundant
+	// with the clone handler (glibc implements fork() via clone), and Node.js on
+	// amd64 uses the fork syscall internally during startup.
 	hasBlockExecWildcard := false
 	for _, item := range cfg.BlockExec {
 		if item == "*" {
@@ -1042,16 +1042,13 @@ func applySeccomp(cfg config.ExecConfig) error {
 			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0},
 		)
 
-		// Block clone3 unconditionally when BlockFork is true.
-		// clone3 uses a struct argument, so the BPF filter can't easily
-		// parse flags. Since clone3 is always a process-creating syscall
-		// (there is no CLONE_THREAD-based thread creation variant like clone()),
-		// we block it entirely.
-		insts = append(insts,
-			syscall.SockFilter{Code: bpfJmpEq, Jf: 1, K: uint32(sysCLONE3)},
-			syscall.SockFilter{Code: bpfJmpReturn, K: retKillOrTrap},
-			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0},
-		)
+		// SYS_CLONE3 is intentionally NOT blocked here.
+		// clone3 is used by glibc/Node.js on arm64 for thread creation
+		// (via CLONE_THREAD flag in the clone3_args struct). Since BPF cannot
+		// easily dereference the struct pointer argument, we cannot distinguish
+		// thread creation from process creation for clone3. Blocking it
+		// unconditionally would break Node.js on arm64.
+		// The SYS_CLONE handler above covers the common case for process creation.
 	}
 
 	for _, call := range actualBlockCalls {
