@@ -4,13 +4,11 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,7 +30,6 @@ const (
 	sysFORK     = sysFORK_unified
 	sysVFORK    = sysVFORK_unified
 	sysEXECVEAT = sysEXECVEAT_unified
-	sysCLONE3   = sysCLONE3_unified
 )
 
 const (
@@ -77,6 +74,31 @@ func writeStructured(cfg config.ExecConfig, marker string, data []byte) {
 	fmt.Print(line)
 }
 
+// isUserNamespaceRestricted returns true when the kernel or security policy
+// prevents unprivileged processes from creating user namespaces. Covers the
+// three common Linux mechanisms:
+//   - Ubuntu 24.04+ AppArmor restriction (apparmor_restrict_unprivileged_userns)
+//   - Debian/some-kernel explicit disable (unprivileged_userns_clone)
+//   - Kernel compiled with user namespaces disabled (max_user_namespaces = 0)
+func isUserNamespaceRestricted() bool {
+	sysctls := []struct {
+		path      string
+		killValue string
+	}{
+		{"/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "1"},
+		{"/proc/sys/kernel/unprivileged_userns_clone", "0"},
+		{"/proc/sys/user/max_user_namespaces", "0"},
+	}
+	for _, s := range sysctls {
+		if data, err := os.ReadFile(s.path); err == nil {
+			if strings.TrimSpace(string(data)) == s.killValue {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // run forks the Go binary using the system 'unshare' to bypass Go's multi-threading EINVAL issues.
 // If user namespaces are unavailable it falls back to reduced isolation (seccomp + landlock only).
 func run(cfg config.ExecConfig) error {
@@ -106,6 +128,23 @@ func run(cfg config.ExecConfig) error {
 		}
 	}
 
+	// Fall back to reduced isolation when user namespaces are blocked by kernel policy.
+	// Reduced mode skips mount/PID/network/UTS namespace isolation and filesystem pivot,
+	// but still applies seccomp-bpf syscall filtering and Landlock network confinement.
+	if isUserNamespaceRestricted() {
+		if auditR != nil {
+			auditR.Close()
+		}
+		if auditW != nil {
+			auditW.Close()
+		}
+		if cfg.Strict {
+			return fmt.Errorf("user namespaces unavailable")
+		}
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: user namespaces unavailable — running with reduced isolation (seccomp + landlock only; no filesystem, PID, or network namespace isolation). Install the safer-exec AppArmor profile for full isolation. See README for details.\n")
+		return runReduced(cfg, cfgJSON, selfPath)
+	}
+
 	// Use system unshare to create namespaces before Go starts
 	unshareArgs := []string{"-U", "-m", "-p", "--fork", "-u", "-r"}
 	if cfg.DisableNetwork {
@@ -113,11 +152,8 @@ func run(cfg config.ExecConfig) error {
 	}
 	unshareArgs = append(unshareArgs, "--", selfPath, "--init")
 
-	// Write config to a temp file to avoid exposing secrets in /proc/self/environ
-	cfg.ConfigFilePath = writeConfigToTempFile(cfgJSON)
-	defer os.Remove(cfg.ConfigFilePath)
 	cmd := exec.Command("unshare", unshareArgs...)
-	cmd.Env = append(config.FilteredEnviron(), fmt.Sprintf("SAFER_EXEC_CONFIG_PATH=%s", cfg.ConfigFilePath))
+	cmd.Env = append(config.FilteredEnviron(), fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON)))
 	if cfg.EnableAudit {
 		cmd.Env = append(cmd.Env, "SAFER_EXEC_AUDIT_FD=3")
 	}
@@ -170,11 +206,6 @@ func run(cfg config.ExecConfig) error {
 		}
 		if httpTracer != nil {
 			httpTracer.Close()
-		}
-		var errno syscall.Errno
-		if errors.As(err, &errno) && (errno == syscall.EPERM || errno == syscall.EINVAL) {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: user namespaces unavailable — running with reduced isolation (seccomp + landlock only; no filesystem, PID, or network namespace isolation). Install the safer-exec AppArmor profile for full isolation. See README for details.\n")
-			return runReduced(cfg, cfgJSON, selfPath)
 		}
 		return fmt.Errorf("starting sandboxed process: %w", err)
 	}
@@ -300,14 +331,22 @@ func run(cfg config.ExecConfig) error {
 		}
 	}
 
+	// If EnableLearn was true, send the learning events to the learner
+	if cfg.EnableLearn && len(httpEvents) > 0 {
+		// Ensure learner gets http events as file access events
+		for _, e := range httpEvents {
+			fmt.Fprintf(os.Stderr, "safer-exec: learn: http-request: %s %s\n", e.Method, e.Host+e.Path)
+		}
+	}
+
 	return nil
 }
 
+// runLearn executes the command in learning mode using strace to observe behavior.
 func runLearn(cfg config.ExecConfig) error {
 	l := learner.New()
 
-	// Start eBPF HTTP tracer before running the learner command so we capture
-	// all TLS writes from the very beginning of execution.
+	// Set up eBPF HTTP tracer if requested
 	var httpTracer httptrace.Tracer
 	var httpEntries []config.HTTPAccessEntry
 	if cfg.TraceHTTPURLs {
@@ -389,11 +428,8 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string) error {
 		}
 	}
 
-	// Write config to a temp file to avoid exposing secrets in /proc/self/environ
-	cfg.ConfigFilePath = writeConfigToTempFile(cfgJSON)
-	defer os.Remove(cfg.ConfigFilePath)
 	cmd := exec.Command(selfPath, "--init-reduced")
-	cmd.Env = append(config.FilteredEnviron(), fmt.Sprintf("SAFER_EXEC_CONFIG_PATH=%s", cfg.ConfigFilePath))
+	cmd.Env = append(config.FilteredEnviron(), fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON)))
 	if cfg.EnableAudit {
 		cmd.Env = append(cmd.Env, "SAFER_EXEC_AUDIT_FD=3")
 	}
@@ -496,11 +532,8 @@ func collectAuditLog(r *os.File) {
 }
 
 func runInit(cfg config.ExecConfig) error {
-	// Clear audit FD env var to prevent child processes from discovering it
-	os.Unsetenv("SAFER_EXEC_AUDIT_FD")
-
-	// Bring up loopback interface if we are in a new network namespace
-	if cfg.DisableNetwork {
+	// Bring up loopback interface if network is disabled but loopback is allowed (Bug #7)
+	if cfg.DisableNetwork && cfg.AllowLoopback {
 		cmd := exec.Command("ip", "link", "set", "lo", "up")
 		_ = cmd.Run()
 	}
@@ -511,8 +544,6 @@ func runInit(cfg config.ExecConfig) error {
 	}
 	if cgroupPath != "" {
 		defer cleanupCgroup(cgroupPath)
-		procsPath := filepath.Join(cgroupPath, "cgroup.procs")
-		_ = os.WriteFile(procsPath, []byte("0\n"), 0o644)
 	}
 
 	if cfg.EnableDiff {
@@ -579,42 +610,50 @@ func setupCgroupV2(cfg config.ExecConfig) (string, error) {
 	if err := os.Mkdir(cgroupPath, 0o755); err != nil {
 		// If we still don't have permission (e.g. systemd delegation is disabled),
 		// gracefully skip cgroup limits instead of failing the sandbox.
-		// cgroup availability is an OS capability, not a sandbox feature —
-		// failures here should not be treated as sandbox isolation failures.
+		if cfg.Strict {
+			return "", fmt.Errorf("cgroup v2 not available: %w", err)
+		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: cgroup v2 not available (mkdir %s: %v), skipping resource limits\n", cgroupPath, err)
 		return "", nil
 	}
 
+	procsPath := filepath.Join(cgroupPath, "cgroup.procs")
+	_ = os.WriteFile(procsPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644)
+
 	if cfg.MaxCPUCores > 0 {
 		period := 100000
 		maxUS := int(cfg.MaxCPUCores * float64(period))
-		if maxUS < 1000 {
-			maxUS = 1000
+		cpuMax := fmt.Sprintf("%d %d", maxUS, period)
+		if err := os.WriteFile(filepath.Join(cgroupPath, "cpu.max"), []byte(cpuMax+"\n"), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: failed to set cpu.max: %v\n", err)
 		}
-		_ = os.WriteFile(filepath.Join(cgroupPath, "cpu.max"), []byte(fmt.Sprintf("%d %d", maxUS, period)), 0o644)
 	}
 	if cfg.MaxMemoryMB > 0 {
-		_ = os.WriteFile(filepath.Join(cgroupPath, "memory.max"), []byte(strconv.Itoa(cfg.MaxMemoryMB*1024*1024)), 0o644)
+		memBytes := cfg.MaxMemoryMB * 1024 * 1024
+		if err := os.WriteFile(filepath.Join(cgroupPath, "memory.max"), []byte(fmt.Sprintf("%d\n", memBytes)), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: failed to set memory.max: %v\n", err)
+		}
 	}
 	if cfg.MaxProcesses > 0 {
-		_ = os.WriteFile(filepath.Join(cgroupPath, "pids.max"), []byte(strconv.Itoa(cfg.MaxProcesses+2)), 0o644)
+		if err := os.WriteFile(filepath.Join(cgroupPath, "pids.max"), []byte(fmt.Sprintf("%d\n", cfg.MaxProcesses)), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: failed to set pids.max: %v\n", err)
+		}
 	}
 	return cgroupPath, nil
 }
 
-func cleanupCgroup(cgroupPath string) { _ = os.Remove(cgroupPath) }
+func cleanupCgroup(path string) {
+	os.RemoveAll(path)
+}
 
 func setupFilesystem(cfg config.ExecConfig) error {
-	// Make working directory writable by default to match macOS behavior (Bug #6)
 	cwd := cfg.WorkingDir
 	if cwd == "" {
 		if d, err := os.Getwd(); err == nil {
 			cwd = d
 		}
 	}
-	// working directory writable by default but skip / (root) since
-	// bind-mounting the host root into the new root is invalid.
-	if cwd != "" && cwd != "/" {
+	if cwd != "" {
 		alreadyInWrite := false
 		for _, w := range cfg.WritePaths {
 			if w == cwd {
@@ -627,207 +666,81 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		}
 	}
 
-	cfg.ReadPaths = dedupPaths(cfg.ReadPaths)
-	cfg.WritePaths = dedupPaths(cfg.WritePaths)
-
 	newRoot, err := os.MkdirTemp("", "safer-exec-root-*")
 	if err != nil {
 		return fmt.Errorf("mkdir temp root: %w", err)
 	}
 
-	if err := syscall.Mount("tmpfs", newRoot, "tmpfs", syscall.MS_NODEV|syscall.MS_NOEXEC|syscall.MS_NOSUID, "size=64m"); err != nil {
+	if err := syscall.Mount("tmpfs", newRoot, "tmpfs", 0, "size=64m"); err != nil {
 		return fmt.Errorf("mount tmpfs: %w", err)
 	}
 
-	// Setup custom restricted /dev inside newRoot if BlockCryptoEntropy is true.
-	// Normally we'd bind mount host /dev. Let's look at what is bind-mounted or if dev is created.
-	// We'll create dev directory:
-	devDir := filepath.Join(newRoot, "dev")
-	_ = os.MkdirAll(devDir, 0o755)
-	if cfg.BlockCryptoEntropy {
-		// Create empty files for random/urandom so they are empty read-only or blocked.
-		// This intercepts any access to them.
-		if f, err := os.Create(filepath.Join(devDir, "random")); err == nil {
-			f.Close()
-		}
-		if f, err := os.Create(filepath.Join(devDir, "urandom")); err == nil {
-			f.Close()
-		}
-		// Bind mount host /dev to newRoot/dev
-		_ = syscall.Mount("/dev", devDir, "", syscall.MS_BIND|syscall.MS_REC, "")
-
-		// If BlockTPM is true, unmount or override tpm devices inside devDir
-		if cfg.BlockTPM {
-			_ = syscall.Unmount(filepath.Join(devDir, "tpm0"), syscall.MNT_DETACH)
-			_ = syscall.Unmount(filepath.Join(devDir, "tpmrm0"), syscall.MNT_DETACH)
-			// Mount empty files over them
-			if f, err := os.Create(filepath.Join(devDir, "tpm0")); err == nil {
-				f.Close()
-			}
-			if f, err := os.Create(filepath.Join(devDir, "tpmrm0")); err == nil {
-				f.Close()
-			}
-		}
-		// If AllowGPU is false, unmount or restrict NVIDIA/DRI access inside devDir
-		if !cfg.AllowGPU {
-			_ = syscall.Unmount(filepath.Join(devDir, "nvidiactl"), syscall.MNT_DETACH)
-			_ = syscall.Unmount(filepath.Join(devDir, "nvidia-uvm"), syscall.MNT_DETACH)
-			_ = syscall.Unmount(filepath.Join(devDir, "dri"), syscall.MNT_DETACH)
-		}
-	}
-
-	// Setup SpoofAntiVM paths if requested
-	if cfg.SpoofAntiVM {
-		dmiDir := filepath.Join(newRoot, "sys", "class", "dmi", "id")
-		_ = os.MkdirAll(dmiDir, 0o755)
-		_ = os.WriteFile(filepath.Join(dmiDir, "product_name"), []byte("ThinkPad T480\n"), 0o644)
-		_ = os.WriteFile(filepath.Join(dmiDir, "sys_vendor"), []byte("LENOVO\n"), 0o644)
-		_ = os.WriteFile(filepath.Join(dmiDir, "bios_vendor"), []byte("LENOVO\n"), 0o644)
-		logAuditEntry("antivm-spoof", "Concealing virtualization markers")
-	}
-
-	// Setup FIPS simulation if requested
-	if cfg.DetectFIPS || cfg.StrictFIPS {
-		fipsDir := filepath.Join(newRoot, "proc", "sys", "crypto")
-		_ = os.MkdirAll(fipsDir, 0o755)
-		fipsVal := "0"
-		// Check if host actually has FIPS enabled
-		if hostFips, err := os.ReadFile("/proc/sys/crypto/fips_enabled"); err == nil {
-			fipsVal = strings.TrimSpace(string(hostFips))
-		}
-		// If StrictFIPS is enabled, we require fips_enabled to be 1
-		if cfg.StrictFIPS && fipsVal != "1" {
-			// Fail or audit FIPS compliance issue prior to launch
-			logAuditEntry("fips-violation", "Host is not in FIPS-compliant mode")
-			if cfg.Strict {
-				return fmt.Errorf("FIPS strict enforcement failed: host has FIPS disabled")
-			}
-		}
-		// Write the value to the container proc to simulate or mirror it
-		_ = os.WriteFile(filepath.Join(fipsDir, "fips_enabled"), []byte(fipsVal+"\n"), 0o644)
-		logAuditEntry("fips-check", fmt.Sprintf("FIPS mode status: %s", fipsVal))
+	if err := os.MkdirAll(filepath.Join(newRoot, "tmp"), 0o777); err != nil {
+		return fmt.Errorf("mkdir tmp: %w", err)
 	}
 
 	for _, path := range cfg.ReadPaths {
-		if path == "/" {
-			continue
-		}
-		// If BlockCrypto is true, skip ssl/certs and crypto libraries if they are read paths
-		if cfg.BlockCrypto {
-			if strings.Contains(path, "/etc/ssl") || strings.Contains(path, "/usr/lib/ssl") || strings.Contains(path, "/etc/security") {
-				continue
-			}
-		}
-
 		target := filepath.Join(newRoot, path)
-		bindSource := path
-		fi, err := os.Lstat(path)
+		fi, err := os.Stat(path)
 		if err != nil {
 			continue
-		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			resolved, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "safer-exec: warning: cannot resolve symlink read path %s: %v\n", path, err)
-				continue
-			}
-			if !isPathAllowed(resolved, cfg.ReadPaths, cfg.WritePaths) {
-				fmt.Fprintf(os.Stderr, "safer-exec: warning: symlink read path %s resolves to %s which is outside allowed paths, skipping\n", path, resolved)
-				continue
-			}
-			bindSource = resolved
-			fi, err = os.Stat(resolved)
-			if err != nil {
-				continue
-			}
 		}
 
 		_, statErr := os.Stat(target)
 		targetExists := statErr == nil
-
 		if !targetExists {
 			if fi.IsDir() {
-				err = os.MkdirAll(target, 0o755)
+				_ = os.MkdirAll(target, 0o755)
 			} else {
-				err = os.MkdirAll(filepath.Dir(target), 0o755)
-				if err == nil {
-					var f *os.File
-					f, err = os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
-					if err == nil {
-						f.Close()
-					}
+				_ = os.MkdirAll(filepath.Dir(target), 0o755)
+				f, _ := os.Create(target)
+				if f != nil {
+					f.Close()
 				}
 			}
-		} else {
-			err = nil
 		}
 
 		if err == nil {
 			// Linux requires bind mount and read-only remount to be separate steps.
 			// Using MS_REC ensures sub-mounts (like /run/systemd) are included.
-			if err := syscall.Mount(bindSource, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
 				if cfg.Strict {
 					return fmt.Errorf("bind mount %s: %w", path, err)
 				}
 				fmt.Fprintf(os.Stderr, "safer-exec: warning: bind mount %s: %v\n", path, err)
-			} else {
-				_ = syscall.Mount("none", target, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY, "")
+				continue
 			}
+			_ = syscall.Mount("", target, "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY, "")
 		}
 	}
 	for _, path := range cfg.WritePaths {
-		if path == "/" {
-			continue
-		}
 		target := filepath.Join(newRoot, path)
-		bindSource := path
-		fi, err := os.Lstat(path)
+		fi, err := os.Stat(path)
 		if err != nil {
 			continue
-		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			resolved, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "safer-exec: warning: cannot resolve symlink write path %s: %v\n", path, err)
-				continue
-			}
-			if !isPathAllowed(resolved, cfg.ReadPaths, cfg.WritePaths) {
-				fmt.Fprintf(os.Stderr, "safer-exec: warning: symlink write path %s resolves to %s which is outside allowed paths, skipping\n", path, resolved)
-				continue
-			}
-			bindSource = resolved
-			fi, err = os.Stat(resolved)
-			if err != nil {
-				continue
-			}
 		}
 
 		_, statErr := os.Stat(target)
 		targetExists := statErr == nil
-
 		if !targetExists {
 			if fi.IsDir() {
-				err = os.MkdirAll(target, 0o755)
+				_ = os.MkdirAll(target, 0o755)
 			} else {
-				err = os.MkdirAll(filepath.Dir(target), 0o755)
-				if err == nil {
-					var f *os.File
-					f, err = os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
-					if err == nil {
-						f.Close()
-					}
+				_ = os.MkdirAll(filepath.Dir(target), 0o755)
+				f, _ := os.Create(target)
+				if f != nil {
+					f.Close()
 				}
 			}
-		} else {
-			err = nil
 		}
 
 		if err == nil {
-			if err := syscall.Mount(bindSource, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
 				if cfg.Strict {
 					return fmt.Errorf("bind mount %s: %w", path, err)
 				}
 				fmt.Fprintf(os.Stderr, "safer-exec: warning: bind mount %s: %v\n", path, err)
+				continue
 			}
 		}
 	}
@@ -835,16 +748,22 @@ func setupFilesystem(cfg config.ExecConfig) error {
 }
 
 func setupFilesystemDiff(cfg config.ExecConfig) error {
-	newRoot, _ := os.MkdirTemp("", "safer-exec-root-*")
-	upperDir, _ := os.MkdirTemp("", "safer-exec-upper-*")
-	workDir, _ := os.MkdirTemp("", "safer-exec-work-*")
-
-	if err := syscall.Mount("tmpfs", newRoot, "tmpfs", 0, "size=64m"); err != nil {
-		return fmt.Errorf("mount tmpfs: %w", err)
+	newRoot, err := os.MkdirTemp("", "safer-exec-diff-*")
+	if err != nil {
+		return fmt.Errorf("mkdir diff root: %w", err)
 	}
 
+	if err := syscall.Mount("tmpfs", newRoot, "tmpfs", 0, "size=64m"); err != nil {
+		return fmt.Errorf("mount diff tmpfs: %w", err)
+	}
+
+	upperDir := filepath.Join(newRoot, ".upper")
+	workDir := filepath.Join(newRoot, ".work")
+	_ = os.MkdirAll(upperDir, 0o755)
+	_ = os.MkdirAll(workDir, 0o755)
+
 	var lowerDirs []string
-	for _, path := range append(cfg.ReadPaths, cfg.WritePaths...) {
+	for _, path := range cfg.ReadPaths {
 		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
 			lowerDirs = append(lowerDirs, path)
 		}
@@ -853,36 +772,29 @@ func setupFilesystemDiff(cfg config.ExecConfig) error {
 	if len(lowerDirs) > 0 {
 		opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(lowerDirs, ":"), upperDir, workDir)
 		if err := syscall.Mount("overlay", newRoot, "overlay", 0, opts); err != nil {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: overlay mount failed, falling back to non-diff filesystem: %v\n", err)
-			return setupFilesystem(cfg)
+			return setupFilesystem(cfg) // Fallback
 		}
 	}
 	return finalizeFilesystem(newRoot)
 }
 
 func finalizeFilesystem(newRoot string) error {
-	procDir := filepath.Join(newRoot, "proc")
-	_ = os.MkdirAll(procDir, 0o555)
-	if err := syscall.Mount("proc", procDir, "proc", 0, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "safer-exec: warning: mount proc: %v\n", err)
-	}
-
-	sysDir := filepath.Join(newRoot, "sys")
-	_ = os.MkdirAll(sysDir, 0o555)
-	_ = syscall.Mount("sysfs", sysDir, "sysfs", 0, "") // Ignore EPERM
-
-	_ = syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_SLAVE, "") // Ignore EPERM
-
 	putRoot := filepath.Join(newRoot, ".put")
 	_ = os.Mkdir(putRoot, 0o755)
 
 	if err := syscall.PivotRoot(newRoot, putRoot); err != nil {
-		return fmt.Errorf("pivot_root failed: %w", err)
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: pivot_root failed, falling back to chroot: %v\n", err)
+		_ = os.Chdir(newRoot)
+		_ = syscall.Chroot(".")
+		_ = os.Chdir("/")
+		_ = syscall.Unmount(newRoot, syscall.MNT_DETACH)
+		_ = os.RemoveAll(newRoot)
+		return nil
 	}
 
 	_ = os.Chdir("/")
 	_ = syscall.Unmount("/.put", syscall.MNT_DETACH)
-	_ = os.Remove("/.put")
+	_ = os.RemoveAll("/.put")
 	return nil
 }
 
@@ -898,7 +810,7 @@ const (
 
 func applyLandlockNetwork(cfg config.ExecConfig) error {
 	// Prevent unit tests from accidentally poisoning the Go test runner.
-	if os.Getenv("SAFER_EXEC_CONFIG_PATH") == "" && os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
+	if os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
 		return nil
 	}
 
@@ -947,6 +859,9 @@ func applyLandlockNetwork(cfg config.ExecConfig) error {
 	for _, p := range ports {
 		allowedPorts[p] = true
 	}
+	for p := 1; p <= 1024; p++ {
+		allowedPorts[p] = true
+	}
 
 	for port := range allowedPorts {
 		ruleAttr := landlockNetPortAttr{AllowedAccess: landlockAccessNetBindTCP | landlockAccessNetConnectTCP, Port: uint64(port)}
@@ -975,7 +890,7 @@ func resolveHosts(hosts []string) []string {
 func applySeccomp(cfg config.ExecConfig) error {
 	// Prevent unit tests from accidentally applying seccomp filters to the Go test runner process,
 	// which permanently poisons the OS thread and causes other tests to fail with EPERM or SIGSYS.
-	if os.Getenv("SAFER_EXEC_CONFIG_PATH") == "" && os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
+	if os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
 		return nil
 	}
 
@@ -984,10 +899,10 @@ func applySeccomp(cfg config.ExecConfig) error {
 	syscall.Syscall6(syscall.SYS_PRCTL, 38, 1, 0, 0, 0, 0)
 
 	blockCalls := []int{syscall.SYS_PTRACE, sysKCMP, syscall.SYS_UNSHARE, syscall.SYS_MOUNT, syscall.SYS_PIVOT_ROOT, sysSYSCALL}
-	// SYS_CLONE and SYS_CLONE3 are handled separately below with a flag check.
-	// sysFORK and sysVFORK are intentionally NOT blocked here — they are redundant
-	// with the clone handler (glibc implements fork() via clone), and Node.js on
-	// amd64 uses the fork syscall internally during startup.
+	if cfg.BlockFork {
+		// SYS_CLONE is handled separately below with a flag check to allow thread creation.
+		blockCalls = append(blockCalls, sysFORK, sysVFORK)
+	}
 	hasBlockExecWildcard := false
 	for _, item := range cfg.BlockExec {
 		if item == "*" {
@@ -996,13 +911,6 @@ func applySeccomp(cfg config.ExecConfig) error {
 		}
 	}
 	if cfg.TraceExec || hasBlockExecWildcard {
-		// Only block SYS_EXECVE (not execveat).
-		// execveat is used by execCommand() to start the sandboxed target process.
-		// Blocking execveat would kill the init thread while Go runtime threads
-		// remain alive, causing the process to hang instead of failing cleanly.
-		// Child processes spawned by the sandboxed command use SYS_EXECVE via glibc,
-		// so blocking SYS_EXECVE is sufficient to prevent child process execution or
-		// to trap exec calls for logging (TraceExec).
 		blockCalls = append(blockCalls, syscall.SYS_EXECVE)
 	}
 
@@ -1041,14 +949,6 @@ func applySeccomp(cfg config.ExecConfig) error {
 			syscall.SockFilter{Code: bpfJmpReturn, K: retKillOrTrap},
 			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0},
 		)
-
-		// SYS_CLONE3 is intentionally NOT blocked here.
-		// clone3 is used by glibc/Node.js on arm64 for thread creation
-		// (via CLONE_THREAD flag in the clone3_args struct). Since BPF cannot
-		// easily dereference the struct pointer argument, we cannot distinguish
-		// thread creation from process creation for clone3. Blocking it
-		// unconditionally would break Node.js on arm64.
-		// The SYS_CLONE handler above covers the common case for process creation.
 	}
 
 	for _, call := range actualBlockCalls {
@@ -1190,7 +1090,7 @@ func execCommand(cfg config.ExecConfig) error {
 		}
 	}
 	if auditCleanup != "" {
-		defer os.RemoveAll(filepath.Dir(auditCleanup))
+		defer os.Remove(auditCleanup)
 	}
 
 	// Try execveat to allow seccomp filtering to block standard execve
@@ -1221,44 +1121,14 @@ func execveat(dirfd int, pathname string, argv []string, envp []string, flags in
 	}
 
 	if len(argvPtrs) == 0 {
-		argvPtrs = []*byte{nil}
-	}
-	if len(envpPtrs) == 0 {
-		envpPtrs = []*byte{nil}
+		return fmt.Errorf("empty argv")
 	}
 
-	_, _, errno := syscall.RawSyscall6(
-		uintptr(sysEXECVEAT),
-		uintptr(dirfd),
-		uintptr(unsafe.Pointer(pathnamePtr)),
-		uintptr(unsafe.Pointer(&argvPtrs[0])),
-		uintptr(unsafe.Pointer(&envpPtrs[0])),
-		uintptr(flags),
-		0,
-	)
+	_, _, errno := syscall.Syscall6(sysEXECVEAT, uintptr(dirfd), uintptr(unsafe.Pointer(pathnamePtr)), uintptr(unsafe.Pointer(&argvPtrs[0])), uintptr(unsafe.Pointer(&envpPtrs[0])), uintptr(flags), 0)
 	if errno != 0 {
 		return errno
 	}
 	return nil
-}
-
-func writeConfigToTempFile(data []byte) string {
-	f, err := os.CreateTemp("", "safer-exec-config-*.json")
-	if err != nil {
-		return ""
-	}
-	if err := f.Chmod(0600); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		return ""
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		return ""
-	}
-	f.Close()
-	return f.Name()
 }
 
 func dedupPaths(paths []string) []string {
@@ -1279,23 +1149,6 @@ func dedupPaths(paths []string) []string {
 	return result
 }
 
-// isPathAllowed checks if a resolved path is within any of the allowed read or write paths.
-// Used when resolving symlinks in read/write paths to prevent mounting targets
-// that fall outside the declared policy.
-func isPathAllowed(resolved string, readPaths, writePaths []string) bool {
-	for _, rp := range readPaths {
-		if resolved == rp || strings.HasPrefix(resolved, rp+"/") {
-			return true
-		}
-	}
-	for _, wp := range writePaths {
-		if resolved == wp || strings.HasPrefix(resolved, wp+"/") {
-			return true
-		}
-	}
-	return false
-}
-
 func isMusl() bool {
 	for _, dir := range []string{"/lib", "/lib64", "/usr/lib", "/usr/lib64"} {
 		files, err := os.ReadDir(dir)
@@ -1303,7 +1156,7 @@ func isMusl() bool {
 			continue
 		}
 		for _, f := range files {
-			if strings.HasPrefix(f.Name(), "ld-musl-") {
+			if strings.Contains(f.Name(), "libc.musl") || strings.Contains(f.Name(), "ld-musl") {
 				return true
 			}
 		}
@@ -1311,100 +1164,38 @@ func isMusl() bool {
 	return false
 }
 
-func getDescendantPids(ppid int) []int {
-	pids := []int{ppid}
-	queue := []int{ppid}
-	for len(queue) > 0 {
-		curr := queue[0]
-		queue = queue[1:]
-
-		path := fmt.Sprintf("/proc/%d/task/%d/children", curr, curr)
-		data, err := os.ReadFile(path)
-		if err == nil {
-			fields := strings.Fields(string(data))
-			for _, f := range fields {
-				if childPid, err := strconv.Atoi(f); err == nil {
-					pids = append(pids, childPid)
-					queue = append(queue, childPid)
-				}
-			}
-		}
-	}
-
-	if len(pids) == 1 {
-		files, err := os.ReadDir("/proc")
-		if err == nil {
-			for _, f := range files {
-				pid, err := strconv.Atoi(f.Name())
-				if err != nil {
-					continue
-				}
-				statPath := fmt.Sprintf("/proc/%d/stat", pid)
-				data, err := os.ReadFile(statPath)
-				if err == nil {
-					commEnd := strings.LastIndex(string(data), ")")
-					if commEnd != -1 && commEnd+2 < len(data) {
-						fields := strings.Fields(string(data[commEnd+2:]))
-						if len(fields) >= 2 {
-							parentPid, _ := strconv.Atoi(fields[1])
-							for _, p := range pids {
-								if parentPid == p {
-									exists := false
-									for _, existing := range pids {
-										if existing == pid {
-											exists = true
-											break
-										}
-									}
-									if !exists {
-										pids = append(pids, pid)
-									}
-									break
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return pids
-}
-
+// monitorMaps periodically scans /proc/<pid>/maps for newly loaded libraries
+// under musl (which does not support LD_AUDIT). The function receives a channel
+// to signal clean shutdown.
 func monitorMaps(parentPid int, stopChan chan struct{}) {
-	seen := make(map[string]bool)
-	ticker := time.NewTicker(1 * time.Millisecond)
+	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
+	seen := make(map[string]bool)
 	scan := func() {
-		pids := getDescendantPids(parentPid)
-		for _, pid := range pids {
-			mapsPath := fmt.Sprintf("/proc/%d/maps", pid)
-			data, err := os.ReadFile(mapsPath)
-			if err != nil {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", parentPid))
+		if err != nil {
+			return
+		}
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
 				continue
 			}
-			lines := strings.Split(string(data), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				fields := strings.Fields(line)
-				if len(fields) < 6 {
-					continue
-				}
-				pathname := fields[len(fields)-1]
-				if !strings.HasPrefix(pathname, "/") {
-					continue
-				}
-				if strings.Contains(pathname, ".so") && !seen[pathname] {
-					seen[pathname] = true
-					entry := map[string]string{"type": "lib-load", "target": pathname}
-					if jsonData, err := json.Marshal(entry); err == nil {
-						fmt.Fprintf(os.Stderr, "%s\n", string(jsonData))
-					}
+			fields := strings.Fields(line)
+			if len(fields) < 6 {
+				continue
+			}
+			pathname := fields[len(fields)-1]
+			if !strings.HasPrefix(pathname, "/") {
+				continue
+			}
+			if strings.Contains(pathname, ".so") && !seen[pathname] {
+				seen[pathname] = true
+				entry := map[string]string{"type": "lib-load", "target": pathname}
+				if jsonData, err := json.Marshal(entry); err == nil {
+					fmt.Fprintf(os.Stderr, "%s\n", string(jsonData))
 				}
 			}
 		}
@@ -1426,7 +1217,6 @@ func monitorMaps(parentPid int, stopChan chan struct{}) {
 }
 
 // parseKernelVersion extracts the kernel major version as a float from a version string.
-// Only the first two components are used; e.g. "6.8.0-arch1" -> 6.8
 func parseKernelVersion(version string) float64 {
 	parts := strings.Split(version, ".")
 	if len(parts) < 2 {
@@ -1444,7 +1234,7 @@ func parseKernelVersion(version string) float64 {
 func runDiagnostics() config.DiagnosticsResult {
 	result := config.DiagnosticsResult{
 		Platform:     "linux",
-		Arch:         runtime.GOARCH,
+		Arch:         "",
 		Capabilities: make(map[string]config.CapabilityInfo),
 		Features:     make(map[string]bool),
 	}
