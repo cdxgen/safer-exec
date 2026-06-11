@@ -153,7 +153,11 @@ export async function run(config, options = {}) {
   const configJson = JSON.stringify(config);
 
   // Write config to stdin
-  child.stdin.write(configJson);
+  if (configJson === undefined) {
+    child.stdin.write('{}');
+  } else {
+    child.stdin.write(configJson);
+  }
   child.stdin.end();
 
   // Set up timeout
@@ -456,7 +460,11 @@ export async function runPipe(config, options = {}) {
   });
 
   const configJson = JSON.stringify(config);
-  child.stdin.write(configJson);
+  if (configJson === undefined) {
+    child.stdin.write('{}');
+  } else {
+    child.stdin.write(configJson);
+  }
   child.stdin.end();
 
   // Forward stdout and stderr streams directly in real-time

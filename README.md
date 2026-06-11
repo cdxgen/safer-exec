@@ -829,7 +829,7 @@ Verify the profile is loaded with `safer-exec diagnostics` — look for "AppArmo
 
 ### Landlock Filesystem Rules
 
-In addition to Landlock network confinement, v0.9.1 adds Landlock filesystem access rules as a defense-in-depth layer. Read and write paths declared in the policy are enforced at the kernel level, catching symlink escapes and missed bind-mount paths. Requires Landlock ABI v3+ (Linux kernel >= 5.13).
+In addition to Landlock network confinement, Landlock filesystem access rules is used as a defense-in-depth layer. Read and write paths declared in the policy are enforced at the kernel level, catching symlink escapes and missed bind-mount paths. Requires Landlock ABI v3+ (Linux kernel >= 5.13).
 
 ### Cgroup v2 IO Limiting
 

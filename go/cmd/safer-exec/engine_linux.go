@@ -140,6 +140,38 @@ func run(cfg config.ExecConfig) error {
 		}
 	}
 
+	// Start eBPF HTTP URL tracer BEFORE the user namespace check so it works
+	// in both full and reduced isolation mode. Loading BPF takes ~10-50ms.
+	var httpTracer httptrace.Tracer
+	var httpEvents []config.HTTPAccessEntry
+	var stopPIDRefresh chan struct{}
+	if cfg.TraceHTTPURLs {
+		if tr, err2 := httptrace.New(); err2 == nil {
+			httpTracer = tr
+
+			// Resolve command path to attach static uprobes to target binary
+			var cmdPath string
+			if filepath.IsAbs(cfg.Cmd) {
+				cmdPath = cfg.Cmd
+			} else if cfg.WorkingDir != "" {
+				cmdPath = filepath.Join(cfg.WorkingDir, cfg.Cmd)
+				if _, err := os.Stat(cmdPath); err != nil {
+					cmdPath, _ = exec.LookPath(cfg.Cmd)
+				}
+			} else {
+				cmdPath, _ = exec.LookPath(cfg.Cmd)
+			}
+			if cmdPath == "" {
+				cmdPath = cfg.Cmd
+			}
+
+			_ = httpTracer.AttachStaticOpenSSL(cmdPath)
+			_ = httpTracer.AttachGoTLS(cmdPath)
+		} else {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: http-trace: %v\n", err2)
+		}
+	}
+
 	// Fall back to reduced isolation when user namespaces are blocked by kernel policy.
 	// Reduced mode skips mount/PID/network/UTS namespace isolation and filesystem pivot,
 	// but still applies seccomp-bpf syscall filtering and Landlock network confinement.
@@ -151,10 +183,13 @@ func run(cfg config.ExecConfig) error {
 			auditW.Close()
 		}
 		if cfg.Strict {
+			if httpTracer != nil {
+				httpTracer.Close()
+			}
 			return fmt.Errorf("user namespaces unavailable")
 		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: user namespaces unavailable — running with reduced isolation (seccomp + landlock only; no filesystem, PID, or network namespace isolation). Install the safer-exec AppArmor profile for full isolation. See README for details.\n")
-		return runReduced(cfg, cfgJSON, selfPath)
+		return runReduced(cfg, cfgJSON, selfPath, httpTracer, &httpEvents, &stopPIDRefresh)
 	}
 
 	// Use system unshare to create namespaces before Go starts
@@ -191,41 +226,6 @@ func run(cfg config.ExecConfig) error {
 
 	if cfg.WorkingDir != "" {
 		cmd.Dir = cfg.WorkingDir
-	}
-
-	// Start eBPF HTTP URL tracer BEFORE cmd.Start() so uprobes are attached
-	// before the child process can call SSL_write. Loading BPF takes ~10-50ms;
-	// doing it first ensures fast-starting commands (e.g. curl) are captured.
-	// A background goroutine refreshes the PID filter every 5ms after the
-	// process starts, covering the unshare → --init → target spawn chain.
-	var httpTracer httptrace.Tracer
-	var httpEvents []config.HTTPAccessEntry
-	var stopPIDRefresh chan struct{}
-	if cfg.TraceHTTPURLs {
-		if tr, err2 := httptrace.New(); err2 == nil {
-			httpTracer = tr
-
-			// Resolve command path to attach static uprobes to target binary
-			var cmdPath string
-			if filepath.IsAbs(cfg.Cmd) {
-				cmdPath = cfg.Cmd
-			} else if cfg.WorkingDir != "" {
-				cmdPath = filepath.Join(cfg.WorkingDir, cfg.Cmd)
-				if _, err := os.Stat(cmdPath); err != nil {
-					cmdPath, _ = exec.LookPath(cfg.Cmd)
-				}
-			} else {
-				cmdPath, _ = exec.LookPath(cfg.Cmd)
-			}
-			if cmdPath == "" {
-				cmdPath = cfg.Cmd
-			}
-
-			_ = httpTracer.AttachStaticOpenSSL(cmdPath)
-			_ = httpTracer.AttachGoTLS(cmdPath)
-		} else {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: http-trace: %v\n", err2)
-		}
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -441,7 +441,7 @@ func deduplicateHTTPAccess(entries []config.HTTPAccessEntry) []config.HTTPAccess
 // runReduced executes the target command with reduced isolation when user namespaces
 // are unavailable. It spawns self with --init-reduced, which applies seccomp-bpf and
 // Landlock network confinement without any namespace or filesystem isolation.
-func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string) error {
+func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTracer httptrace.Tracer, httpEvents *[]config.HTTPAccessEntry, stopPIDRefresh *chan struct{}) error {
 	// Filesystem diffing requires OverlayFS (mount namespace). Skip and warn.
 	if cfg.EnableDiff {
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: --diff requires mount namespace isolation; skipped in reduced isolation mode\n")
@@ -452,6 +452,9 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string) error {
 		var err error
 		auditR, auditW, err = os.Pipe()
 		if err != nil {
+			if httpTracer != nil {
+				httpTracer.Close()
+			}
 			return fmt.Errorf("creating audit pipe: %w", err)
 		}
 	}
@@ -483,6 +486,9 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string) error {
 		if auditR != nil {
 			auditR.Close()
 		}
+		if httpTracer != nil {
+			httpTracer.Close()
+		}
 		return fmt.Errorf("starting reduced sandbox: %w", err)
 	}
 
@@ -496,9 +502,57 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string) error {
 		go monitorMaps(cmd.Process.Pid, stopMonitor)
 	}
 
+	// Start eBPF PID refresh and event capture goroutines (reduced mode)
+	if httpTracer != nil {
+		rootPID := uint32(cmd.Process.Pid)
+		_ = httpTracer.AddPID(rootPID)
+		*stopPIDRefresh = make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(5 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				for p := range httptrace.PidDescendants(rootPID) {
+					_ = httpTracer.AddPID(p)
+				}
+				select {
+				case <-*stopPIDRefresh:
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+
+		go func() {
+			for ev := range httpTracer.Events() {
+				entry := config.HTTPAccessEntry{
+					Method:   ev.Method,
+					Host:     ev.Host,
+					Path:     ev.Path,
+					Protocol: ev.Protocol,
+					Port:     ev.Port,
+					Query:    ev.Query,
+					Body:     ev.Body,
+					Source:   ev.Source.String(),
+					PID:      ev.PID,
+				}
+				if cfg.EnableAudit {
+					logAuditHTTPEntry(entry)
+				}
+				*httpEvents = append(*httpEvents, entry)
+			}
+		}()
+	}
+
 	waitErr := cmd.Wait()
+	if stopPIDRefresh != nil && *stopPIDRefresh != nil {
+		close(*stopPIDRefresh)
+	}
 	if stopMonitor != nil {
 		close(stopMonitor)
+	}
+	if httpTracer != nil {
+		time.Sleep(100 * time.Millisecond)
+		httpTracer.Close()
 	}
 
 	if waitErr != nil {
