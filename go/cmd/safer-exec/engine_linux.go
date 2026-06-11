@@ -154,8 +154,18 @@ func run(cfg config.ExecConfig) error {
 	}
 	unshareArgs = append(unshareArgs, "--", selfPath, "--init")
 
+	// Write config to a temp file to avoid exposing secrets in /proc/self/environ.
+	// Falls back to env var if temp file cannot be created.
+	configPath, err := writeConfigToTempFile(cfgJSON)
+	var envVar string
+	if err == nil {
+		defer os.Remove(configPath)
+		envVar = fmt.Sprintf("SAFER_EXEC_CONFIG_PATH=%s", configPath)
+	} else {
+		envVar = fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON))
+	}
 	cmd := exec.Command("unshare", unshareArgs...)
-	cmd.Env = append(config.FilteredEnviron(), fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON)))
+	cmd.Env = append(config.FilteredEnviron(), envVar)
 	if cfg.EnableAudit {
 		cmd.Env = append(cmd.Env, "SAFER_EXEC_AUDIT_FD=3")
 	}
@@ -430,8 +440,18 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string) error {
 		}
 	}
 
+	// Write config to a temp file to avoid exposing secrets in /proc/self/environ.
+	// Falls back to env var if temp file cannot be created.
+	configPath, err := writeConfigToTempFile(cfgJSON)
+	var envVar string
+	if err == nil {
+		defer os.Remove(configPath)
+		envVar = fmt.Sprintf("SAFER_EXEC_CONFIG_PATH=%s", configPath)
+	} else {
+		envVar = fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON))
+	}
 	cmd := exec.Command(selfPath, "--init-reduced")
-	cmd.Env = append(config.FilteredEnviron(), fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON)))
+	cmd.Env = append(config.FilteredEnviron(), envVar)
 	if cfg.EnableAudit {
 		cmd.Env = append(cmd.Env, "SAFER_EXEC_AUDIT_FD=3")
 	}
@@ -460,13 +480,13 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string) error {
 		go monitorMaps(cmd.Process.Pid, stopMonitor)
 	}
 
-	err := cmd.Wait()
+	waitErr := cmd.Wait()
 	if stopMonitor != nil {
 		close(stopMonitor)
 	}
 
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			if auditR != nil {
 				collectAuditLog(auditR)
 			}
@@ -479,7 +499,7 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string) error {
 			}
 			return &ExitError{Code: code}
 		}
-		return fmt.Errorf("reduced sandbox: %w", err)
+		return fmt.Errorf("reduced sandbox: %w", waitErr)
 	}
 
 	if auditR != nil {
@@ -534,6 +554,9 @@ func collectAuditLog(r *os.File) {
 }
 
 func runInit(cfg config.ExecConfig) error {
+	// Clear audit FD env var to prevent child processes from discovering it
+	os.Unsetenv("SAFER_EXEC_AUDIT_FD")
+
 	// Bring up loopback interface if network is disabled but loopback is allowed (Bug #7)
 	if cfg.DisableNetwork && cfg.AllowLoopback {
 		cmd := exec.Command("ip", "link", "set", "lo", "up")
@@ -673,7 +696,7 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		return fmt.Errorf("mkdir temp root: %w", err)
 	}
 
-	if err := syscall.Mount("tmpfs", newRoot, "tmpfs", 0, "size=64m"); err != nil {
+	if err := syscall.Mount("tmpfs", newRoot, "tmpfs", syscall.MS_NODEV|syscall.MS_NOEXEC|syscall.MS_NOSUID, "size=64m"); err != nil {
 		return fmt.Errorf("mount tmpfs: %w", err)
 	}
 
@@ -682,10 +705,31 @@ func setupFilesystem(cfg config.ExecConfig) error {
 	}
 
 	for _, path := range cfg.ReadPaths {
+		if path == "/" {
+			continue
+		}
+		if path == "/" {
+			continue
+		}
 		target := filepath.Join(newRoot, path)
-		fi, err := os.Stat(path)
+		fi, err := os.Lstat(path)
 		if err != nil {
 			continue
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: cannot resolve symlink read path %s: %v\n", path, err)
+				continue
+			}
+			if !isPathAllowed(resolved, cfg.ReadPaths, cfg.WritePaths) {
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: symlink read path %s resolves to %s which is outside allowed paths, skipping\n", path, resolved)
+				continue
+			}
+			fi, err = os.Stat(resolved)
+			if err != nil {
+				continue
+			}
 		}
 
 		_, statErr := os.Stat(target)
@@ -702,24 +746,40 @@ func setupFilesystem(cfg config.ExecConfig) error {
 			}
 		}
 
-		if err == nil {
-			// Linux requires bind mount and read-only remount to be separate steps.
-			// Using MS_REC ensures sub-mounts (like /run/systemd) are included.
-			if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-				if cfg.Strict {
-					return fmt.Errorf("bind mount %s: %w", path, err)
-				}
-				fmt.Fprintf(os.Stderr, "safer-exec: warning: bind mount %s: %v\n", path, err)
-				continue
+		// Linux requires bind mount and read-only remount to be separate steps.
+		// Using MS_REC ensures sub-mounts (like /run/systemd) are included.
+		if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			if cfg.Strict {
+				return fmt.Errorf("bind mount %s: %w", path, err)
 			}
-			_ = syscall.Mount("", target, "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY, "")
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: bind mount %s: %v\n", path, err)
+			continue
 		}
+		_ = syscall.Mount("", target, "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY, "")
 	}
 	for _, path := range cfg.WritePaths {
+		if path == "/" {
+			continue
+		}
 		target := filepath.Join(newRoot, path)
-		fi, err := os.Stat(path)
+		fi, err := os.Lstat(path)
 		if err != nil {
 			continue
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: cannot resolve symlink write path %s: %v\n", path, err)
+				continue
+			}
+			if !isPathAllowed(resolved, cfg.ReadPaths, cfg.WritePaths) {
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: symlink write path %s resolves to %s which is outside allowed paths, skipping\n", path, resolved)
+				continue
+			}
+			fi, err = os.Stat(resolved)
+			if err != nil {
+				continue
+			}
 		}
 
 		_, statErr := os.Stat(target)
@@ -736,17 +796,15 @@ func setupFilesystem(cfg config.ExecConfig) error {
 			}
 		}
 
-		if err == nil {
-			if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-				if cfg.Strict {
-					return fmt.Errorf("bind mount %s: %w", path, err)
-				}
-				fmt.Fprintf(os.Stderr, "safer-exec: warning: bind mount %s: %v\n", path, err)
-				continue
+		if err := syscall.Mount(path, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			if cfg.Strict {
+				return fmt.Errorf("bind mount %s: %w", path, err)
 			}
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: bind mount %s: %v\n", path, err)
+			continue
 		}
 	}
-	return finalizeFilesystem(newRoot)
+	return finalizeFilesystem(newRoot, cfg)
 }
 
 func setupFilesystemDiff(cfg config.ExecConfig) error {
@@ -777,14 +835,17 @@ func setupFilesystemDiff(cfg config.ExecConfig) error {
 			return setupFilesystem(cfg) // Fallback
 		}
 	}
-	return finalizeFilesystem(newRoot)
+	return finalizeFilesystem(newRoot, cfg)
 }
 
-func finalizeFilesystem(newRoot string) error {
+func finalizeFilesystem(newRoot string, cfg config.ExecConfig) error {
 	putRoot := filepath.Join(newRoot, ".put")
 	_ = os.Mkdir(putRoot, 0o755)
 
 	if err := syscall.PivotRoot(newRoot, putRoot); err != nil {
+		if cfg.Strict {
+			return fmt.Errorf("pivot_root failed: %w", err)
+		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: pivot_root failed, falling back to chroot: %v\n", err)
 		_ = os.Chdir(newRoot)
 		_ = syscall.Chroot(".")
@@ -812,7 +873,7 @@ const (
 
 func applyLandlockNetwork(cfg config.ExecConfig) error {
 	// Prevent unit tests from accidentally poisoning the Go test runner.
-	if os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
+	if os.Getenv("SAFER_EXEC_CONFIG_PATH") == "" && os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
 		return nil
 	}
 
@@ -892,7 +953,7 @@ func resolveHosts(hosts []string) []string {
 func applySeccomp(cfg config.ExecConfig) error {
 	// Prevent unit tests from accidentally applying seccomp filters to the Go test runner process,
 	// which permanently poisons the OS thread and causes other tests to fail with EPERM or SIGSYS.
-	if os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
+	if os.Getenv("SAFER_EXEC_CONFIG_PATH") == "" && os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
 		return nil
 	}
 
@@ -1092,7 +1153,7 @@ func execCommand(cfg config.ExecConfig) error {
 		}
 	}
 	if auditCleanup != "" {
-		defer os.Remove(auditCleanup)
+		defer os.RemoveAll(filepath.Dir(auditCleanup))
 	}
 
 	// Try execveat to allow seccomp filtering to block standard execve
@@ -1131,6 +1192,42 @@ func execveat(dirfd int, pathname string, argv []string, envp []string, flags in
 		return errno
 	}
 	return nil
+}
+
+func writeConfigToTempFile(data []byte) (string, error) {
+	f, err := os.CreateTemp("", "safer-exec-config-*.json")
+	if err != nil {
+		return "", err
+	}
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+	f.Close()
+	return f.Name(), nil
+}
+
+// isPathAllowed checks if a resolved path is within any of the allowed read or write paths.
+// Used when resolving symlinks in read/write paths to prevent mounting targets
+// that fall outside the declared policy.
+func isPathAllowed(resolved string, readPaths, writePaths []string) bool {
+	for _, rp := range readPaths {
+		if resolved == rp || strings.HasPrefix(resolved, rp+"/") {
+			return true
+		}
+	}
+	for _, wp := range writePaths {
+		if resolved == wp || strings.HasPrefix(resolved, wp+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func dedupPaths(paths []string) []string {

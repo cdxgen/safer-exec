@@ -213,14 +213,14 @@ The Node.js layer handles policy resolution, DNS lookups, and config serializati
 **Linux path (full isolation):**
 
 1. Probe for user namespace availability; fall back to reduced mode if restricted
-2. Fork self with `--init` flag and config in `SAFER_EXEC_CONFIG` env var
+2. Fork self with `--init` flag and config via temp file path (`SAFER_EXEC_CONFIG_PATH`) or env var (`SAFER_EXEC_CONFIG`)
 3. Unshare namespaces (user, mount, PID, UTS, network)
 4. Map UID/GID to root inside the user namespace for mount privileges
 5. Create cgroup v2 hierarchy for resource quotas
 6. Mount tmpfs root, bind-mount read/write paths, mount proc and sysfs
-7. Apply Landlock v2 network confinement rules (only explicitly configured ports, no 1-1024 wildcard)
-8. Apply seccomp-bpf filter blocking ptrace, kcmp, unshare, mount, pivot_root, execveat (when TraceExec), clone3 (when BlockFork)
-9. `pivot_root` to the new filesystem tree (failure is a hard error)
+7. Apply Landlock v2 network confinement rules (well-known ports 1-1024 auto-allowed)
+8. Apply seccomp-bpf filter blocking ptrace, kcmp, unshare, mount, pivot_root
+9. `pivot_root` to the new filesystem tree (hard error with `--strict`; chroot fallback otherwise)
 10. `execve` the target command
 
 **Linux path (reduced isolation — user namespaces unavailable):**

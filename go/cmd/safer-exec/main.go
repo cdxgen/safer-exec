@@ -172,12 +172,25 @@ func readConfig() (config.ExecConfig, error) {
 }
 
 // initMain is called when the binary re-executes itself with --init.
-// It reads config from the SAFER_EXEC_CONFIG environment variable,
-// sets up namespaces, and executes the target command.
+// It reads config from the SAFER_EXEC_CONFIG_PATH environment variable
+// (or SAFER_EXEC_CONFIG as fallback), sets up namespaces, and executes
+// the target command.
 func initMain() {
-	cfgJSON := os.Getenv("SAFER_EXEC_CONFIG")
+	cfgPath := os.Getenv("SAFER_EXEC_CONFIG_PATH")
+	var cfgJSON string
+	if cfgPath != "" {
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: init config read: %v\n", err)
+			os.Exit(1)
+		}
+		cfgJSON = string(data)
+		os.Remove(cfgPath)
+	} else {
+		cfgJSON = os.Getenv("SAFER_EXEC_CONFIG")
+	}
 	if cfgJSON == "" {
-		fmt.Fprintln(os.Stderr, "safer-exec: SAFER_EXEC_CONFIG not set")
+		fmt.Fprintln(os.Stderr, "safer-exec: init config not set")
 		os.Exit(1)
 	}
 
@@ -197,9 +210,21 @@ func initMain() {
 // It applies only seccomp-bpf and Landlock (no namespace or filesystem isolation)
 // and executes the target command directly.
 func initReducedMain() {
-	cfgJSON := os.Getenv("SAFER_EXEC_CONFIG")
+	cfgPath := os.Getenv("SAFER_EXEC_CONFIG_PATH")
+	var cfgJSON string
+	if cfgPath != "" {
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: init-reduced config read: %v\n", err)
+			os.Exit(1)
+		}
+		cfgJSON = string(data)
+		os.Remove(cfgPath)
+	} else {
+		cfgJSON = os.Getenv("SAFER_EXEC_CONFIG")
+	}
 	if cfgJSON == "" {
-		fmt.Fprintln(os.Stderr, "safer-exec: SAFER_EXEC_CONFIG not set")
+		fmt.Fprintln(os.Stderr, "safer-exec: init-reduced config not set")
 		os.Exit(1)
 	}
 

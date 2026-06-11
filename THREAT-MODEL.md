@@ -68,17 +68,17 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 ### Linux (Namespaces + Seccomp + Landlock + cgroup v2)
 
-| Mechanism         | What it enforces       | How                                                                                                                    |
-| ----------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| User namespace    | UID isolation          | `CLONE_NEWUSER` + `/proc/self` UID/GID mapping                                                                         |
-| Mount namespace   | Filesystem isolation   | `CLONE_NEWNS` + tmpfs root + bind mounts                                                                               |
-| PID namespace     | Process tree isolation | `CLONE_NEWPID`                                                                                                         |
-| UTS namespace     | Hostname isolation     | `CLONE_NEWUTS`                                                                                                         |
-| Network namespace | Network isolation      | `CLONE_NEWNET` (when `disableNetwork` is true)                                                                         |
-| pivot_root        | Root filesystem swap   | Mounts tmpfs, bind-mounts paths, pivots                                                                                |
-| Seccomp-bpf       | Syscall filtering      | Blocks ptrace, kcmp, unshare, mount, pivot_root, syscall, execveat (when TraceExec/BlockExec), clone3 (when BlockFork) |
-| Landlock v2       | Network port filtering | Ruleset version 5 (kernel 6.2+) for TCP connect/bind                                                                   |
-| cgroup v2         | Resource quotas        | `cpu.max`, `memory.max`, `pids.max`                                                                                    |
+| Mechanism         | What it enforces       | How                                                  |
+| ----------------- | ---------------------- | ---------------------------------------------------- |
+| User namespace    | UID isolation          | `CLONE_NEWUSER` + `/proc/self` UID/GID mapping       |
+| Mount namespace   | Filesystem isolation   | `CLONE_NEWNS` + tmpfs root + bind mounts             |
+| PID namespace     | Process tree isolation | `CLONE_NEWPID`                                       |
+| UTS namespace     | Hostname isolation     | `CLONE_NEWUTS`                                       |
+| Network namespace | Network isolation      | `CLONE_NEWNET` (when `disableNetwork` is true)       |
+| pivot_root        | Root filesystem swap   | Mounts tmpfs, bind-mounts paths, pivots              |
+| Seccomp-bpf       | Syscall filtering      | Blocks ptrace, kcmp, unshare, mount, pivot_root      |
+| Landlock v2       | Network port filtering | Ruleset version 5 (kernel 6.2+) for TCP connect/bind |
+| cgroup v2         | Resource quotas        | `cpu.max`, `memory.max`, `pids.max`                  |
 
 ## 3. Threats and Attack Vectors
 
@@ -116,7 +116,7 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **How isolation works:**
 
-- **Linux:** A new network namespace is created when `disableNetwork` is true. Landlock v2 rules restrict TCP connections to explicitly configured ports (defaults: 80, 443). No wildcard range for privileged ports.
+- **Linux:** A new network namespace is created when `disableNetwork` is true. Landlock v2 rules restrict TCP connections to explicitly configured ports plus well-known ports (1-1024).
 - **macOS:** Seatbelt rules allow outbound connections. Port filtering uses `remote ip "*:PORT"` patterns.
 
 **Residual risk:**
@@ -174,7 +174,7 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **Impact:** The target can perform syscalls not typically needed but does not affect isolation quality.
 
-**Blocked syscalls:** ptrace, kcmp, unshare, mount, pivot_root, syscall (meta-syscall). When `blockFork` is set: clone, fork, vfork, clone3. When `traceExec` or blockExec wildcard is set: execve, execveat.
+**Blocked syscalls:** ptrace, kcmp, unshare, mount, pivot_root, syscall (meta-syscall). When `blockFork` is set: clone (except CLONE_THREAD), fork, vfork. When `traceExec` or blockExec wildcard is set: execve.
 
 **What is not blocked:** All other syscalls including read, write, openat, stat, fstat, lstat, access, connect, socket, recvfrom, sendto, etc.
 
@@ -191,7 +191,7 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 **How isolation works:**
 
 - **macOS:** Seatbelt rules restrict `process-exec` to specified binaries. The `blockFork` flag removes the `process-fork` allow rule. The `traceExec` flag adds `(trace process-exec "*")` to log all child processes.
-- **Linux:** Seccomp-bpf filters block `clone` (0/3), `fork` (0/1), `vfork` (0/5), and `execve` (0/32) syscalls for x86_64. The `allowExec` flag filters by executable name. The `blockExec` flag blocks specific binaries.
+- **Linux:** Seccomp-bpf filters block `fork`, `vfork`, and `execve` syscalls. The `clone` syscall is handled with a flag check to allow thread creation (CLONE_THREAD) while blocking process forks. The `allowExec` flag filters by executable name. The `blockExec` flag blocks specific binaries.
 
 **Residual risk:**
 
