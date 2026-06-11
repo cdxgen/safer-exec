@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -167,6 +168,40 @@ func run(cfg config.ExecConfig) error {
 
 			_ = httpTracer.AttachStaticOpenSSL(cmdPath)
 			_ = httpTracer.AttachGoTLS(cmdPath)
+
+			// For script-based commands (npm, pip, etc.), also try to attach
+			// uprobes to the interpreter binary (node, python, etc.) since the
+			// script itself won't contain the SSL symbols.
+			if cmdPath != "" {
+				// Try reading shebang to find the interpreter
+				if data, err := os.ReadFile(cmdPath); err == nil && len(data) > 2 && data[0] == '#' && data[1] == '!' {
+					shebang := string(data[:bytes.IndexByte(data, '\n')])
+					parts := strings.Fields(shebang[2:])
+					if len(parts) > 0 {
+						interp := parts[0]
+						// Handle /usr/bin/env python → python case
+						if strings.HasSuffix(interp, "/env") && len(parts) > 1 {
+							interp = parts[1]
+						}
+						if interpPath, err := exec.LookPath(interp); err == nil {
+							_ = httpTracer.AttachStaticOpenSSL(interpPath)
+							_ = httpTracer.AttachGoTLS(interpPath)
+						}
+					}
+				}
+				// Also try common interpreter binary names for well-known package managers
+				base := filepath.Base(cmdPath)
+				switch base {
+				case "npm", "npx", "yarn", "pnpm", "corepack":
+					if nodePath, err := exec.LookPath("node"); err == nil {
+						_ = httpTracer.AttachStaticOpenSSL(nodePath)
+					}
+				case "pip", "pip3", "pipenv", "poetry":
+					if pythonPath, err := exec.LookPath("python3"); err == nil {
+						_ = httpTracer.AttachStaticOpenSSL(pythonPath)
+					}
+				}
+			}
 		} else {
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: http-trace: %v\n", err2)
 		}
@@ -295,11 +330,6 @@ func run(cfg config.ExecConfig) error {
 	if stopMonitor != nil {
 		close(stopMonitor)
 	}
-	if httpTracer != nil {
-		// Allow ring buffer drain goroutine to flush remaining events before close.
-		time.Sleep(100 * time.Millisecond)
-		httpTracer.Close()
-	}
 
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -307,7 +337,25 @@ func run(cfg config.ExecConfig) error {
 				collectAuditLog(auditR)
 			}
 			code := exitErr.ExitCode()
+			if code == 126 || code == 127 {
+				// unshare failed to execute the binary (126) or command not found (127).
+				// This can happen on systems where user+mount namespaces block exec
+				// (e.g. OrbStack VMs, certain container runtimes). Fall back to
+				// reduced isolation mode instead of failing.
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: unshare namespace exec failed (exit %d) — falling back to reduced isolation mode\n", code)
+				// Clean up the audit pipe created for this attempt; runReduced creates its own.
+				if auditR != nil {
+					auditR.Close()
+				}
+				// Do NOT close httpTracer here — pass it to runReduced so HTTP tracing
+				// continues working in reduced isolation mode.
+				return runReduced(cfg, cfgJSON, selfPath, httpTracer, &httpEvents, &stopPIDRefresh)
+			}
 			if code == 132 || code == 137 || code == 153 {
+				if httpTracer != nil {
+					time.Sleep(100 * time.Millisecond)
+					httpTracer.Close()
+				}
 				// Output diff even if killed by limits
 				if cfg.EnableDiff && beforeSnap != nil {
 					if afterSnap, err := fsdiff.SnapshotPath(cfg.WritePaths...); err == nil {
@@ -319,10 +367,18 @@ func run(cfg config.ExecConfig) error {
 				}
 				return nil
 			}
+			if httpTracer != nil {
+				time.Sleep(100 * time.Millisecond)
+				httpTracer.Close()
+			}
 			if code == -1 {
 				fmt.Fprintf(os.Stderr, "safer-exec: process killed by signal: %v\n", exitErr.ProcessState.String())
 			}
 			return &ExitError{Code: code}
+		}
+		if httpTracer != nil {
+			time.Sleep(100 * time.Millisecond)
+			httpTracer.Close()
 		}
 		return fmt.Errorf("running sandboxed process: %w", err)
 	}
@@ -339,6 +395,11 @@ func run(cfg config.ExecConfig) error {
 
 	if cfg.EnableAudit && auditR != nil {
 		collectAuditLog(auditR)
+	}
+
+	if httpTracer != nil {
+		time.Sleep(100 * time.Millisecond)
+		httpTracer.Close()
 	}
 
 	// Enforce AllowURLRules against captured HTTP events (Linux-only, requires TraceHTTPURLs).

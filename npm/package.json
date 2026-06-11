@@ -1,6 +1,6 @@
 {
   "name": "@cdxgen/safer-exec",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "type": "module",
   "main": "./src/index.js",
   "bin": {
@@ -42,10 +42,10 @@
   "description": "OS-level sandboxing with tracing, auditing, and learning mode for arbitrary binaries.",
   "homepage": "https://github.com/cdxgen/safer-exec#readme",
   "optionalDependencies": {
-    "@cdxgen/safer-exec-darwin-arm64": "0.9.2",
-    "@cdxgen/safer-exec-darwin-amd64": "0.9.2",
-    "@cdxgen/safer-exec-linux-amd64": "0.9.2",
-    "@cdxgen/safer-exec-linux-arm64": "0.9.2"
+    "@cdxgen/safer-exec-darwin-arm64": "0.9.3",
+    "@cdxgen/safer-exec-darwin-amd64": "0.9.3",
+    "@cdxgen/safer-exec-linux-amd64": "0.9.3",
+    "@cdxgen/safer-exec-linux-arm64": "0.9.3"
   },
   "engines": {
     "node": ">=20.0.0"

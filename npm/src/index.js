@@ -1351,7 +1351,7 @@ export class SaferExec extends EventEmitter {
       maxWriteBps: this._maxWriteBps,
       timeoutMs: this._timeoutMs,
       workingDir: this._workingDir,
-      enableAudit: this._enableAudit,
+      enableAudit: this._enableAudit || this._traceLibraries || this._traceHTTPURLs,
       enableDiff: this._enableDiff,
       enableLearn: this._enableLearn,
       allowExec: this._allowExec,
