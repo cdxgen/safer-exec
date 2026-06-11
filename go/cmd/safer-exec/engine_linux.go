@@ -166,41 +166,49 @@ func run(cfg config.ExecConfig) error {
 				cmdPath = cfg.Cmd
 			}
 
-			_ = httpTracer.AttachStaticOpenSSL(cmdPath)
-			_ = httpTracer.AttachGoTLS(cmdPath)
-
-			// For script-based commands (npm, pip, etc.), also try to attach
-			// uprobes to the interpreter binary (node, python, etc.) since the
-			// script itself won't contain the SSL symbols.
+			// Collect all candidate binary paths and deduplicate before
+			// attaching uprobes, to avoid attaching the same probe twice.
+			probeTargets := make(map[string]bool)
 			if cmdPath != "" {
-				// Try reading shebang to find the interpreter
+				probeTargets[cmdPath] = true
+
+				// Resolve shebang if the command is a script
 				if data, err := os.ReadFile(cmdPath); err == nil && len(data) > 2 && data[0] == '#' && data[1] == '!' {
 					shebang := string(data[:bytes.IndexByte(data, '\n')])
 					parts := strings.Fields(shebang[2:])
 					if len(parts) > 0 {
 						interp := parts[0]
-						// Handle /usr/bin/env python → python case
 						if strings.HasSuffix(interp, "/env") && len(parts) > 1 {
 							interp = parts[1]
 						}
 						if interpPath, err := exec.LookPath(interp); err == nil {
-							_ = httpTracer.AttachStaticOpenSSL(interpPath)
-							_ = httpTracer.AttachGoTLS(interpPath)
+							probeTargets[interpPath] = true
 						}
 					}
 				}
-				// Also try common interpreter binary names for well-known package managers
-				base := filepath.Base(cmdPath)
-				switch base {
+				// Add well-known interpreter paths for package managers
+				switch filepath.Base(cmdPath) {
 				case "npm", "npx", "yarn", "pnpm", "corepack":
 					if nodePath, err := exec.LookPath("node"); err == nil {
-						_ = httpTracer.AttachStaticOpenSSL(nodePath)
+						probeTargets[nodePath] = true
 					}
-				case "pip", "pip3", "pipenv", "poetry":
+				case "bun":
+					if bunPath, err := exec.LookPath("bun"); err == nil {
+						probeTargets[bunPath] = true
+					}
+				case "deno":
+					if denoPath, err := exec.LookPath("deno"); err == nil {
+						probeTargets[denoPath] = true
+					}
+				case "pip", "pip3", "pipenv", "poetry", "uv":
 					if pythonPath, err := exec.LookPath("python3"); err == nil {
-						_ = httpTracer.AttachStaticOpenSSL(pythonPath)
+						probeTargets[pythonPath] = true
 					}
 				}
+			}
+			for p := range probeTargets {
+				_ = httpTracer.AttachStaticOpenSSL(p)
+				_ = httpTracer.AttachGoTLS(p)
 			}
 		} else {
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: http-trace: %v\n", err2)
