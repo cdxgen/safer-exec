@@ -21,23 +21,25 @@ import (
 
 // Learner tracks filesystem and network behavior during command execution.
 type Learner struct {
-	readPaths  map[string]bool
-	writePaths map[string]bool
-	allowIPs   map[string]bool
-	allowHosts map[string]bool
-	allowPorts map[int]bool
-	envVars    map[string]bool
+	readPaths   map[string]bool
+	writePaths  map[string]bool
+	allowIPs    map[string]bool
+	allowHosts  map[string]bool
+	allowPorts  map[int]bool
+	allowListen map[string]bool
+	envVars     map[string]bool
 }
 
 // New creates a new Learner.
 func New() *Learner {
 	return &Learner{
-		readPaths:  make(map[string]bool),
-		writePaths: make(map[string]bool),
-		allowIPs:   make(map[string]bool),
-		allowHosts: make(map[string]bool),
-		allowPorts: make(map[int]bool),
-		envVars:    make(map[string]bool),
+		readPaths:   make(map[string]bool),
+		writePaths:  make(map[string]bool),
+		allowIPs:    make(map[string]bool),
+		allowHosts:  make(map[string]bool),
+		allowPorts:  make(map[int]bool),
+		allowListen: make(map[string]bool),
+		envVars:     make(map[string]bool),
 	}
 }
 
@@ -76,7 +78,7 @@ func (l *Learner) learnWithStrace(cfg config.ExecConfig, stracePath, cmd string,
 	tmpFile.Close()
 
 	straceArgs := []string{
-		"-e", "trace=openat,open,readlink,connect,sendto,recvfrom,stat,stat64,fstat,fstat64,lstat,lstat64,access",
+		"-e", "trace=openat,open,readlink,connect,bind,sendto,recvfrom,stat,stat64,fstat,fstat64,lstat,lstat64,access",
 		"-o", tmpFile.Name(),
 		cmd,
 	}
@@ -152,6 +154,19 @@ func (l *Learner) parseStraceLine(line string) {
 		}
 		if port := extractPort(line); port > 0 {
 			l.allowPorts[port] = true
+		}
+	}
+
+	// Extract network binds (listening)
+	if strings.Contains(line, "bind(") {
+		ip := extractIP(line)
+		port := extractPort(line)
+		if ip != "" {
+			if port > 0 {
+				l.allowListen[fmt.Sprintf("%s:%d", ip, port)] = true
+			} else {
+				l.allowListen[ip] = true
+			}
 		}
 	}
 }
@@ -234,14 +249,15 @@ func (l *Learner) mergeAndWrite(cfg config.ExecConfig, observed *config.PolicyFi
 func (l *Learner) buildPolicy(cmd string, args []string) *config.PolicyFile {
 	// Initialize all slices to empty arrays (not nil) so JSON serializes as [] not null
 	policy := &config.PolicyFile{
-		Cmd:        cmd,
-		Args:       args,
-		ReadPaths:  []string{},
-		WritePaths: []string{},
-		AllowHosts: []string{},
-		AllowIPs:   []string{},
-		AllowPorts: []int{},
-		EnvVars:    []string{},
+		Cmd:         cmd,
+		Args:        args,
+		ReadPaths:   []string{},
+		WritePaths:  []string{},
+		AllowHosts:  []string{},
+		AllowIPs:    []string{},
+		AllowPorts:  []int{},
+		AllowListen: []string{},
+		EnvVars:     []string{},
 	}
 
 	// Deduplicate paths to their common parent directories
@@ -270,6 +286,12 @@ func (l *Learner) buildPolicy(cmd string, args []string) *config.PolicyFile {
 		policy.AllowPorts = append(policy.AllowPorts, port)
 	}
 	sort.Ints(policy.AllowPorts)
+
+	// Listen
+	for item := range l.allowListen {
+		policy.AllowListen = append(policy.AllowListen, item)
+	}
+	sort.Strings(policy.AllowListen)
 
 	// Env vars
 	for v := range l.envVars {

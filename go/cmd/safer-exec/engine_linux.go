@@ -1403,39 +1403,66 @@ const (
 	landlockAccessFSTruncate   = 1 << 14
 )
 
+func getBindPortsAndWildcard(allowListen []string) ([]int, bool) {
+	var ports []int
+	hasWildcard := false
+	for _, item := range allowListen {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if item == "*" || !strings.Contains(item, ":") {
+			var p int
+			if _, err := fmt.Sscanf(item, "%d", &p); err == nil && p > 0 && p <= 65535 {
+				ports = append(ports, p)
+			} else {
+				hasWildcard = true
+			}
+		} else {
+			var portStr string
+			if strings.Contains(item, "]") {
+				parts := strings.Split(item, "]:")
+				if len(parts) == 2 {
+					portStr = parts[1]
+				}
+			} else {
+				parts := strings.Split(item, ":")
+				portStr = parts[len(parts)-1]
+			}
+			if portStr == "*" {
+				hasWildcard = true
+			} else {
+				var p int
+				if _, err := fmt.Sscanf(portStr, "%d", &p); err == nil && p > 0 && p <= 65535 {
+					ports = append(ports, p)
+				}
+			}
+		}
+	}
+	return ports, hasWildcard
+}
+
 func applyLandlockNetwork(cfg config.ExecConfig) error {
 	// Prevent unit tests from accidentally poisoning the Go test runner.
 	if os.Getenv("SAFER_EXEC_CONFIG_PATH") == "" && os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
 		return nil
 	}
 
-	// If loopback is allowed and network is disabled, CLONE_NEWNET isolates everything.
-	// We don't need Landlock to restrict loopback ports.
-	if cfg.DisableNetwork && cfg.AllowLoopback {
-		return nil
+	var handledAccess uint64 = 0
+
+	bindPorts, bindWildcard := getBindPortsAndWildcard(cfg.AllowListen)
+	restrictBind := !bindWildcard
+	if restrictBind {
+		handledAccess |= landlockAccessNetBindTCP
 	}
 
-	if len(cfg.AllowIPs) == 0 && len(cfg.AllowPorts) == 0 && len(cfg.AllowURLRules) == 0 && !cfg.DisableNetwork {
+	restrictConnect := len(cfg.AllowIPs) > 0 || len(cfg.AllowPorts) > 0 || len(cfg.AllowURLRules) > 0 || cfg.DisableNetwork
+	if restrictConnect {
+		handledAccess |= landlockAccessNetConnectTCP
+	}
+
+	if handledAccess == 0 {
 		return nil
-	}
-	ports := cfg.AllowPorts
-	// Extract ports declared in AllowURLRules so Landlock allows the necessary TCP ports.
-	for _, r := range cfg.AllowURLRules {
-		if r.Port > 0 {
-			found := false
-			for _, p := range ports {
-				if p == r.Port {
-					found = true
-					break
-				}
-			}
-			if !found {
-				ports = append(ports, r.Port)
-			}
-		}
-	}
-	if len(ports) == 0 {
-		ports = []int{80, 443}
 	}
 
 	abi, _, errno := syscall.RawSyscall(sysLandlockCreateRuleset, 0, 0, landlockCreateRulesetVersion)
@@ -1443,25 +1470,56 @@ func applyLandlockNetwork(cfg config.ExecConfig) error {
 		return nil
 	}
 
-	attr := landlockRulesetAttr{HandledAccessNet: landlockAccessNetBindTCP | landlockAccessNetConnectTCP}
+	attr := landlockRulesetAttr{HandledAccessNet: handledAccess}
 	rid, _, errno := syscall.RawSyscall(sysLandlockCreateRuleset, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr), 0)
 	if errno != 0 {
 		return nil
 	}
 	defer syscall.Close(int(rid))
 
-	allowedPorts := make(map[int]bool)
-	for _, p := range ports {
-		allowedPorts[p] = true
-	}
-	for p := 1; p <= 1024; p++ {
-		allowedPorts[p] = true
+	portAccess := make(map[int]uint64)
+
+	if restrictConnect {
+		connectPorts := cfg.AllowPorts
+		for _, r := range cfg.AllowURLRules {
+			if r.Port > 0 {
+				found := false
+				for _, p := range connectPorts {
+					if p == r.Port {
+						found = true
+						break
+					}
+				}
+				if !found {
+					connectPorts = append(connectPorts, r.Port)
+				}
+			}
+		}
+		if len(connectPorts) == 0 && !cfg.DisableNetwork {
+			connectPorts = []int{80, 443}
+		}
+		for _, p := range connectPorts {
+			portAccess[p] |= landlockAccessNetConnectTCP
+		}
+		for p := 1; p <= 1024; p++ {
+			portAccess[p] |= landlockAccessNetConnectTCP
+		}
 	}
 
-	for port := range allowedPorts {
-		ruleAttr := landlockNetPortAttr{AllowedAccess: landlockAccessNetBindTCP | landlockAccessNetConnectTCP, Port: uint64(port)}
-		syscall.Syscall6(sysLandlockAddRules, rid, uintptr(landlockRuleNetPort), uintptr(unsafe.Pointer(&ruleAttr)), 0, 0, 0)
+	if restrictBind {
+		for _, p := range bindPorts {
+			portAccess[p] |= landlockAccessNetBindTCP
+		}
 	}
+
+	for port, access := range portAccess {
+		access &= handledAccess
+		if access > 0 {
+			ruleAttr := landlockNetPortAttr{AllowedAccess: access, Port: uint64(port)}
+			syscall.Syscall6(sysLandlockAddRules, rid, uintptr(landlockRuleNetPort), uintptr(unsafe.Pointer(&ruleAttr)), 0, 0, 0)
+		}
+	}
+
 	syscall.RawSyscall(sysLandlockRestrictSelf, rid, 0, 0)
 	return nil
 }
@@ -1615,7 +1673,18 @@ func applySeccomp(cfg config.ExecConfig) error {
 	// PR_SET_NO_NEW_PRIVS = 38
 	syscall.Syscall6(syscall.SYS_PRCTL, 38, 1, 0, 0, 0, 0)
 
-	blockCalls := []int{syscall.SYS_PTRACE, sysKCMP, syscall.SYS_UNSHARE, syscall.SYS_MOUNT, syscall.SYS_PIVOT_ROOT, sysSYSCALL}
+	blockCalls := []int{
+		syscall.SYS_PTRACE, sysKCMP, syscall.SYS_UNSHARE, syscall.SYS_MOUNT, syscall.SYS_PIVOT_ROOT, sysSYSCALL,
+		// Block privilege elevation (sudo/user/group changes)
+		syscall.SYS_SETUID, syscall.SYS_SETGID, syscall.SYS_SETREUID, syscall.SYS_SETREGID,
+		syscall.SYS_SETRESUID, syscall.SYS_SETRESGID, syscall.SYS_SETFSUID, syscall.SYS_SETFSGID,
+		syscall.SYS_CAPSET,
+		// Block file capability changes (setcap)
+		syscall.SYS_SETXATTR, syscall.SYS_LSETXATTR, syscall.SYS_FSETXATTR,
+		syscall.SYS_REMOVEXATTR, syscall.SYS_LREMOVEXATTR, syscall.SYS_FREMOVEXATTR,
+		// Block eBPF, perf monitoring, tracepoints, userfaultfd, and kernel key manager
+		syscall.SYS_BPF, syscall.SYS_PERF_EVENT_OPEN, syscall.SYS_USERFAULTFD, syscall.SYS_KEYCTL,
+	}
 	if cfg.BlockFork {
 		// SYS_CLONE is handled separately below with a flag check to allow thread creation.
 		blockCalls = append(blockCalls, sysFORK, sysVFORK)

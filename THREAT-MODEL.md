@@ -250,6 +250,9 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 A new network namespace is created when `disableNetwork` is true. This prevents the sandboxed process from observing host network interfaces, listening sockets, or network connection state. When a new network namespace is active, explicit `allowHosts` / `allowPorts` configuration is required for outbound connectivity.
 
+**Network Port Listening Restriction:**
+By default, the sandboxed process is prevented from listening on any network port (including local loopback `lo`) on both macOS and Linux. Listening or binding to specific IP addresses or ports must be explicitly permitted using `allowListen` / `--allow-listen`.
+
 **macOS escape paths:**
 
 1. Fork child processes that read files (allowed, children inherit the Seatbelt profile).

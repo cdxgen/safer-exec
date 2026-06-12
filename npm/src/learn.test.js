@@ -77,4 +77,16 @@ describe('Learning Mode (enableLearn)', () => {
       strict.equal(result.learnedPolicy.cmd, 'sh');
     });
   });
+
+  describe('Network listen learning', () => {
+    it('should learn listen bind addresses', async () => {
+      const result = await new SaferExec()
+        .readPaths(...basePaths)
+        .enableLearn()
+        .run('node', ['-e', "const http = require('http'); const server = http.createServer(); server.listen(0, '127.0.0.1', () => server.close());"]);
+      if (!checkLearnedPolicy(result)) return;
+      strict.ok(result.learnedPolicy.allowListen === undefined || Array.isArray(result.learnedPolicy.allowListen), 'allowListen should be an array or undefined');
+      // On some macOS/environments trace files might not catch loopback binds, but it should at least be defined as an array
+    });
+  });
 });

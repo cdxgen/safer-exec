@@ -330,6 +330,9 @@ export class SaferExec extends EventEmitter {
     /** @type {boolean} Allow reading/writing hidden files and directories */
     this._allowHidden = options.allowHidden || false;
 
+    /** @type {string[]} IP addresses or ip:port strings allowed to bind/listen to */
+    this._allowListen = Array.isArray(options.allowListen) ? options.allowListen : [];
+
     /** @type {boolean} Allow cryptographic library and device access */
     this._allowCrypto = options.allowCrypto !== false;
 
@@ -508,6 +511,9 @@ export class SaferExec extends EventEmitter {
       if (basePolicy.env) {
         this._env = { ...basePolicy.env, ...this._env };
       }
+      if (Array.isArray(basePolicy.allowListen)) {
+        this._allowListen = [...new Set([...basePolicy.allowListen, ...this._allowListen])];
+      }
     }
 
     // Filesystem paths
@@ -533,6 +539,9 @@ export class SaferExec extends EventEmitter {
     }
     if (Array.isArray(raw.allowPorts) && raw.allowPorts.length > 0) {
       this.allowPorts(...raw.allowPorts);
+    }
+    if (Array.isArray(raw.allowListen) && raw.allowListen.length > 0) {
+      this.allowListen(raw.allowListen);
     }
 
     // Environment — prefer env map; fall back to envVars list
@@ -1133,6 +1142,21 @@ export class SaferExec extends EventEmitter {
   }
 
   /**
+   * Allow the sandboxed process to bind/listen to specific IP addresses or ip:port strings.
+   *
+   * @param {string|string[]} listenList - IP address or list of IP addresses / ip:port strings
+   * @returns {SaferExec} This instance for chaining
+   */
+  allowListen(listenList) {
+    if (Array.isArray(listenList)) {
+      this._allowListen.push(...listenList);
+    } else if (typeof listenList === 'string' && listenList) {
+      this._allowListen.push(listenList);
+    }
+    return this;
+  }
+
+  /**
    * Allow cryptographic library and entropy device access (default).
    *
    * @param {boolean} [allow=true] - Whether to allow crypto operations
@@ -1460,6 +1484,34 @@ export class SaferExec extends EventEmitter {
     effectiveReadPaths = Array.from(new Set(effectiveReadPaths));
     effectiveWritePaths = Array.from(new Set(effectiveWritePaths));
 
+    const effectiveBlockExec = [...this._blockExec];
+    try {
+      const { resolveBinaryPath } = await import('./runner.js');
+      const binPath = resolveBinaryPath();
+      if (binPath && !effectiveBlockExec.includes(binPath)) {
+        effectiveBlockExec.push(binPath);
+      }
+    } catch {}
+
+    const pathEnv = process.env.PATH || '';
+    const delimiter = process.platform === 'win32' ? ';' : ':';
+    for (const p of pathEnv.split(delimiter)) {
+      if (!p) continue;
+      for (const name of ['safer-exec', 'safer-exec-rt']) {
+        try {
+          const fullPath = join(p, name);
+          if (existsSync(fullPath) && !effectiveBlockExec.includes(fullPath)) {
+            effectiveBlockExec.push(fullPath);
+          }
+        } catch {}
+      }
+    }
+    for (const name of ['safer-exec', 'safer-exec-rt']) {
+      if (!effectiveBlockExec.includes(name)) {
+        effectiveBlockExec.push(name);
+      }
+    }
+
     let executionCmd = cmd;
     if (this._resolveSymlinks) {
       try {
@@ -1503,7 +1555,7 @@ export class SaferExec extends EventEmitter {
       enableDiff: this._enableDiff,
       enableLearn: this._enableLearn,
       allowExec: this._allowExec,
-      blockExec: this._blockExec,
+      blockExec: effectiveBlockExec,
       blockFork: this._blockFork,
       traceExec: this._traceExec,
       dumpProfile: this._dumpProfile,
@@ -1528,6 +1580,7 @@ export class SaferExec extends EventEmitter {
       allowURLRules: this._allowURLRules,
       allowEnvs: this._allowEnvs,
       allowHidden: this._allowHidden,
+      allowListen: this._allowListen,
     };
 
     const effectiveTimeout = this._timeoutMs;

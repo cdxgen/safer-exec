@@ -105,6 +105,7 @@ Options:
   -s, --strict               Treat sandbox setup warnings as errors
       --allow-envs=<vars>     Comma-separated host env vars to pass through (always sanitized by default)
       --allow-hidden          Allow access to hidden files and directories (blocked by default)
+      --allow-listen=<list>   Comma-separated list of IP addresses or ip:port strings to allow listening on (blocked by default)
 
   -j, --json                 Output results as JSON
   -h, --help                 Show this help message
@@ -319,6 +320,10 @@ function parseCliArgs() {
       'allow-hidden': {
         type: 'boolean',
       },
+      'allow-listen': {
+        type: 'string',
+        multiple: true,
+      },
       json: {
         type: 'boolean',
         short: 'j',
@@ -498,6 +503,13 @@ function buildExec(values, cmd, args) {
   }
   if (values['allow-hidden']) {
     exec.allowHidden();
+  }
+  if (values['allow-listen'] && values['allow-listen'].length > 0) {
+    const list = [];
+    for (const item of values['allow-listen']) {
+      list.push(...item.split(',').map(s => s.trim()).filter(Boolean));
+    }
+    exec.allowListen(list);
   }
 
   // Features

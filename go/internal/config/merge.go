@@ -57,6 +57,7 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	merged.AllowHosts = unionStrings(base.AllowHosts, observed.AllowHosts)
 	merged.AllowIPs = unionStrings(base.AllowIPs, observed.AllowIPs)
 	merged.AllowPorts = unionInts(base.AllowPorts, observed.AllowPorts)
+	merged.AllowListen = unionStrings(base.AllowListen, observed.AllowListen)
 	merged.AllowURLRules = mergeURLRules(base.AllowURLRules, observed.AllowURLRules)
 	merged.DisableNetwork = base.DisableNetwork || observed.DisableNetwork
 	merged.AllowLoopback = base.AllowLoopback || observed.AllowLoopback

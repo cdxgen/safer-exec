@@ -240,6 +240,33 @@ describe('SaferExec', () => {
     });
   });
 
+  describe('allowListen', () => {
+    it('should default to empty array', () => {
+      const exec = new SaferExec();
+      strict.deepEqual(exec._allowListen, []);
+    });
+
+    it('should be settable via constructor option', () => {
+      const exec = new SaferExec({ allowListen: ['127.0.0.1:8080'] });
+      strict.deepEqual(exec._allowListen, ['127.0.0.1:8080']);
+    });
+
+    it('should return this for chaining and support single strings or arrays', () => {
+      const exec = new SaferExec();
+      strict.equal(exec.allowListen('127.0.0.1:9090'), exec);
+      strict.deepEqual(exec._allowListen, ['127.0.0.1:9090']);
+
+      exec.allowListen(['10.0.0.1:80', '192.168.1.1']);
+      strict.deepEqual(exec._allowListen, ['127.0.0.1:9090', '10.0.0.1:80', '192.168.1.1']);
+    });
+
+    it('should include allowListen in _buildConfig output', async () => {
+      const exec = new SaferExec({ allowListen: ['127.0.0.1:8080'] });
+      const { config } = await exec._buildConfig('echo', ['test']);
+      strict.deepEqual(config.allowListen, ['127.0.0.1:8080']);
+    });
+  });
+
   describe('fluent API', () => {
     it('should chain methods returning this', () => {
       const exec = new SaferExec();
@@ -401,6 +428,13 @@ describe('SaferExec', () => {
         ['sh', 'bash'],
         'should deduplicate blockExec'
       );
+    });
+
+    it('should dynamically block sandbox execution itself in config', async () => {
+      const exec = new SaferExec();
+      const { config } = await exec._buildConfig('echo', ['test']);
+      strict.ok(config.blockExec.includes('safer-exec'), 'should include safer-exec');
+      strict.ok(config.blockExec.includes('safer-exec-rt'), 'should include safer-exec-rt');
     });
 
     it('should accept multiple hosts in a single allowHosts call', () => {

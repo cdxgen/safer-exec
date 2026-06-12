@@ -652,9 +652,17 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		resolvedIPs = append(resolvedIPs, resolveIPs(cfg.AllowHosts)...)
 	}
 
+	// Network binding / listening rules (blocked by default, even on loopback)
+	for _, listenStr := range cfg.AllowListen {
+		target := listenStr
+		if !strings.Contains(listenStr, ":") {
+			target = listenStr + ":*"
+		}
+		sb.WriteString(fmt.Sprintf("(allow network-bind (local ip %q))\n", target))
+		sb.WriteString(fmt.Sprintf("(allow network-inbound (local ip %q))\n", target))
+	}
+
 	if cfg.AllowLoopback {
-		sb.WriteString("(allow network-bind (local ip \"localhost:*\"))\n")
-		sb.WriteString("(allow network-inbound (local ip \"localhost:*\"))\n")
 		sb.WriteString("(allow network-outbound (remote ip \"localhost:*\"))\n")
 	}
 
