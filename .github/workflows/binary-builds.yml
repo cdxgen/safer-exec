@@ -235,13 +235,20 @@ jobs:
             suffix="-musl"
           fi
           bin_name="safer-exec-${{ matrix.os }}-${{ matrix.arch }}${suffix}"
+          rt_bin_name="safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }}${suffix}"
+          
+          # Copy the Go runtime engine binary
+          cp go/bin/safer-exec-rt "$rt_bin_name"
           
           if [[ "${{ matrix.os }}" == "darwin" ]]; then
             shasum -a 256 "$bin_name" > "${bin_name}.sha256"
+            shasum -a 256 "$rt_bin_name" > "${rt_bin_name}.sha256"
           else
             sha256sum "$bin_name" > "${bin_name}.sha256"
+            sha256sum "$rt_bin_name" > "${rt_bin_name}.sha256"
           fi
           cat "${bin_name}.sha256"
+          cat "${rt_bin_name}.sha256"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -249,6 +256,7 @@ jobs:
           name: safer-exec-standalone-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.libc }}
           path: |
             safer-exec-${{ matrix.os }}-${{ matrix.arch }}*
+            safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }}*
           if-no-files-found: error
 
       - name: Release standalone binary
@@ -257,3 +265,4 @@ jobs:
         with:
           files: |
             safer-exec-${{ matrix.os }}-${{ matrix.arch }}*
+            safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }}*
