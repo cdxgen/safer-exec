@@ -35,22 +35,38 @@ export async function resolveHost(hostname, options = {}) {
   }
 
   const results = [];
+  const retries = 3;
+
+  const runWithRetry = async (fn) => {
+    let lastErr;
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        if (i < retries - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      }
+    }
+    throw lastErr;
+  };
 
   // Resolve IPv4 addresses
   try {
-    const ipv4Addresses = await dns.resolve4(hostname);
+    const ipv4Addresses = await runWithRetry(() => dns.resolve4(hostname));
     results.push(...ipv4Addresses);
   } catch {
-    // Host might only have IPv6
+    // Host might only have IPv6 or resolve failed
   }
 
   // Resolve IPv6 addresses
   if (includeIpv6) {
     try {
-      const ipv6Addresses = await dns.resolve6(hostname);
+      const ipv6Addresses = await runWithRetry(() => dns.resolve6(hostname));
       results.push(...ipv6Addresses);
     } catch {
-      // Host might only have IPv4
+      // Host might only have IPv4 or resolve failed
     }
   }
 

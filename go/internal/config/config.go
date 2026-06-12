@@ -238,6 +238,32 @@ type ExecConfig struct {
 	// EnableAudit is true, and as httpAccess entries in --learn mode output.
 	TraceHTTPURLs bool `json:"traceHTTPURLs"`
 
+	// TraceCrypto, when true, attaches eBPF uprobes to TLS cipher negotiation
+	// functions (SSL_get_current_cipher, SSL_CIPHER_get_name for OpenSSL/BoringSSL;
+	// gnutls_cipher_suite_get_name for GnuTLS) and crypto operation functions
+	// (EVP_DigestInit, EVP_EncryptInit_ex, EVP_PKEY_sign for OpenSSL) to capture
+	// the negotiated TLS cipher suite per connection and crypto algorithm usage.
+	// Requires Linux kernel >= 5.8, CAP_BPF + CAP_PERFMON. Automatically enables
+	// TraceHTTPURLs if not already set.
+	// Captured cipher info is included in HTTPAccess entries, audit logs, and
+	// the learned policy.
+	TraceCrypto bool `json:"traceCrypto,omitempty"`
+
+	// AllowCiphers lists the allowed TLS cipher suite names (e.g. ["ECDHE-RSA-AES256-GCM-SHA384", "TLS_AES_256_GCM_SHA384"]).
+	// If TraceCrypto is active, any observed TLS negotiation using a cipher suite not in this list
+	// will trigger a cipher-violation audit entry. Empty or nil allows any cipher.
+	AllowCiphers []string `json:"allowCiphers,omitempty"`
+
+	// CBOMOutputPath, when set, writes a CycloneDX CBOM (Cryptography Bill of Materials)
+	// document to the specified file path. The document includes cryptographic-asset
+	// components for detected TLS ciphers, libraries, and crypto operations.
+	CBOMOutputPath string `json:"cbomOutputPath,omitempty"`
+
+	// CryptoProbeMode controls the depth of crypto tracing.
+	// "tls-only" (default) — capture only TLS cipher suites
+	// "operations" — also capture digest, encrypt, sign operations (higher overhead)
+	CryptoProbeMode string `json:"cryptoProbeMode,omitempty"`
+
 	// StructuredOutputPath, when non-empty, redirects all structured output
 	// (FSDIFF, LEARNED, PROFILE markers) to the specified file path instead
 	// of writing them to stdout. The file is written as newline-delimited
@@ -281,6 +307,100 @@ type HTTPAccessEntry struct {
 	Source string `json:"source"`
 	// PID is the host PID of the process that made the request.
 	PID uint32 `json:"pid,omitempty"`
+	// Cipher is the negotiated TLS cipher suite name (e.g. "ECDHE-RSA-AES256-GCM-SHA384").
+	// Populated when TraceCrypto is enabled.
+	Cipher string `json:"cipher,omitempty"`
+	// CipherIANAName is the IANA standard cipher suite name.
+	CipherIANAName string `json:"cipherIanaName,omitempty"`
+	// CipherIANAID is the IANA cipher suite ID.
+	CipherIANAID uint16 `json:"cipherIanaId,omitempty"`
+	// TLSVersion is the negotiated TLS protocol version.
+	TLSVersion string `json:"tlsVersion,omitempty"`
+	// CipherBits is the number of secret bits in the cipher.
+	CipherBits int `json:"cipherBits,omitempty"`
+	// CryptoLibrary is the name and version of the detected crypto library.
+	CryptoLibrary string `json:"cryptoLibrary,omitempty"`
+	// CryptoLibraryVersion is the detected version of the crypto library.
+	CryptoLibraryVersion string `json:"cryptoLibraryVersion,omitempty"`
+}
+
+// CipherInfo describes a single negotiated TLS cipher suite observed during
+// eBPF crypto tracing. Captured via uretprobes on SSL_get_current_cipher
+// and related functions.
+type CipherInfo struct {
+	// ConnID is the TLS connection identifier (SSL* pointer) — same value
+	// used in HTTPAccessEntry for cross-referencing HTTP requests to ciphers.
+	ConnID uint64 `json:"connId,omitempty"`
+	// Name is the human-readable cipher suite name (e.g. "ECDHE-RSA-AES256-GCM-SHA384").
+	Name string `json:"name"`
+	// IANAName is the IANA standard cipher suite name (e.g. "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384").
+	IANAName string `json:"ianaName,omitempty"`
+	// IANAID is the IANA cipher suite ID (e.g. 0xC02C).
+	IANAID uint16 `json:"ianaId,omitempty"`
+	// Protocol is the TLS protocol version (e.g. "TLSv1.2", "TLSv1.3").
+	Protocol string `json:"protocol,omitempty"`
+	// Bits is the number of secret bits in the cipher.
+	Bits int `json:"bits,omitempty"`
+	// KeyExchange is the key exchange algorithm (e.g. "ECDHE", "RSA").
+	KeyExchange string `json:"keyExchange,omitempty"`
+	// Authentication is the authentication algorithm (e.g. "RSA", "ECDSA").
+	Authentication string `json:"authentication,omitempty"`
+	// Encryption is the symmetric encryption algorithm (e.g. "AES", "CHACHA20").
+	Encryption string `json:"encryption,omitempty"`
+	// EncryptionBits is the symmetric cipher key size in bits.
+	EncryptionBits int `json:"encryptionBits,omitempty"`
+	// Hash is the hash/MAC algorithm (e.g. "SHA384", "SHA256").
+	Hash string `json:"hash,omitempty"`
+	// Mode is the cipher mode (e.g. "GCM", "POLY1305").
+	Mode string `json:"mode,omitempty"`
+	// Library is the crypto library that established this connection.
+	Library string `json:"library,omitempty"`
+	// LibraryVersion is the detected version of the crypto library.
+	LibraryVersion string `json:"libraryVersion,omitempty"`
+	// PID is the host PID of the process that negotiated this cipher.
+	PID uint32 `json:"pid,omitempty"`
+}
+
+// CryptoOperation describes a single cryptographic operation observed via
+// eBPF uprobes on OpenSSL/GnuTLS/Go crypto functions.
+type CryptoOperation struct {
+	// Type is the operation type: "digest", "encrypt", "decrypt", "sign", "verify", "keygen".
+	Type string `json:"type"`
+	// Algorithm is the algorithm name (e.g. "SHA-256", "AES-256-CBC", "RSA-2048").
+	Algorithm string `json:"algorithm"`
+	// Library is the crypto library that performed this operation.
+	Library string `json:"library,omitempty"`
+	// LibraryVersion is the detected version of the crypto library.
+	LibraryVersion string `json:"libraryVersion,omitempty"`
+	// PID is the host PID of the process that performed this operation.
+	PID uint32 `json:"pid,omitempty"`
+	// Count is the number of times this operation was observed (deduplicated).
+	Count uint64 `json:"count,omitempty"`
+}
+
+// CryptoLibrary describes a detected cryptographic library.
+type CryptoLibrary struct {
+	// Name is the library name (e.g. "OpenSSL", "GnuTLS", "Go crypto/tls").
+	Name string `json:"name"`
+	// Version is the detected version string (e.g. "3.0.8").
+	Version string `json:"version,omitempty"`
+	// Path is the absolute path to the shared library (e.g. "/usr/lib/x86_64-linux-gnu/libssl.so.3").
+	Path string `json:"path,omitempty"`
+	// Source indicates how the library was detected: "ebpf_uprobe", "proc_maps", "buildinfo", "symbol_table".
+	Source string `json:"source,omitempty"`
+}
+
+// CryptoResult is the structured output written as CRYPTO: marker.
+// It collects all cryptographic observations from a single execution.
+type CryptoResult struct {
+	// Ciphers is the list of negotiated TLS cipher suites observed.
+	Ciphers []CipherInfo `json:"ciphers,omitempty"`
+	// Libraries is the list of detected cryptographic libraries.
+	Libraries []CryptoLibrary `json:"libraries,omitempty"`
+	// Operations is the list of detected cryptographic operations (opt-in deep tracing).
+	Operations []CryptoOperation `json:"operations,omitempty"`
+	// Platform is the OS platform where observations were made.
+	Platform string `json:"platform,omitempty"`
 }
 
 // AuditEntry represents a single sandbox violation or event.
@@ -408,6 +528,15 @@ type PolicyFile struct {
 	// and applied during enforcement when TraceHTTPURLs is active.
 	AllowURLRules []AllowURLRule `json:"allowURLRules,omitempty"`
 
+	// Crypto ciphers, libraries, and operations — populated when --trace-crypto
+	// is used with --learn or --audit.
+	CryptoCiphers    []CipherInfo      `json:"cryptoCiphers,omitempty"`
+	CryptoLibraries  []CryptoLibrary   `json:"cryptoLibraries,omitempty"`
+	CryptoOperations []CryptoOperation `json:"cryptoOperations,omitempty"`
+
+	// AllowCiphers lists the allowed TLS cipher suite names.
+	AllowCiphers []string `json:"allowCiphers,omitempty"`
+
 	// Informational — set by learner, ignored when loading as policy-file
 	Cmd  string   `json:"cmd,omitempty"`
 	Args []string `json:"args,omitempty"`
@@ -456,6 +585,8 @@ type ExecResult struct {
 	FSDiff *FSDiff `json:"fsDiff,omitempty"`
 	// LearnedPolicy is the auto-generated policy (when EnableLearn is true).
 	LearnedPolicy *LearnedPolicy `json:"learnedPolicy,omitempty"`
+	// Crypto is the cryptographic observation report (when TraceCrypto is true).
+	Crypto *CryptoResult `json:"crypto,omitempty"`
 }
 
 // ProfileValidationResult is the output of --validate-profile mode.

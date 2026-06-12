@@ -118,6 +118,11 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	// HTTP access — union, deduplicated by (method, host, path) key.
 	merged.HTTPAccess = mergeHTTPAccess(base.HTTPAccess, observed.HTTPAccess)
 
+	// Crypto — union, deduplicated
+	merged.CryptoCiphers = mergeCiphers(base.CryptoCiphers, observed.CryptoCiphers)
+	merged.CryptoLibraries = mergeLibraries(base.CryptoLibraries, observed.CryptoLibraries)
+	merged.CryptoOperations = mergeCryptoOps(base.CryptoOperations, observed.CryptoOperations)
+
 	// Informational — observed (most recent run)
 	merged.Cmd = observed.Cmd
 	merged.Args = observed.Args
@@ -295,6 +300,70 @@ func mergeURLRules(a, b []AllowURLRule) []AllowURLRule {
 		sort.Strings(ms)
 		rule.Methods = ms
 		result[e.idx] = rule
+	}
+	return result
+}
+
+// mergeCiphers returns the union of two CipherInfo slices, deduplicated by (Name, IANAID).
+func mergeCiphers(a, b []CipherInfo) []CipherInfo {
+	type key struct {
+		name   string
+		ianaID uint16
+	}
+	seen := make(map[key]bool)
+	var result []CipherInfo
+	for _, c := range append(a, b...) {
+		k := key{c.Name, c.IANAID}
+		if !seen[k] {
+			seen[k] = true
+			result = append(result, c)
+		}
+	}
+	if result == nil {
+		result = []CipherInfo{}
+	}
+	return result
+}
+
+// mergeLibraries returns the union of two CryptoLibrary slices, deduplicated by (Name, Version).
+func mergeLibraries(a, b []CryptoLibrary) []CryptoLibrary {
+	type key struct {
+		name    string
+		version string
+	}
+	seen := make(map[key]bool)
+	var result []CryptoLibrary
+	for _, lib := range append(a, b...) {
+		k := key{lib.Name, lib.Version}
+		if !seen[k] {
+			seen[k] = true
+			result = append(result, lib)
+		}
+	}
+	if result == nil {
+		result = []CryptoLibrary{}
+	}
+	return result
+}
+
+// mergeCryptoOps returns the union of two CryptoOperation slices, deduplicated by (Type, Algorithm, Library).
+func mergeCryptoOps(a, b []CryptoOperation) []CryptoOperation {
+	type key struct {
+		opType    string
+		algorithm string
+		library   string
+	}
+	seen := make(map[key]bool)
+	var result []CryptoOperation
+	for _, op := range append(a, b...) {
+		k := key{op.Type, op.Algorithm, op.Library}
+		if !seen[k] {
+			seen[k] = true
+			result = append(result, op)
+		}
+	}
+	if result == nil {
+		result = []CryptoOperation{}
 	}
 	return result
 }

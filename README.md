@@ -78,91 +78,97 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 
 `new SaferExec(options?)`
 
-| Option               | Type       | Default         | Description                                                                                          |
-| -------------------- | ---------- | --------------- | ---------------------------------------------------------------------------------------------------- |
-| `allowHosts`         | `string[]` | `[]`            | Hostnames to allow network access to                                                                 |
-| `allowURLRules`      | `Object[]` | `[]`            | Fine-grained URL rules — exact, wildcard, regex, path, method (Linux only, requires `traceHTTPURLs`) |
-| `readPaths`          | `string[]` | `[]`            | Filesystem paths to read from                                                                        |
-| `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to                                                                         |
-| `env`                | `Object`   | `{}`            | Environment variables to set                                                                         |
-| `disableNetwork`     | `boolean`  | `false`         | Cut all network access                                                                               |
-| `maxMemoryMB`        | `number`   | `512`           | Memory limit in megabytes (default: 512)                                                             |
-| `maxCPUCores`        | `number`   | `1.0`           | CPU limit as fractional cores (default: 1.0)                                                         |
-| `maxProcesses`       | `number`   | `100`           | Max child processes — anti-fork bomb (default: 100)                                                  |
-| `maxReadIOPS`        | `number`   | `0`             | Max read IO operations per second — I/O bomb prevention (Linux only)                                 |
-| `maxWriteIOPS`       | `number`   | `0`             | Max write IO operations per second — I/O bomb prevention (Linux only)                                |
-| `maxReadBps`         | `number`   | `0`             | Max read bandwidth in bytes per second (Linux only)                                                  |
-| `maxWriteBps`        | `number`   | `0`             | Max write bandwidth in bytes per second (Linux only)                                                 |
-| `timeoutMs`          | `number`   | `60000`         | Hard kill timeout in milliseconds (default: 60000)                                                   |
-| `workingDir`         | `string`   | `process.cwd()` | Working directory                                                                                    |
-| `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                                                                              |
-| `enableAudit`        | `boolean`  | `false`         | Enable violation auditing                                                                            |
-| `allowPorts`         | `number[]` | `[]`            | TCP ports to allow                                                                                   |
-| `enableDiff`         | `boolean`  | `false`         | Enable filesystem mutation diffing                                                                   |
-| `enableLearn`        | `boolean`  | `false`         | Enable behavioral auto-profiling                                                                     |
-| `validateProfile`    | `boolean`  | `false`         | Validate Seatbelt profile syntax without executing (macOS only)                                      |
-| `allowExec`          | `string[]` | `[]`            | Executables the command is allowed to run                                                            |
-| `blockExec`          | `string[]` | `[]`            | Executables to block from running                                                                    |
-| `blockFork`          | `boolean`  | `false`         | Prevent forking new processes                                                                        |
-| `traceExec`          | `boolean`  | `false`         | Log every child process spawned                                                                      |
-| `strict`             | `boolean`  | `false`         | Treat sandbox setup warnings as errors                                                               |
-| `allowCrypto`        | `boolean`  | `true`          | Permit cryptographic library/device access                                                           |
-| `blockCrypto`        | `boolean`  | `false`         | Block system crypto libraries access                                                                 |
-| `blockCryptoEntropy` | `boolean`  | `false`         | Block entropy (/dev/random) device access                                                            |
-| `detectFIPS`         | `boolean`  | `false`         | Enable FIPS compliance checks/logging                                                                |
-| `strictFIPS`         | `boolean`  | `false`         | Force strict FIPS validation                                                                         |
-| `allowGPU`           | `boolean`  | `false`         | Permit process to utilize host GPU nodes                                                             |
-| `blockTPM`           | `boolean`  | `false`         | Restrict hardware access to TPM device                                                               |
-| `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks                                                           |
-| `traceLibraries`     | `boolean`  | `false`         | Track dynamic library loading (opt-in)                                                               |
-| `traceHTTPURLs`      | `boolean`  | `false`         | Capture HTTPS request URLs via eBPF uprobes (Linux only, requires CAP_BPF)                           |
-| `sanitizeEnv`        | `boolean`  | `false`         | Strip sensitive env vars (TOKEN, SECRET, etc.) before passing to sandbox                             |
+| Option               | Type       | Default         | Description                                                                                                                                      |
+| -------------------- | ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `allowHosts`         | `string[]` | `[]`            | Hostnames to allow network access to                                                                                                             |
+| `allowURLRules`      | `Object[]` | `[]`            | Fine-grained URL rules — exact, wildcard, regex, path, method (Linux only, requires `traceHTTPURLs`)                                             |
+| `readPaths`          | `string[]` | `[]`            | Filesystem paths to read from                                                                                                                    |
+| `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to                                                                                                                     |
+| `env`                | `Object`   | `{}`            | Environment variables to set                                                                                                                     |
+| `disableNetwork`     | `boolean`  | `false`         | Cut all network access                                                                                                                           |
+| `maxMemoryMB`        | `number`   | `512`           | Memory limit in megabytes (default: 512)                                                                                                         |
+| `maxCPUCores`        | `number`   | `1.0`           | CPU limit as fractional cores (default: 1.0)                                                                                                     |
+| `maxProcesses`       | `number`   | `100`           | Max child processes — anti-fork bomb (default: 100)                                                                                              |
+| `maxReadIOPS`        | `number`   | `0`             | Max read IO operations per second — I/O bomb prevention (Linux only)                                                                             |
+| `maxWriteIOPS`       | `number`   | `0`             | Max write IO operations per second — I/O bomb prevention (Linux only)                                                                            |
+| `maxReadBps`         | `number`   | `0`             | Max read bandwidth in bytes per second (Linux only)                                                                                              |
+| `maxWriteBps`        | `number`   | `0`             | Max write bandwidth in bytes per second (Linux only)                                                                                             |
+| `timeoutMs`          | `number`   | `60000`         | Hard kill timeout in milliseconds (default: 60000)                                                                                               |
+| `workingDir`         | `string`   | `process.cwd()` | Working directory                                                                                                                                |
+| `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                                                                                                                          |
+| `enableAudit`        | `boolean`  | `false`         | Enable violation auditing                                                                                                                        |
+| `allowPorts`         | `number[]` | `[]`            | TCP ports to allow                                                                                                                               |
+| `enableDiff`         | `boolean`  | `false`         | Enable filesystem mutation diffing                                                                                                               |
+| `enableLearn`        | `boolean`  | `false`         | Enable behavioral auto-profiling                                                                                                                 |
+| `validateProfile`    | `boolean`  | `false`         | Validate Seatbelt profile syntax without executing (macOS only)                                                                                  |
+| `allowExec`          | `string[]` | `[]`            | Executables the command is allowed to run                                                                                                        |
+| `blockExec`          | `string[]` | `[]`            | Executables to block from running                                                                                                                |
+| `blockFork`          | `boolean`  | `false`         | Prevent forking new processes                                                                                                                    |
+| `traceExec`          | `boolean`  | `false`         | Log every child process spawned                                                                                                                  |
+| `strict`             | `boolean`  | `false`         | Treat sandbox setup warnings as errors                                                                                                           |
+| `allowCrypto`        | `boolean`  | `true`          | Permit cryptographic library/device access                                                                                                       |
+| `blockCrypto`        | `boolean`  | `false`         | Block system crypto libraries access                                                                                                             |
+| `blockCryptoEntropy` | `boolean`  | `false`         | Block entropy (/dev/random) device access                                                                                                        |
+| `detectFIPS`         | `boolean`  | `false`         | Enable FIPS compliance checks/logging                                                                                                            |
+| `strictFIPS`         | `boolean`  | `false`         | Force strict FIPS validation                                                                                                                     |
+| `allowGPU`           | `boolean`  | `false`         | Permit process to utilize host GPU nodes                                                                                                         |
+| `blockTPM`           | `boolean`  | `false`         | Restrict hardware access to TPM device                                                                                                           |
+| `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks                                                                                                       |
+| `traceLibraries`     | `boolean`  | `false`         | Track dynamic library loading (opt-in)                                                                                                           |
+| `traceHTTPURLs`      | `boolean`  | `false`         | Capture HTTPS request URLs via eBPF uprobes (Linux only, requires CAP_BPF)                                                                       |
+| `sanitizeEnv`        | `boolean`  | `false`         | Strip sensitive env vars (TOKEN, SECRET, etc.) before passing to sandbox                                                                         |
+| `traceCrypto`        | `boolean`  | `false`         | Enable cryptographic tracing — cipher suites and library detection (Linux only, requires CAP_BPF). Auto-enables `traceHTTPURLs`.                 |
+| `cbomOutputPath`     | `string`   | `""`            | Write a CycloneDX CBOM JSON document to this path when `traceCrypto` is active                                                                   |
+| `cryptoProbeMode`    | `string`   | `"tls-only"`    | Crypto probe depth: `"tls-only"` (default) captures TLS ciphers; `"operations"` also captures digest, encrypt, sign operations (higher overhead) |
 
 ### Instance Methods
 
 All methods return `this` for chaining except `.run()`.
 
-| Method                  | Description                                                                                      |
-| ----------------------- | ------------------------------------------------------------------------------------------------ |
-| `.applyPolicy(name)`    | Apply a pre-defined policy. Throws if unknown.                                                   |
-| `.allowHosts(...hosts)` | Add hostnames to the network allow list                                                          |
-| `.allowUrls(...urls)`   | Add fine-grained URL rules — strings or `{host,protocol,path,methods,port}` objects (Linux only) |
-| `.readPaths(...paths)`  | Add filesystem read paths                                                                        |
-| `.writePaths(...paths)` | Add filesystem write paths                                                                       |
-| `.env(key, value)`      | Set an environment variable                                                                      |
-| `.disableNetwork()`     | Disable all network access                                                                       |
-| `.maxMemory(mb)`        | Set memory limit in megabytes                                                                    |
-| `.maxCPUCores(cores)`   | Set CPU limit as fractional cores (e.g. 0.5)                                                     |
-| `.maxProcesses(count)`  | Set maximum child process count                                                                  |
-| `.maxReadIOPS(iops)`    | Set max read IO operations per second (Linux only)                                               |
-| `.maxWriteIOPS(iops)`   | Set max write IO operations per second (Linux only)                                              |
-| `.maxReadBps(bps)`      | Set max read bytes per second (Linux only)                                                       |
-| `.maxWriteBps(bps)`     | Set max write bytes per second (Linux only)                                                      |
-| `.timeout(ms)`          | Set hard kill timeout in milliseconds                                                            |
-| `.binaryPath(path)`     | Override the Go binary path                                                                      |
-| `.workingDir(dir)`      | Set the working directory                                                                        |
-| `.enableAudit()`        | Enable sandbox violation auditing                                                                |
-| `.allowPorts(...ports)` | Set allowed TCP ports                                                                            |
-| `.enableDiff()`         | Enable filesystem mutation diffing                                                               |
-| `.enableLearn()`        | Enable behavioral auto-profiling                                                                 |
-| `.validateProfile()`    | Validate Seatbelt profile syntax without executing (macOS)                                       |
-| `.allowExec(...cmds)`   | Restrict which executables can run                                                               |
-| `.blockExec(...cmds)`   | Block specific executables from running                                                          |
-| `.blockFork()`          | Prevent the command from forking new processes                                                   |
-| `.traceExec()`          | Log every child process spawned                                                                  |
-| `.strict()`             | Treat sandbox setup warnings as hard errors                                                      |
-| `.resolveSymlinks()`    | Resolve target command symlink in PATH                                                           |
-| `.allowCrypto(allow)`   | Allow/disallow cryptographic operations                                                          |
-| `.blockCrypto()`        | Restrict system cryptographic libraries                                                          |
-| `.blockCryptoEntropy()` | Restrict entropy devices (/dev/random)                                                           |
-| `.detectFIPS()`         | Log and watch for FIPS lookups                                                                   |
-| `.strictFIPS()`         | Restrict runtime to strict FIPS compliant mode                                                   |
-| `.allowGPU(allow)`      | Allow/disallow access to host GPU nodes                                                          |
-| `.blockTPM()`           | Restrict hardware access to TPM device                                                           |
-| `.spoofAntiVM()`        | Intercept debugger & virtualization checks                                                       |
-| `.traceLibraries()`     | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS)                         |
-| `.traceHTTPURLs()`      | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)                             |
-| `.sanitizeEnv(val)`     | Strip sensitive env vars (TOKEN, SECRET, AUTH, etc.) before passing to sandbox                   |
+| Method                   | Description                                                                                                          |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| `.applyPolicy(name)`     | Apply a pre-defined policy. Throws if unknown.                                                                       |
+| `.allowHosts(...hosts)`  | Add hostnames to the network allow list                                                                              |
+| `.allowUrls(...urls)`    | Add fine-grained URL rules — strings or `{host,protocol,path,methods,port}` objects (Linux only)                     |
+| `.readPaths(...paths)`   | Add filesystem read paths                                                                                            |
+| `.writePaths(...paths)`  | Add filesystem write paths                                                                                           |
+| `.env(key, value)`       | Set an environment variable                                                                                          |
+| `.disableNetwork()`      | Disable all network access                                                                                           |
+| `.maxMemory(mb)`         | Set memory limit in megabytes                                                                                        |
+| `.maxCPUCores(cores)`    | Set CPU limit as fractional cores (e.g. 0.5)                                                                         |
+| `.maxProcesses(count)`   | Set maximum child process count                                                                                      |
+| `.maxReadIOPS(iops)`     | Set max read IO operations per second (Linux only)                                                                   |
+| `.maxWriteIOPS(iops)`    | Set max write IO operations per second (Linux only)                                                                  |
+| `.maxReadBps(bps)`       | Set max read bytes per second (Linux only)                                                                           |
+| `.maxWriteBps(bps)`      | Set max write bytes per second (Linux only)                                                                          |
+| `.timeout(ms)`           | Set hard kill timeout in milliseconds                                                                                |
+| `.binaryPath(path)`      | Override the Go binary path                                                                                          |
+| `.workingDir(dir)`       | Set the working directory                                                                                            |
+| `.enableAudit()`         | Enable sandbox violation auditing                                                                                    |
+| `.allowPorts(...ports)`  | Set allowed TCP ports                                                                                                |
+| `.enableDiff()`          | Enable filesystem mutation diffing                                                                                   |
+| `.enableLearn()`         | Enable behavioral auto-profiling                                                                                     |
+| `.validateProfile()`     | Validate Seatbelt profile syntax without executing (macOS)                                                           |
+| `.allowExec(...cmds)`    | Restrict which executables can run                                                                                   |
+| `.blockExec(...cmds)`    | Block specific executables from running                                                                              |
+| `.blockFork()`           | Prevent the command from forking new processes                                                                       |
+| `.traceExec()`           | Log every child process spawned                                                                                      |
+| `.strict()`              | Treat sandbox setup warnings as hard errors                                                                          |
+| `.resolveSymlinks()`     | Resolve target command symlink in PATH                                                                               |
+| `.allowCrypto(allow)`    | Allow/disallow cryptographic operations                                                                              |
+| `.blockCrypto()`         | Restrict system cryptographic libraries                                                                              |
+| `.blockCryptoEntropy()`  | Restrict entropy devices (/dev/random)                                                                               |
+| `.detectFIPS()`          | Log and watch for FIPS lookups                                                                                       |
+| `.strictFIPS()`          | Restrict runtime to strict FIPS compliant mode                                                                       |
+| `.allowGPU(allow)`       | Allow/disallow access to host GPU nodes                                                                              |
+| `.blockTPM()`            | Restrict hardware access to TPM device                                                                               |
+| `.spoofAntiVM()`         | Intercept debugger & virtualization checks                                                                           |
+| `.traceLibraries()`      | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS)                                             |
+| `.traceHTTPURLs()`       | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)                                                 |
+| `.sanitizeEnv(val)`      | Strip sensitive env vars (TOKEN, SECRET, AUTH, etc.) before passing to sandbox                                       |
+| `.traceCrypto()`         | Enable TLS cipher suite and crypto library detection via eBPF uprobes (Linux only). Auto-enables `.traceHTTPURLs()`. |
+| `.cbom(path)`            | Set the output path for the CycloneDX CBOM JSON document (requires `.traceCrypto()`)                                 |
+| `.cryptoProbeMode(mode)` | Set crypto probe depth: `"tls-only"` (default) or `"operations"` (also captures digest/sign ops)                     |
 
 ### Static Methods
 
@@ -351,7 +357,7 @@ sudo tee /etc/apparmor.d/safer-exec > /dev/null << 'EOF'
 abi <abi/4.0>,
 include <tunables/global>
 
-profile safer-exec /usr/local/bin/safer-exec flags=(unconfined) {
+profile safer-exec /usr/local/bin/safer-exec-rt flags=(unconfined) {
   userns,
 }
 EOF
@@ -359,14 +365,14 @@ EOF
 sudo apparmor_parser -r /etc/apparmor.d/safer-exec
 ```
 
-Adjust the path (`/usr/local/bin/safer-exec`) to wherever the binary is installed. When using the npm package, the binary lives inside `node_modules/@cdxgen/safer-exec-linux-*/bin/safer-exec` — you can use a glob pattern:
+Adjust the path (`/usr/local/bin/safer-exec-rt`) to wherever the binary is installed. When using the npm package, the binary lives inside `node_modules/@cdxgen/safer-exec-linux-*/bin/safer-exec-rt` — you can use a glob pattern:
 
 ```bash
 sudo tee /etc/apparmor.d/safer-exec > /dev/null << 'EOF'
 abi <abi/4.0>,
 include <tunables/global>
 
-profile safer-exec <path to>/node_modules/@cdxgen/safer-exec-linux-*/bin/safer-exec {
+profile safer-exec <path to>/node_modules/@cdxgen/safer-exec-linux-*/bin/safer-exec-rt {
   # Allow user namespaces
   userns,
   # Add other necessary rules (ix/px for child processes, file r/w, etc.)
@@ -383,13 +389,17 @@ The profile takes effect immediately (no reboot required). Verify with:
 sudo aa-status | grep safer-exec
 ```
 
-### Alternative 1: Elevate ONLY the SEA binary
+### Alternative 1: Elevate ONLY the Go Runtime binary
 
 ```
-sudo setcap 'cap_bpf,cap_perfmon,cap_sys_ptrace,cap_sys_admin+eip' /usr/local/bin/safer-exec
+sudo setcap 'cap_sys_resource,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_sys_admin+eip' /usr/local/bin/safer-exec-rt
 ```
 
-### Alternativ 2: system-wide sysctl (not recommended)
+> [!NOTE]
+> **Automatic Bootstrapping (CI/Root execution):**
+> If the Go runtime binary is missing from `/usr/local/bin/safer-exec-rt` and the process runs under root permissions (UID 0), the npm wrapper automatically copies/bootstraps the binary to `/usr/local/bin/safer-exec-rt` and executes `setcap` internally during the initial run to enable capability-sensitive tracing out of the box.
+
+### Alternative 2: system-wide sysctl (not recommended)
 
 If installing an AppArmor profile is not an option (e.g., in ephemeral CI environments), you can disable the restriction globally:
 
@@ -650,6 +660,202 @@ Each captured request emits a `{"type":"http-request","method":"...","host":"...
 | `ssl_write_uprobe` | OpenSSL / BoringSSL (`libssl.so`)      |
 | `go_tls_uprobe`    | Go built-in `crypto/tls` (Go binaries) |
 | `gnutls_uprobe`    | GnuTLS (`libgnutls.so`)                |
+
+Enable opt-in capture of TLS cipher suites and cryptographic library identities using eBPF uretprobes on OpenSSL/GnuTLS cipher negotiation functions. This is a superset of `--trace-http-urls` — enabling crypto tracing automatically enables URL tracing as well.
+
+### Unified Socket-Level Handshake & SNI Fallback Tracing
+
+To ensure robustness, `safer-exec` intercepts TCP socket handshakes at the socket level using kernel tracepoints (`sys_enter_connect`, `sys_enter_write`, `sys_enter_sendto`, etc.). It automatically parses TLS `ClientHello` (SNI) and `ServerHello` records from socket buffers to resolve hostnames and negotiated ciphers for statically-compiled languages (such as Go or Rust) that bypass dynamic library wrappers.
+
+### Cryptographic Operations Auditing (beyond TLS)
+
+When `cryptoProbeMode` is set to `"operations"`, `safer-exec` attaches uprobes to common system cryptography functions (such as OpenSSL `MD5_Init`, `SHA1_Init`, `SHA224_Init`, `SHA256_Init`, `SHA384_Init`, `SHA512_Init`, `AES_set_encrypt_key` and `AES_set_decrypt_key` or Go internal crypto routines `crypto/sha256.block`, `crypto/aes.encryptBlock`). This captures local, non-network cryptographic operations (hashing, symmetric encryption/decryption) and exports them in the CycloneDX Cryptography Bill of Materials (CBOM).
+
+### File and Execution Auditing via LSM BPF
+
+On kernels supporting Linux Security Modules (LSM) BPF (kernel ≥ 5.7), `safer-exec` attaches to LSM hooks (`bprm_check_security` and `file_open`). Using the kernel `bpf_d_path` helper, it dynamically audits process context, absolute files, and executions, providing kernel-level runtime observability and policy verification.
+
+**Platform requirements:** identical to `--trace-http-urls` (Linux ≥ 5.8, `CAP_BPF` + `CAP_PERFMON`, `amd64` or `arm64`).
+
+### CLI
+
+```bash
+# Capture cipher suites and emit a CycloneDX CBOM
+safer-exec --trace-crypto --cbom-output=cbom.json -- node index.js
+
+# Also capture digest, encrypt, sign operations (higher overhead)
+safer-exec --trace-crypto --crypto-probe-mode=operations --cbom-output=cbom.json -- node index.js
+
+# Combine with learn mode to record ciphers in the policy file
+safer-exec --learn --learn-output=policy.json --trace-crypto -- npm install
+```
+
+### JavaScript API
+
+```js
+import { SaferExec } from "@cdxgen/safer-exec";
+
+const result = await new SaferExec()
+  .traceCrypto() // enable cipher + library tracing
+  .cbom("./cbom.json") // write CycloneDX CBOM on exit
+  .cryptoProbeMode("operations") // also capture digest/sign ops
+  .run("node", ["index.js"]);
+
+// result.crypto — cryptographic observations
+// {
+//   ciphers: [
+//     {
+//       name: "ECDHE-RSA-AES256-GCM-SHA384",
+//       ianaName: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+//       ianaId: 49200,
+//       protocol: "TLSv1.2",
+//       keyExchange: "ECDHE",
+//       authentication: "RSA",
+//       encryption: "AES",
+//       encryptionBits: 256,
+//       hash: "SHA384",
+//       mode: "GCM",
+//       library: "OpenSSL",
+//       libraryVersion: "3.0.8",
+//       pid: 12345
+//     }
+//   ],
+//   libraries: [
+//     { name: "OpenSSL", version: "3.0.8", path: "/usr/lib/x86_64-linux-gnu/libssl.so.3", source: "ebpf_uprobe" }
+//   ],
+//   operations: [],   // populated when cryptoProbeMode is "operations"
+//   platform: "linux"
+// }
+```
+
+### Real-Time Event-Driven Crypto Auditing
+
+When both `.enableAudit()` and `.traceCrypto()` are enabled, cryptographic events are parsed and emitted in real-time as `audit` events on the `SaferExec` instance:
+
+```js
+const exec = new SaferExec().traceCrypto().enableAudit();
+
+exec.on("audit", (entry) => {
+  if (entry.type === "crypto-cipher") {
+    console.log(`Negotiated cipher ${entry.name} via ${entry.library}`);
+  } else if (entry.type === "crypto-library") {
+    console.log(
+      `Loaded crypto library: ${entry.name} version ${entry.version} at ${entry.path}`,
+    );
+  } else if (entry.type === "crypto-operation") {
+    console.log(
+      `Crypto operation observed: ${entry.operation} (${entry.algorithm})`,
+    );
+  }
+});
+
+await exec.run("node", ["index.js"]);
+```
+
+Additionally, standard `"http-request"` audit events are enriched with cipher, protocol, and cryptographic library details if captured:
+
+```json
+{
+  "type": "http-request",
+  "method": "GET",
+  "host": "registry.npmjs.org",
+  "path": "/",
+  "protocol": "https",
+  "port": 443,
+  "cipher": "ECDHE-RSA-AES256-GCM-SHA384",
+  "cipherIanaName": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+  "cipherIanaId": 49200,
+  "tlsVersion": "TLSv1.2",
+  "cipherBits": 256,
+  "cryptoLibrary": "OpenSSL",
+  "cryptoLibraryVersion": "3"
+}
+```
+
+### Cipher Allowlisting
+
+When `--trace-crypto` / `.traceCrypto()` is active, you can restrict the allowed TLS cipher suites. If a sandboxed command negotiates a TLS connection using a cipher suite not explicitly in the allowlist, a `cipher-violation` audit event is emitted.
+
+To ensure high reliability across stripped libraries and older or unprivileged kernels (e.g., GitHub Actions runner environments), `safer-exec` employs a dual-mechanism fallback architecture:
+
+1. **Map-Based Entry Tracing:** Function parameters (such as the `SSL*` or `cipher*` pointers) are captured at the function entry `uprobes` and stored in BPF maps indexed by thread IDs. Exit `uretprobes` look up the connection context from these maps rather than trying to read parameters directly from registers at return, avoiding verifier rejections.
+2. **TLS Handshake Record Parsing Fallback:** A fallback packet decoder hooks standard read/recv library calls or intercept socket connection state (`sys_enter_connect` tracepoint / socket-level events) to parse unencrypted ClientHello and ServerHello records directly from raw TCP buffers, extracting negotiated cipher suites and destination hostnames (SNI) even if target libraries lack symbol tables. The SNI parsing (`parseSNI` function) tracks the standard TLS Handshake Record (record type `0x16` and Handshake type `0x01` ClientHello), navigating through the TLS header, ClientHello session parameters, cipher suite list, compression formats, and extension blocks to pinpoint the Server Name Indication list (type `0x0000` per RFC 6066) and extract the exact HostName.
+
+**CLI:**
+
+```bash
+# Allow only modern TLS v1.3 ciphers, trigger violations for any older negotiations
+safer-exec --trace-crypto --allow-cipher=TLS_AES_256_GCM_SHA384 --allow-cipher=TLS_CHACHA20_POLY1305_SHA256 --audit -- curl https://registry.npmjs.org
+```
+
+**JavaScript API:**
+
+```js
+const result = await new SaferExec()
+  .traceCrypto()
+  .allowCiphers("TLS_AES_256_GCM_SHA384", "ECDHE-RSA-AES256-GCM-SHA384")
+  .enableAudit()
+  .run("curl", ["https://registry.npmjs.org"]);
+```
+
+### CBOM Output
+
+When `--cbom-output` / `.cbom(path)` is set, a [CycloneDX 1.7](https://cyclonedx.org/specification/overview/) JSON document is written containing `cryptographic-asset` components for each detected cipher suite and library:
+
+```json
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.7",
+  "version": 1,
+  "metadata": { "timestamp": "...", "tools": [...] },
+  "components": [
+    {
+      "type": "cryptographic-asset",
+      "name": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+      "cryptoProperties": {
+        "assetType": "protocol",
+        "protocolProperties": {
+          "type": "tls",
+          "version": "1.2",
+          "cipherSuites": [
+            {
+              "name": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+              "algorithms": ["ECDHE", "RSA", "AES-256-GCM", "SHA384"]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+### `result.crypto` fields
+
+| Field        | Type                | Description                                                                       |
+| ------------ | ------------------- | --------------------------------------------------------------------------------- |
+| `ciphers`    | `CipherInfo[]`      | Negotiated TLS cipher suites observed during execution                            |
+| `libraries`  | `CryptoLibrary[]`   | Detected cryptographic libraries (OpenSSL, GnuTLS, Go crypto/tls, etc.)           |
+| `operations` | `CryptoOperation[]` | Crypto operations (digest, encrypt, sign, verify) — only with `"operations"` mode |
+| `platform`   | `string`            | OS platform where observations were made                                          |
+
+**`CipherInfo` fields:**
+
+| Field            | Type     | Description                                                         |
+| ---------------- | -------- | ------------------------------------------------------------------- |
+| `name`           | `string` | OpenSSL-style name (e.g. `"ECDHE-RSA-AES256-GCM-SHA384"`)           |
+| `ianaName`       | `string` | IANA standard name (e.g. `"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"`) |
+| `ianaId`         | `number` | IANA cipher suite ID (e.g. `0xC030`)                                |
+| `protocol`       | `string` | TLS protocol version (`"TLSv1.2"`, `"TLSv1.3"`)                     |
+| `keyExchange`    | `string` | Key exchange algorithm (`"ECDHE"`, `"DHE"`, `"RSA"`)                |
+| `authentication` | `string` | Authentication algorithm (`"RSA"`, `"ECDSA"`)                       |
+| `encryption`     | `string` | Symmetric cipher name (`"AES"`, `"CHACHA20"`)                       |
+| `encryptionBits` | `number` | Cipher key size in bits                                             |
+| `hash`           | `string` | Hash/MAC algorithm (`"SHA256"`, `"SHA384"`)                         |
+| `mode`           | `string` | Cipher mode (`"GCM"`, `"POLY1305"`, `"CBC"`)                        |
+| `library`        | `string` | Crypto library that established the connection                      |
+| `libraryVersion` | `string` | Detected library version                                            |
+| `pid`            | `number` | Host PID of the process that negotiated this cipher                 |
 
 ## URL Access-Control Rules (`allowUrls` / `--allow-url`)
 

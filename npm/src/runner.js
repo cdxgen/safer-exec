@@ -20,12 +20,30 @@
  * @module runner
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { basename, dirname, join } from 'node:path';
-import { readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, rmSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir, platform, arch } from 'node:os';
 import { createRequire } from 'node:module';
+
+/**
+ * Validate that an object looks like an audit log entry.
+ * Supports standard violations/calls as well as crypto ciphers, libraries, and operations.
+ *
+ * @param {Object} entry - The parsed JSON entry
+ * @returns {boolean} True if it is a valid audit entry
+ */
+export function isValidAuditEntry(entry) {
+  return !!(entry && entry.type && (
+    entry.target ||
+    entry.host ||
+    entry.name ||
+    entry.algorithm ||
+    entry.cipher ||
+    entry.operation
+  ));
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -47,14 +65,14 @@ export function resolveBinaryPath() {
   const localArch = currentArch === 'x64' ? 'amd64' : currentArch;
 
   // Try platform-arch specific locally compiled binary first
-  const platformArchBinary = join(__dirname, '..', '..', 'go', 'bin', `safer-exec-${currentPlatform}-${localArch}`);
+  const platformArchBinary = join(__dirname, '..', '..', 'go', 'bin', `safer-exec-rt-${currentPlatform}-${localArch}`);
   try {
     readFileSync(platformArchBinary);
     return platformArchBinary;
   } catch {}
 
   // Try standard locally compiled binary
-  const localBinary = join(__dirname, '..', '..', 'go', 'bin', 'safer-exec');
+  const localBinary = join(__dirname, '..', '..', 'go', 'bin', 'safer-exec-rt');
   try {
     readFileSync(localBinary);
     return localBinary;
@@ -103,7 +121,7 @@ export function resolveBinaryPath() {
 
     for (const modulesDir of searchDirs) {
       // Direct structure under node_modules
-      const directPath = join(modulesDir, pkgName, "bin", "safer-exec");
+      const directPath = join(modulesDir, pkgName, "bin", "safer-exec-rt");
       let realDirectPath;
       try {
         realDirectPath = realpathSync(directPath);
@@ -127,7 +145,54 @@ export function resolveBinaryPath() {
   }
 
   // Try PATH
-  return 'safer-exec';
+  const defaultGlobalPath = '/usr/local/bin/safer-exec-rt';
+  try {
+    if (existsSync(defaultGlobalPath)) {
+      return defaultGlobalPath;
+    }
+  } catch {}
+
+  // If missing and we are root (UID 0), automatically copy/install the runtime binary to /usr/local/bin/safer-exec-rt
+  // to ensure capability-sensitive features work out of the box in CI environments.
+  if (process.getuid?.() === 0) {
+    // Locate the packaged runtime binary that we resolved under node_modules
+    let packagedBinaryPath = '';
+    try {
+      const require = createRequire(import.meta.url);
+      const mainPkgPath = require.resolve("@cdxgen/safer-exec");
+      const searchDirs = [];
+      let curDir = dirname(mainPkgPath);
+      while (curDir && curDir !== dirname(curDir)) {
+        if (basename(curDir) === "node_modules") searchDirs.push(curDir);
+        const nodeModulesSub = join(curDir, "node_modules");
+        if (existsSync(nodeModulesSub)) searchDirs.push(nodeModulesSub);
+        curDir = dirname(curDir);
+      }
+      for (const modulesDir of searchDirs) {
+        const directPath = join(modulesDir, pkgName, "bin", "safer-exec-rt");
+        if (existsSync(directPath)) {
+          packagedBinaryPath = directPath;
+          break;
+        }
+      }
+    } catch {}
+
+    if (packagedBinaryPath) {
+      try {
+        console.warn(`safer-exec: warning: system runtime binary missing at ${defaultGlobalPath}. Copying from ${packagedBinaryPath}...`);
+        copyFileSync(packagedBinaryPath, defaultGlobalPath);
+        chmodSync(defaultGlobalPath, 0o755);
+        try {
+          execSync(`setcap 'cap_sys_resource,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_sys_admin+eip' ${defaultGlobalPath} 2>/dev/null`);
+        } catch {}
+        return defaultGlobalPath;
+      } catch (e) {
+        console.warn(`safer-exec: warning: failed to auto-bootstrap runtime binary to ${defaultGlobalPath}: ${e.message}`);
+      }
+    }
+  }
+
+  return 'safer-exec-rt';
 }
 
 /**
@@ -194,7 +259,7 @@ export async function run(config, options = {}) {
           let parsed = null;
           try {
             const entry = JSON.parse(trimmed);
-            if (entry.type && (entry.target || entry.host)) {
+            if (isValidAuditEntry(entry)) {
               parsed = entry;
             }
           } catch {}
@@ -228,7 +293,7 @@ export async function run(config, options = {}) {
         let parsed = null;
         try {
           const entry = JSON.parse(trimmed);
-          if (entry.type && (entry.target || entry.host)) {
+          if (isValidAuditEntry(entry)) {
             parsed = entry;
           }
         } catch {}
@@ -255,7 +320,7 @@ export async function run(config, options = {}) {
   });
 
   // Parse structured output from stdout
-  const { fsDiff, learnedPolicy, profile, cleanStdout } = parseStructuredOutput(stdout);
+  const { fsDiff, learnedPolicy, crypto, profile, cleanStdout } = parseStructuredOutput(stdout);
 
   // Parse audit log entries from stderr when enabled
   let auditLog = null;
@@ -271,24 +336,27 @@ export async function run(config, options = {}) {
     timedOut,
     ...(fsDiff !== null && { fsDiff }),
     ...(learnedPolicy !== null && { learnedPolicy }),
+    ...(crypto !== null && { crypto }),
     ...(profile !== null && { profile }),
   };
 }
 
 /**
- * Parse structured output lines (FSDIFF:..., LEARNED:..., PROFILE:...) from stdout.
+ * Parse structured output lines (FSDIFF:..., LEARNED:..., CRYPTO:..., PROFILE:...) from stdout.
  *
  * The Go binary prefixes special output with markers:
  * - "FSDIFF:" followed by JSON for filesystem diff
  * - "LEARNED:" followed by JSON for learned policy
+ * - "CRYPTO:" followed by JSON for cryptographic observations
  * - "PROFILE:" followed by the generated Seatbelt profile text
  *
  * @param {string} stdout - Raw stdout from the Go binary
- * @returns {{ fsDiff: object|null, learnedPolicy: object|null, profile: string|null, cleanStdout: string }}
+ * @returns {{ fsDiff: object|null, learnedPolicy: object|null, crypto: object|null, profile: string|null, cleanStdout: string }}
  */
 export function parseStructuredOutput(stdout) {
   let fsDiff = null;
   let learnedPolicy = null;
+  let crypto = null;
   let profile = null;
   const lines = stdout.split('\n');
   const cleanLines = [];
@@ -306,6 +374,12 @@ export function parseStructuredOutput(stdout) {
       } catch {
         cleanLines.push(line);
       }
+    } else if (line.startsWith('CRYPTO:')) {
+      try {
+        crypto = JSON.parse(line.slice(7));
+      } catch {
+        cleanLines.push(line);
+      }
     } else if (line.startsWith('PROFILE:')) {
       profile = line.slice(8);
     } else if (profile !== null) {
@@ -319,6 +393,7 @@ export function parseStructuredOutput(stdout) {
   return {
     fsDiff,
     learnedPolicy,
+    crypto,
     profile,
     cleanStdout: cleanLines.join('\n'),
   };
@@ -350,7 +425,7 @@ export function parseAuditLog(stderr) {
 
       // Validate it looks like an audit entry.
       // http-request entries use "host" instead of "target".
-      if (entry.type && (entry.target || entry.host)) {
+      if (isValidAuditEntry(entry)) {
         entries.push(entry);
       }
     } catch {
@@ -387,10 +462,11 @@ export function parseAuditLog(stderr) {
 export function readStructuredFile(filePath) {
   let fsDiff = null;
   let learnedPolicy = null;
+  let crypto = null;
   let profile = null;
 
   if (!existsSync(filePath)) {
-    return { fsDiff, learnedPolicy, profile };
+    return { fsDiff, learnedPolicy, crypto, profile };
   }
 
   try {
@@ -406,6 +482,10 @@ export function readStructuredFile(filePath) {
         try {
           learnedPolicy = JSON.parse(line.slice(8));
         } catch {}
+      } else if (line.startsWith('CRYPTO:')) {
+        try {
+          crypto = JSON.parse(line.slice(7));
+        } catch {}
       } else if (line.startsWith('PROFILE:')) {
         profile = line.slice(8);
       } else if (profile !== null && line) {
@@ -416,7 +496,7 @@ export function readStructuredFile(filePath) {
     // Silently ignore file read errors, return whatever we parsed
   }
 
-  return { fsDiff, learnedPolicy, profile };
+  return { fsDiff, learnedPolicy, crypto, profile };
 }
 
 /**
@@ -496,7 +576,7 @@ export async function runPipe(config, options = {}) {
           let parsed = null;
           try {
             const entry = JSON.parse(trimmed);
-            if (entry.type && (entry.target || entry.host)) {
+            if (isValidAuditEntry(entry)) {
               parsed = entry;
             }
           } catch {}
@@ -554,7 +634,7 @@ export async function runPipe(config, options = {}) {
         let parsed = null;
         try {
           const entry = JSON.parse(trimmed);
-          if (entry.type && (entry.target || entry.host)) {
+          if (isValidAuditEntry(entry)) {
             parsed = entry;
           }
         } catch {}
@@ -576,6 +656,7 @@ export async function runPipe(config, options = {}) {
 
       let fsDiff = null;
       let learnedPolicy = null;
+      let crypto = null;
       let profile = null;
 
       // Parse structured output from the temporary file if it was created
@@ -583,6 +664,7 @@ export async function runPipe(config, options = {}) {
         const parsed = readStructuredFile(structuredPath);
         fsDiff = parsed.fsDiff;
         learnedPolicy = parsed.learnedPolicy;
+        crypto = parsed.crypto;
         profile = parsed.profile;
       }
 
@@ -603,6 +685,7 @@ export async function runPipe(config, options = {}) {
         timedOut,
         fsDiff,
         learnedPolicy,
+        crypto,
         profile,
         auditLog,
       });

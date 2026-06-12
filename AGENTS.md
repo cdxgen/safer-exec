@@ -37,11 +37,15 @@ go/                           — Go engine (platform-specific sandboxing)
     engine_linux_*_syscall.go — Architecture-specific syscall constants
     engine_darwin_test.go     — macOS engine tests
     engine_linux_test.go      — Linux engine tests
-  internal/
+   internal/
     config/                   — ExecConfig JSON contract (shared by all layers)
     learner/                  — Linux strace-based behavioral learner
     learnermac/               — macOS Seatbelt trace parser (learning mode)
     fsdiff/                   — Filesystem snapshot + SHA-256 diff utilities
+    httptrace/                — eBPF HTTP URL + crypto tracing (Linux-only)
+      bpf/                    — BPF C source + pre-compiled objects
+      cipher.go               — Cipher name parser + IANA registry mapping
+      cipher_test.go          — Cipher decomposition tests
 apparmor/                     — AppArmor profile for unprivileged user namespace creation
   safer-exec                  — Bundled AppArmor profile
 npm/
@@ -109,6 +113,7 @@ node npm/src/cli.js --policy=npm -- npm install
 node npm/src/cli.js --max-memory=512 -- npm run build
 node npm/src/cli.js --diff --write-path=/tmp -- npm install
 node npm/src/cli.js --learn -- npm install
+node npm/src/cli.js --trace-crypto --cbom-output=cbom.json -- npm install
 node npm/src/cli.js diagnostics
 ```
 
@@ -140,6 +145,7 @@ The Go binary communicates structured data back to Node.js via marker-prefixed J
 
 - `FSDIFF:` prefix — filesystem diff report
 - `LEARNED:` prefix — learned policy output
+- `CRYPTO:` prefix — cryptographic observations (ciphers, libraries)
 - Audit entries — JSON lines on stderr
 
 The Node.js `runner.js` parses these markers and separates them from regular stdout.
@@ -180,6 +186,7 @@ Policies are plain JavaScript functions that return config objects. They are pla
 - Go tests live alongside engine files (`engine_*_test.go`)
 - Tests should verify actual sandbox behavior, not just config serialization
 - Exhaustion tests should use `.timeout()` to prevent hanging
+- **NEVER use `sudo` to run tests or execute command verification.** If a test requires special capabilities, configure appropriate setcap or file permissions instead of using superuser privileges.
 
 ---
 
@@ -201,6 +208,42 @@ Policies are plain JavaScript functions that return config objects. They are pla
 2. Export `<ecosystem>Policy()` function returning policy config
 3. Import and register in `POLICIES` map in `npm/src/index.js`
 4. Add test in `npm/src/policies.test.js`
+
+### Crypto Tracing & CBOM Generation
+
+The `--trace-crypto` feature captures TLS cipher suites and cryptographic library
+identities using eBPF uretprobes on OpenSSL/GnuTLS cipher negotiation functions.
+
+**How it works:**
+
+1. **Library detection**: `attachLibraryProbes()` in `httptrace_linux.go` parses
+   library paths (`libssl.so.3` → OpenSSL 3.x) and extracts versions. Detected
+   libraries are returned via `Tracer.DetectedLibraries()`.
+
+2. **Cipher detection**: eBPF uretprobes on `SSL_get_current_cipher`,
+   `SSL_CIPHER_get_name`, `SSL_CIPHER_get_bits`, `SSL_get_version` (OpenSSL),
+   and `gnutls_cipher_suite_get_name` (GnuTLS) capture negotiated cipher suites
+   per TLS connection. Cipher info is correlated with HTTP requests via the
+   SSL\* pointer (`ConnID`).
+
+3. **CBOM output**: `writeCBOMFile()` in `engine_linux.go` produces a minimal
+   CycloneDX JSON document with `cryptographic-asset` components for each
+   detected library and cipher suite. The document uses CycloneDX 1.7
+   specification.
+
+4. **Cipher name parsing**: `DecomposeCipherName()` in `cipher.go` parses
+   OpenSSL-style names into constituent algorithms (key exchange,
+   authentication, encryption, hash, mode) for CBOM metadata.
+
+**Adding or maintaining a BPF probe:**
+
+1. Modify/add probes in `go/internal/httptrace/bpf/ssl_trace.c`. When capturing parameters, avoid reading registers directly in exit `uretprobe` return handlers (which is blocked by the verifier on stripped/older runner kernels). Instead, implement a dual hook:
+   - Save function parameters in a BPF hash map keyed by `tgid_tid` (`bpf_get_current_pid_tgid()`) during the entry `uprobe`.
+   - Retrieve the arguments from the map and read the return value (`PT_REGS_RC(ctx)`) during the exit `uretprobe`.
+2. Add the corresponding `*ebpf.Program` field to `bpfObjects` in `httptrace_linux.go`.
+3. Register the program loading and attach it under `EnableCryptoTracing()` or `AttachStaticOpenSSL()`.
+4. Handle the events correctly in `readCipherLoop()`.
+5. Rebuild BPF objects: Run `cd go/internal/httptrace/bpf && bash compile.sh` to compile BPF bytecode targeting multiple architectures inside Docker containers. Because the Docker mount points to the host directory, make sure you compile BPF changes locally without container virtualization directory translation issues, and stage the updated `.o` binary objects (`ssl_trace_linux_amd64.o` and `ssl_trace_linux_arm64.o`) into git.
 
 ### Debugging Sandbox Issues
 

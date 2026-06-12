@@ -19,12 +19,12 @@ fi
 # Determine binary output name
 OUTPUT_BINARY="${OUTPUT_BINARY:-safer-exec}"
 
-if [[ -f go/bin/safer-exec ]]; then
-  echo "Go engine already compiled at go/bin/safer-exec, skipping build."
+if [[ -f go/bin/safer-exec-rt ]]; then
+  echo "Go engine already compiled at go/bin/safer-exec-rt, skipping build."
 else
   echo "Building Go engine for $TARGET_OS/$TARGET_ARCH..."
   # Compile Go binary statically
-  (cd go && CGO_ENABLED=0 GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/)
+  (cd go && CGO_ENABLED=0 GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath -ldflags="-s -w" -o bin/safer-exec-rt ./cmd/safer-exec/)
 fi
 
 # Create staging directory
@@ -36,10 +36,10 @@ cp npm/package.json "$STAGING_DIR/npm/"
 cp -R npm/src "$STAGING_DIR/npm/"
 
 mkdir -p "$STAGING_DIR/go/bin"
-cp go/bin/safer-exec "$STAGING_DIR/go/bin/"
+cp go/bin/safer-exec-rt "$STAGING_DIR/go/bin/"
 
 # Ensure the executable permission is set
-chmod +x "$STAGING_DIR/go/bin/safer-exec"
+chmod +x "$STAGING_DIR/go/bin/safer-exec-rt"
 
 CAXA_PACKAGE="${CAXA_PACKAGE:-@cdxgen/caxa@^3.0.3}"
 echo "Running caxa to build standalone binary: $OUTPUT_BINARY"

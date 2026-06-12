@@ -432,10 +432,13 @@ const result = await new SaferExec()
 
 ### Troubleshooting
 
-| Symptom                                       | Cause                                                              | Fix                                                                                                       |
-| --------------------------------------------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
-| `http-trace: eBPF HTTP tracing not supported` | Missing `CAP_BPF`/`CAP_PERFMON`, kernel < 5.8, or unsupported arch | Run with `sudo`; upgrade kernel                                                                           |
-| `http-trace: no SSL/TLS libraries found`      | `libssl.so` not installed                                          | `apt-get install libssl3`                                                                                 |
-| Empty `auditLog` despite HTTP activity        | Program uses HTTP/2 (binary HPACK)                                 | Force HTTP/1.1 with `--http1.1` flag or equivalent                                                        |
-| `http-trace: process is using HTTP/2…`        | Program negotiated h2 via ALPN                                     | Add `--http1.1` / `--no-alpn` to the sandboxed command, or accept that HTTP/2 endpoints won't be captured |
-| `pivot_root failed, falling back to chroot`   | `readPaths` includes `/` (entire root bind-mounted over tmpfs)     | Use specific paths via a policy preset instead of `readPaths: ["/"]`                                      |
+| Symptom                                       | Cause                                                                | Fix                                                                                                       |
+| --------------------------------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `http-trace: eBPF HTTP tracing not supported` | Missing `CAP_BPF`/`CAP_PERFMON`, kernel < 5.8, or unsupported arch   | Run with `sudo`; upgrade kernel                                                                           |
+| `http-trace: no SSL/TLS libraries found`      | `libssl.so` not installed                                            | `apt-get install libssl3`                                                                                 |
+| Empty `auditLog` despite HTTP activity        | Program uses HTTP/2 (binary HPACK)                                   | Force HTTP/1.1 with `--http1.1` flag or equivalent                                                        |
+| `http-trace: process is using HTTP/2…`        | Program negotiated h2 via ALPN                                       | Add `--http1.1` / `--no-alpn` to the sandboxed command, or accept that HTTP/2 endpoints won't be captured |
+| `pivot_root failed, falling back to chroot`   | `readPaths` includes `/` (entire root bind-mounted over tmpfs)       | Use specific paths via a policy preset instead of `readPaths: ["/"]`                                      |
+| LSM BPF loading warning or error              | LSM BPF not enabled in kernel configurations                         | Ensure kernel is compiled with `CONFIG_BPF_LSM=y` and `lsm=...,bpf` in kernel command line.               |
+| Unified socket SNI tracing not working        | Kernel lacks tracepoints support or missing `sys_enter_connect`      | Verify kernel version and check if `/sys/kernel/debug/tracing/events/syscalls/sys_enter_connect` exists.  |
+| Non-TLS crypto operations trace missing       | Target binary is statically linked without resolving openssl symbols | For static OpenSSL binaries, ensure symbols like `SHA256_Init` are exported or use dynamic libraries.     |

@@ -46,18 +46,18 @@ jobs:
           if [[ "${{ matrix.os }}" == "linux" ]]; then
             CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build \
               -trimpath -ldflags="-s -w" \
-              -o bin/safer-exec-${{ matrix.os }}-${{ matrix.arch }} ./cmd/safer-exec/
+              -o bin/safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }} ./cmd/safer-exec/
           else
             CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build \
               -ldflags="-s -w" \
-              -o bin/safer-exec-${{ matrix.os }}-${{ matrix.arch }} ./cmd/safer-exec/
+              -o bin/safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }} ./cmd/safer-exec/
           fi
 
       - name: Upload binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: safer-exec-${{ matrix.os }}-${{ matrix.arch }}
-          path: go/bin/safer-exec-${{ matrix.os }}-${{ matrix.arch }}
+          name: safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }}
+          path: go/bin/safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }}
 
   check-bpf-objects:
     runs-on: ubuntu-latest
@@ -108,11 +108,11 @@ jobs:
         if: contains(matrix.os, 'ubuntu')
         run: |
           cd go
-          CGO_ENABLED=0 go build -o /tmp/safer-exec-test ./cmd/safer-exec/
+          CGO_ENABLED=0 go build -o /tmp/safer-exec-rt-test ./cmd/safer-exec/
           # The Go binary reads JSON config from stdin; CLI flags belong to the npm wrapper.
           # Without CAP_BPF the eBPF warning is emitted but the process must exit 0.
           output=$(echo '{"cmd":"/bin/echo","args":["http-trace-graceful-degradation-ok"],"traceHTTPURLs":true}' \
-            | /tmp/safer-exec-test 2>&1) || true
+            | /tmp/safer-exec-rt-test 2>&1) || true
           echo "$output"
           # Fail only if the eBPF layer emitted a fatal (non-warning) error.
           if echo "$output" | grep -q "safer-exec: http-trace:" && \
@@ -147,7 +147,7 @@ jobs:
       - name: Build Go binary
         run: |
           cd go
-          go build -trimpath -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/
+          go build -trimpath -ldflags="-s -w" -o bin/safer-exec-rt ./cmd/safer-exec/
 
       - name: Set up Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
@@ -168,6 +168,11 @@ jobs:
         run: |
           cd npm
           npm run test:integration
+
+      - name: Run HTTP tracing diagnostics
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo env "PATH=$PATH" node tests/debug_httptrace.js
 
       - name: Run HTTP tracing integration tests
         if: startsWith(matrix.os, 'ubuntu')
@@ -199,7 +204,7 @@ jobs:
       - name: Download binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
-          pattern: safer-exec-*
+          pattern: safer-exec-rt-*
           path: binaries/
 
       - name: Set up Node.js
@@ -220,9 +225,9 @@ jobs:
           fi
 
           # Package each binary into its own npm package
-          for binary in binaries/safer-exec-*/safer-exec-*; do
+          for binary in binaries/safer-exec-rt-*/safer-exec-rt-*; do
             binary_name=$(basename "$binary")
-            platform=$(echo "$binary_name" | cut -d- -f3,4)
+            platform=$(echo "$binary_name" | cut -d- -f4,5)
             pkg_name="@cdxgen/safer-exec-${platform}"
             os_name=$(echo "$platform" | cut -d- -f1)
             case "$platform" in
@@ -230,7 +235,7 @@ jobs:
               *) cpu="x64" ;;
             esac
             mkdir -p "publish-${platform}/bin"
-            cp "$binary" "publish-${platform}/bin/safer-exec"
+            cp "$binary" "publish-${platform}/bin/safer-exec-rt"
             jq -n \
               --arg name "$pkg_name" \
               --arg version "$version" \
@@ -239,7 +244,7 @@ jobs:
               '{
                 name: $name,
                 version: $version,
-                main: "bin/safer-exec",
+                main: "bin/safer-exec-rt",
                 files: ["bin/"],
                 license: "MIT",
                 repository: {

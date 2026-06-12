@@ -363,6 +363,18 @@ export class SaferExec extends EventEmitter {
     /** @type {boolean} Attach eBPF uprobes to TLS write functions to capture HTTP URLs (Linux only, kernel >= 5.8) */
     this._traceHTTPURLs = options.traceHTTPURLs || false;
 
+    /** @type {boolean} Enable cryptographic tracing (cipher suites, libraries). Auto-enables traceHTTPURLs. */
+    this._traceCrypto = options.traceCrypto || false;
+
+    /** @type {string} Path for CycloneDX CBOM JSON output */
+    this._cbomOutputPath = options.cbomOutputPath || '';
+
+    /** @type {string} Crypto probe mode: "tls-only" or "operations" */
+    this._cryptoProbeMode = options.cryptoProbeMode || 'tls-only';
+
+    /** @type {string[]} Allowed TLS cipher suites (Linux only) */
+    this._allowCiphers = options.allowCiphers || [];
+
     /**
      * Fine-grained URL access rules (Linux-only, requires traceHTTPURLs).
      * Each entry: { protocol?, host, port?, pathPrefix?, methods? }
@@ -1217,6 +1229,82 @@ export class SaferExec extends EventEmitter {
   }
 
   /**
+   * Enable cryptographic tracing via eBPF uprobes on TLS cipher negotiation and
+   * crypto operation functions. Automatically enables HTTP URL tracing.
+   *
+   * Captures:
+   * - Negotiated TLS cipher suites per connection (name, IANA ID, protocol version, key size)
+   * - Detected cryptographic library identities and versions (OpenSSL, GnuTLS, Go crypto/tls)
+   * - Optionally: digest, encrypt, sign operations (when cryptoProbeMode is "operations")
+   *
+   * Cipher info is attached to HTTP access entries and included in audit logs,
+   * learned policies, and CBOM output.
+   *
+   * Requirements: Linux kernel >= 5.8, CAP_BPF + CAP_PERFMON.
+   * Falls back to library detection from /proc/pid/maps when eBPF probes fail.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  traceCrypto() {
+    this._traceCrypto = true;
+    this._traceHTTPURLs = true;
+    return this;
+  }
+
+  /**
+   * Set the path for CycloneDX CBOM (Cryptography Bill of Materials) output.
+   *
+   * When set, the Go binary writes a minimal CycloneDX JSON document with
+   * cryptographic-asset components for detected libraries, cipher suites,
+   * and crypto operations to this file path after execution completes.
+   *
+   * Requires traceCrypto() or --trace-crypto to be active.
+   *
+   * @param {string} path - File path for CBOM output (e.g. "./cbom.json")
+   * @returns {SaferExec} This instance for chaining
+   */
+  cbom(path) {
+    this._cbomOutputPath = path;
+    return this;
+  }
+
+  /**
+   * Set the crypto probe mode controlling the depth of crypto tracing.
+   *
+   * "tls-only" (default) — capture only TLS cipher suites after handshake.
+   * "operations" — also capture digest, encrypt, and sign operations (higher overhead).
+   *
+   * @param {'tls-only'|'operations'} mode - The crypto probe depth
+   * @returns {SaferExec} This instance for chaining
+   */
+  cryptoProbeMode(mode) {
+    this._cryptoProbeMode = mode;
+    return this;
+  }
+
+  /**
+   * Restrict negotiation to specific TLS cipher suites.
+   *
+   * Observed cipher negotiations using any suite not in this list will trigger
+   * a `cipher-violation` audit log entry.
+   *
+   * Supports standard cipher names (e.g. "ECDHE-RSA-AES256-GCM-SHA384")
+   * and IANA standard names (e.g. "TLS_AES_256_GCM_SHA384").
+   *
+   * @param {...string|string[]} ciphers - Cipher suites to allow
+   * @returns {SaferExec} This instance for chaining
+   */
+  allowCiphers(...ciphers) {
+    const flat = ciphers.flat();
+    for (const c of flat) {
+      if (c && !this._allowCiphers.includes(c)) {
+        this._allowCiphers.push(c);
+      }
+    }
+    return this;
+  }
+
+  /**
    * Set the temporary directory where the dynamic library tracker (LD_AUDIT helper) is extracted.
    *
    * @param {string} dir - The path to the directory
@@ -1373,6 +1461,10 @@ export class SaferExec extends EventEmitter {
       traceLibraries: this._traceLibraries,
       traceTempDir: this._traceTempDir,
       traceHTTPURLs: this._traceHTTPURLs,
+      traceCrypto: this._traceCrypto,
+      allowCiphers: this._allowCiphers,
+      cbomOutputPath: this._cbomOutputPath,
+      cryptoProbeMode: this._cryptoProbeMode,
       allowURLRules: this._allowURLRules,
       sanitizeEnv: this._sanitizeEnv,
     };

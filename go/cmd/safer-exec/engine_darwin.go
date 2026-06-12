@@ -831,6 +831,7 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["trace_libraries"] = true
 	result.Features["trace_http_urls"] = false
 	result.Features["allow_url_rules"] = false
+	result.Features["trace_crypto"] = false
 	result.Features["profile_validation"] = hasSandbox // sandbox-exec -n validates profiles
 	result.Features["time_isolation"] = false          // not applicable on macOS
 	result.Features["ipc_isolation"] = false           // not applicable on macOS

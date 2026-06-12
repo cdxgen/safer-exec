@@ -223,6 +223,7 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["trace_libraries"] = false
 	result.Features["trace_http_urls"] = false
 	result.Features["allow_url_rules"] = false
+	result.Features["trace_crypto"] = false
 	result.Features["time_isolation"] = false
 	result.Features["ipc_isolation"] = false
 	result.Features["io_limit"] = false

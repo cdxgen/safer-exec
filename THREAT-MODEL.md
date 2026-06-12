@@ -27,31 +27,34 @@ Node.js (policy + DNS) --[JSON on stdin]--> Go binary --[sandbox]--> target comm
 
 The Node.js layer serializes an `ExecConfig` object to JSON. The Go struct expects the following fields:
 
-| Field            | Type     | Description                       |
-| ---------------- | -------- | --------------------------------- |
-| `cmd`            | string   | Command to execute                |
-| `args`           | string[] | Command arguments                 |
-| `env`            | object   | Environment variables             |
-| `readPaths`      | string[] | Filesystem read paths             |
-| `writePaths`     | string[] | Filesystem write paths            |
-| `allowHosts`     | string[] | Hostnames to allow                |
-| `allowIPs`       | string[] | Resolved IP addresses             |
-| `allowPorts`     | number[] | TCP ports to allow                |
-| `disableNetwork` | boolean  | Cut all network access            |
-| `maxMemoryMB`    | number   | Memory limit in megabytes         |
-| `maxCPUCores`    | number   | CPU limit as fractional cores     |
-| `maxProcesses`   | number   | Max child processes               |
-| `timeoutMs`      | number   | Hard kill timeout in milliseconds |
-| `workingDir`     | string   | Working directory                 |
-| `enableAudit`    | boolean  | Enable violation auditing         |
-| `enableDiff`     | boolean  | Enable filesystem diffing         |
-| `enableLearn`    | boolean  | Enable learning mode              |
-| `allowExec`      | string[] | Executables to allow              |
-| `blockExec`      | string[] | Executables to block              |
-| `blockFork`      | boolean  | Prevent forking                   |
-| `traceExec`      | boolean  | Log child processes               |
-| `strict`         | boolean  | Treat warnings as hard errors     |
-| `sanitizeEnv`    | boolean  | Strip sensitive env vars          |
+| Field             | Type     | Description                        |
+| ----------------- | -------- | ---------------------------------- |
+| `cmd`             | string   | Command to execute                 |
+| `args`            | string[] | Command arguments                  |
+| `env`             | object   | Environment variables              |
+| `readPaths`       | string[] | Filesystem read paths              |
+| `writePaths`      | string[] | Filesystem write paths             |
+| `allowHosts`      | string[] | Hostnames to allow                 |
+| `allowIPs`        | string[] | Resolved IP addresses              |
+| `allowPorts`      | number[] | TCP ports to allow                 |
+| `disableNetwork`  | boolean  | Cut all network access             |
+| `maxMemoryMB`     | number   | Memory limit in megabytes          |
+| `maxCPUCores`     | number   | CPU limit as fractional cores      |
+| `maxProcesses`    | number   | Max child processes                |
+| `timeoutMs`       | number   | Hard kill timeout in milliseconds  |
+| `workingDir`      | string   | Working directory                  |
+| `enableAudit`     | boolean  | Enable violation auditing          |
+| `enableDiff`      | boolean  | Enable filesystem diffing          |
+| `enableLearn`     | boolean  | Enable learning mode               |
+| `allowExec`       | string[] | Executables to allow               |
+| `blockExec`       | string[] | Executables to block               |
+| `blockFork`       | boolean  | Prevent forking                    |
+| `traceExec`       | boolean  | Log child processes                |
+| `strict`          | boolean  | Treat warnings as hard errors      |
+| `sanitizeEnv`     | boolean  | Strip sensitive env vars           |
+| `traceCrypto`     | boolean  | Capture TLS & non-TLS operations   |
+| `cbomOutputPath`  | string   | Write CycloneDX CBOM JSON file     |
+| `cryptoProbeMode` | string   | Depth of crypto probe (operations) |
 
 ## 2. Sandbox Mechanisms
 
@@ -66,19 +69,20 @@ The Node.js layer serializes an `ExecConfig` object to JSON. The Go struct expec
 
 Seatbelt profiles start with `(deny default)` then add allow rules. The profile imports `system.sb` which includes base system rules.
 
-### Linux (Namespaces + Seccomp + Landlock + cgroup v2)
+### Linux (Namespaces + Seccomp + Landlock + cgroup v2 + eBPF LSM)
 
-| Mechanism         | What it enforces       | How                                                  |
-| ----------------- | ---------------------- | ---------------------------------------------------- |
-| User namespace    | UID isolation          | `CLONE_NEWUSER` + `/proc/self` UID/GID mapping       |
-| Mount namespace   | Filesystem isolation   | `CLONE_NEWNS` + tmpfs root + bind mounts             |
-| PID namespace     | Process tree isolation | `CLONE_NEWPID`                                       |
-| UTS namespace     | Hostname isolation     | `CLONE_NEWUTS`                                       |
-| Network namespace | Network isolation      | `CLONE_NEWNET` (when `disableNetwork` is true)       |
-| pivot_root        | Root filesystem swap   | Mounts tmpfs, bind-mounts paths, pivots              |
-| Seccomp-bpf       | Syscall filtering      | Blocks ptrace, kcmp, unshare, mount, pivot_root      |
-| Landlock v2       | Network port filtering | Ruleset version 5 (kernel 6.2+) for TCP connect/bind |
-| cgroup v2         | Resource quotas        | `cpu.max`, `memory.max`, `pids.max`                  |
+| Mechanism         | What it enforces       | How                                                       |
+| ----------------- | ---------------------- | --------------------------------------------------------- |
+| User namespace    | UID isolation          | `CLONE_NEWUSER` + `/proc/self` UID/GID mapping            |
+| Mount namespace   | Filesystem isolation   | `CLONE_NEWNS` + tmpfs root + bind mounts                  |
+| PID namespace     | Process tree isolation | `CLONE_NEWPID`                                            |
+| UTS namespace     | Hostname isolation     | `CLONE_NEWUTS`                                            |
+| Network namespace | Network isolation      | `CLONE_NEWNET` (when `disableNetwork` is true)            |
+| pivot_root        | Root filesystem swap   | Mounts tmpfs, bind-mounts paths, pivots                   |
+| Seccomp-bpf       | Syscall filtering      | Blocks ptrace, kcmp, unshare, mount, pivot_root           |
+| Landlock v2       | Network port filtering | Ruleset version 5 (kernel 6.2+) for TCP connect/bind      |
+| cgroup v2         | Resource quotas        | `cpu.max`, `memory.max`, `pids.max`                       |
+| LSM BPF           | Kernel-level audits    | Attaches BPF hooks to `bprm_check_security` / `file_open` |
 
 ## 3. Threats and Attack Vectors
 

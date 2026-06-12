@@ -31,19 +31,22 @@ safer-exec [OPTIONS] -- COMMAND [ARGS...]
 
 ### Feature Flags
 
-| Flag                    | Short | Description                                  |
-| ----------------------- | ----- | -------------------------------------------- |
-| `--diff`                | `-d`  | Enable filesystem mutation diffing           |
-| `--learn`               | `-l`  | Enable behavioral auto-profiling             |
-| `--learn-output=<file>` |       | Write learned policy to file                 |
-| `--audit`               | `-a`  | Enable sandbox violation auditing            |
-| `--allow-exec=<cmd>`    |       | Allow only specific executables (repeatable) |
-| `--block-exec=<cmd>`    |       | Block specific executables (repeatable)      |
-| `--block-fork`          |       | Prevent forking new processes                |
-| `--trace-exec`          |       | Log every child process spawned              |
-| `--json`                | `-j`  | Output results as JSON                       |
-| `--help`                | `-h`  | Show help                                    |
-| `--version`             | `-v`  | Show version                                 |
+| Flag                         | Short | Description                                  |
+| ---------------------------- | ----- | -------------------------------------------- |
+| `--diff`                     | `-d`  | Enable filesystem mutation diffing           |
+| `--learn`                    | `-l`  | Enable behavioral auto-profiling             |
+| `--learn-output=<file>`      |       | Write learned policy to file                 |
+| `--audit`                    | `-a`  | Enable sandbox violation auditing            |
+| `--allow-exec=<cmd>`         |       | Allow only specific executables (repeatable) |
+| `--block-exec=<cmd>`         |       | Block specific executables (repeatable)      |
+| `--block-fork`               |       | Prevent forking new processes                |
+| `--trace-exec`               |       | Log every child process spawned              |
+| `--trace-crypto`             |       | Enable cryptographic tracing (TLS + ops)     |
+| `--cbom-output=<file>`       |       | Write CycloneDX CBOM JSON document           |
+| `--crypto-probe-mode=<mode>` |       | Set probe depth: `tls-only` or `operations`  |
+| `--json`                     | `-j`  | Output results as JSON                       |
+| `--help`                     | `-h`  | Show help                                    |
+| `--version`                  | `-v`  | Show version                                 |
 
 ### Built-in Policies
 

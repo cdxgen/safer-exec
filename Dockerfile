@@ -18,7 +18,7 @@ COPY go/ ./
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" \
-    -o /out/safer-exec ./cmd/safer-exec/
+    -o /out/safer-exec-rt ./cmd/safer-exec/
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage 2: Slim runtime image
@@ -50,12 +50,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /out/safer-exec /usr/local/bin/safer-exec
-RUN chmod +x /usr/local/bin/safer-exec
+COPY --from=build /out/safer-exec-rt /usr/local/bin/safer-exec-rt
+RUN chmod +x /usr/local/bin/safer-exec-rt
 
 # Symlink the package into global node_modules so require.resolve("@cdxgen/safer-exec")
 # resolves correctly from runner.js — without triggering npm's bin conflict with the
-# Go binary already at /usr/local/bin/safer-exec.
+# Go binary already at /usr/local/bin/safer-exec-rt.
 COPY npm/ /opt/safer-exec/
 RUN mkdir -p /usr/local/lib/node_modules/@cdxgen && \
     ln -sf /opt/safer-exec /usr/local/lib/node_modules/@cdxgen/safer-exec && \

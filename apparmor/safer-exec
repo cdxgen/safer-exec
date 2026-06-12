@@ -42,8 +42,9 @@ profile safer-exec /usr/lib/node_modules/@cdxgen/safer-exec/** flags=(attach_dis
   /tmp/safer-exec-* rw,
   /tmp/safer-exec-*/** rwkl,
 
-  # Allow executing the safer-exec binary itself
+  # Allow executing the safer-exec-rt binary itself
   /usr/lib/node_modules/@cdxgen/safer-exec/** rmix,
+  /usr/local/bin/safer-exec-rt rmix,
 
   # Allow all other paths required by npm/node
   /** mrixwlk,

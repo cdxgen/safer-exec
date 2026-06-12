@@ -64,6 +64,20 @@ type HTTPEvent struct {
 	Body string
 	// Source identifies which TLS library was intercepted.
 	Source Source
+
+	// CipherSuite is the IANA cipher suite ID (e.g., 0xC02C for ECDHE-RSA-AES256-GCM-SHA384).
+	// Populated when crypto tracing is active and the cipher has been resolved for this connection.
+	CipherSuite uint16
+	// CipherName is the human-readable cipher name (e.g., "ECDHE-RSA-AES256-GCM-SHA384").
+	CipherName string
+	// TLSVersion is the negotiated TLS version (e.g., "TLSv1.2").
+	TLSVersion string
+	// CipherBits is the number of secret bits in the cipher.
+	CipherBits int
+	// CryptoLibrary is the name of the detected crypto library for this connection.
+	CryptoLibrary string
+	// CryptoLibraryVersion is the version of the detected crypto library.
+	CryptoLibraryVersion string
 }
 
 // Tracer attaches eBPF uprobes to TLS write functions and emits HTTPEvents
@@ -84,6 +98,41 @@ type Tracer interface {
 	AttachGoTLS(exePath string) error
 	// AttachStaticOpenSSL attaches the OpenSSL SSL_write uprobe directly to the target executable.
 	AttachStaticOpenSSL(exePath string) error
+	// EnableCryptoTracing attaches eBPF uretprobes to cipher negotiation functions
+	// (SSL_get_current_cipher, SSL_CIPHER_get_name, gnutls_cipher_suite_get_name)
+	// to capture negotiated cipher suites per connection. Cipher info is attached
+	// to HTTPEvents via per-connection lookup by ConnID.
+	EnableCryptoTracing() error
+	// DetectedLibraries returns the list of crypto libraries detected during probing.
+	DetectedLibraries() []CryptoLibraryInfo
 	// Close detaches all probes and releases eBPF resources.
 	Close() error
+}
+
+// CryptoLibraryInfo describes a detected crypto library with version info.
+type CryptoLibraryInfo struct {
+	Name    string
+	Version string
+	Path    string
+	Source  string
+}
+
+// CipherResult holds the parsed cipher information from a single TLS connection.
+// It is produced by the cipher event channel and looked up by ConnID when
+// HTTP events are generated.
+type CipherResult struct {
+	// ConnID is the TLS connection identifier (SSL* / session pointer).
+	ConnID uint64
+	// Name is the human-readable cipher suite name.
+	Name string
+	// IANAName is the IANA-registered cipher suite name.
+	IANAName string
+	// IANAID is the IANA cipher suite ID.
+	IANAID uint16
+	// Protocol is the TLS version string.
+	Protocol string
+	// Bits is the secret bits count.
+	Bits int
+	// PID is the host PID of the process that negotiated this cipher.
+	PID uint32
 }

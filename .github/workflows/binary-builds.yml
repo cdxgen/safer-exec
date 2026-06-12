@@ -85,7 +85,7 @@ jobs:
         run: |
           # First compile Go binary on the host runner to avoid installing Go inside Docker
           echo "Compiling static Go binary on host for Linux ${{ matrix.arch }}..."
-          (cd go && CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -trimpath -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/)
+          (cd go && CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -trimpath -ldflags="-s -w" -o bin/safer-exec-rt ./cmd/safer-exec/)
 
           # Now run caxa inside an Alpine container which has a musl Node.js
           echo "Packaging standalone binary inside Alpine Docker..."

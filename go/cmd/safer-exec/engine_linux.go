@@ -146,9 +146,27 @@ func run(cfg config.ExecConfig) error {
 	var httpTracer httptrace.Tracer
 	var httpEvents []config.HTTPAccessEntry
 	var stopPIDRefresh chan struct{}
+	var cryptoResult *config.CryptoResult
+
+	// Auto-enable HTTP URL tracing if crypto tracing is requested
+	if cfg.TraceCrypto && !cfg.TraceHTTPURLs {
+		cfg.TraceHTTPURLs = true
+	}
+
 	if cfg.TraceHTTPURLs {
 		if tr, err2 := httptrace.New(); err2 == nil {
 			httpTracer = tr
+
+			// Enable crypto tracing if requested
+			if cfg.TraceCrypto {
+				if err3 := httpTracer.EnableCryptoTracing(); err3 != nil {
+					fmt.Fprintf(os.Stderr, "safer-exec: warning: crypto-trace: %v\n", err3)
+				} else {
+					// Cipher probes run against all PIDs so they fire before we
+					// know the child PID; bypass the per-PID filter here.
+					_ = httpTracer.SetTraceAll(true)
+				}
+			}
 
 			// Resolve command path to attach static uprobes to target binary
 			var cmdPath string
@@ -291,6 +309,7 @@ func run(cfg config.ExecConfig) error {
 		go monitorMaps(cmd.Process.Pid, stopMonitor)
 	}
 
+	var httpEventsDone chan struct{}
 	if httpTracer != nil {
 		rootPID := uint32(cmd.Process.Pid)
 		_ = httpTracer.AddPID(rootPID)
@@ -310,18 +329,27 @@ func run(cfg config.ExecConfig) error {
 			}
 		}()
 
+		httpEventsDone = make(chan struct{})
 		go func() {
+			defer close(httpEventsDone)
 			for ev := range httpTracer.Events() {
 				entry := config.HTTPAccessEntry{
-					Method:   ev.Method,
-					Host:     ev.Host,
-					Path:     ev.Path,
-					Protocol: ev.Protocol,
-					Port:     ev.Port,
-					Query:    ev.Query,
-					Body:     ev.Body,
-					Source:   ev.Source.String(),
-					PID:      ev.PID,
+					Method:               ev.Method,
+					Host:                 ev.Host,
+					Path:                 ev.Path,
+					Protocol:             ev.Protocol,
+					Port:                 ev.Port,
+					Query:                ev.Query,
+					Body:                 ev.Body,
+					Source:               ev.Source.String(),
+					PID:                  ev.PID,
+					Cipher:               ev.CipherName,
+					CipherIANAName:       httptrace.IANACipherName(ev.CipherName),
+					CipherIANAID:         ev.CipherSuite,
+					TLSVersion:           ev.TLSVersion,
+					CipherBits:           ev.CipherBits,
+					CryptoLibrary:        ev.CryptoLibrary,
+					CryptoLibraryVersion: ev.CryptoLibraryVersion,
 				}
 				if cfg.EnableAudit {
 					logAuditHTTPEntry(entry)
@@ -329,6 +357,20 @@ func run(cfg config.ExecConfig) error {
 				httpEvents = append(httpEvents, entry)
 			}
 		}()
+	}
+
+	// closeHTTPTracer shuts down HTTP tracing and waits for the event goroutine
+	// to finish draining and writing all audit entries before returning.
+	// Must be called instead of httpTracer.Close() everywhere in this function.
+	closeHTTPTracer := func() {
+		if httpTracer == nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+		httpTracer.Close()
+		if httpEventsDone != nil {
+			<-httpEventsDone
+		}
 	}
 
 	err = cmd.Wait()
@@ -360,10 +402,7 @@ func run(cfg config.ExecConfig) error {
 				return runReduced(cfg, cfgJSON, selfPath, httpTracer, &httpEvents, &stopPIDRefresh)
 			}
 			if code == 132 || code == 137 || code == 153 {
-				if httpTracer != nil {
-					time.Sleep(100 * time.Millisecond)
-					httpTracer.Close()
-				}
+				closeHTTPTracer()
 				// Output diff even if killed by limits
 				if cfg.EnableDiff && beforeSnap != nil {
 					if afterSnap, err := fsdiff.SnapshotPath(cfg.WritePaths...); err == nil {
@@ -375,19 +414,13 @@ func run(cfg config.ExecConfig) error {
 				}
 				return nil
 			}
-			if httpTracer != nil {
-				time.Sleep(100 * time.Millisecond)
-				httpTracer.Close()
-			}
+			closeHTTPTracer()
 			if code == -1 {
 				fmt.Fprintf(os.Stderr, "safer-exec: process killed by signal: %v\n", exitErr.ProcessState.String())
 			}
 			return &ExitError{Code: code}
 		}
-		if httpTracer != nil {
-			time.Sleep(100 * time.Millisecond)
-			httpTracer.Close()
-		}
+		closeHTTPTracer()
 		return fmt.Errorf("running sandboxed process: %w", err)
 	}
 
@@ -405,10 +438,7 @@ func run(cfg config.ExecConfig) error {
 		collectAuditLog(auditR)
 	}
 
-	if httpTracer != nil {
-		time.Sleep(100 * time.Millisecond)
-		httpTracer.Close()
-	}
+	closeHTTPTracer()
 
 	// Enforce AllowURLRules against captured HTTP events (Linux-only, requires TraceHTTPURLs).
 	// This is observational enforcement: Landlock already restricts ports; we surface
@@ -436,12 +466,260 @@ func run(cfg config.ExecConfig) error {
 		}
 	}
 
+	// Build and emit crypto result if tracing was enabled
+	if cfg.TraceCrypto && httpTracer != nil {
+		cryptoResult = buildCryptoResult(httpTracer, httpEvents)
+		if len(cfg.AllowCiphers) > 0 && len(cryptoResult.Ciphers) > 0 {
+			allowedMap := make(map[string]bool)
+			for _, ac := range cfg.AllowCiphers {
+				allowedMap[ac] = true
+			}
+			for i := range cryptoResult.Ciphers {
+				c := &cryptoResult.Ciphers[i]
+				if !allowedMap[c.Name] && !allowedMap[c.IANAName] {
+					logAuditEntry("cipher-violation", c.Name)
+					fmt.Fprintf(os.Stderr, "safer-exec: cipher-violation: cipher %s (IANA: %s) is not allowed by policy\n", c.Name, c.IANAName)
+				}
+			}
+		}
+		if cfg.EnableAudit {
+			logAuditCryptoResult(cfg, cryptoResult)
+		}
+		if data, err := json.Marshal(cryptoResult); err == nil {
+			writeStructured(cfg, "CRYPTO:", data)
+		}
+		if cfg.CBOMOutputPath != "" {
+			writeCBOMFile(cfg.CBOMOutputPath, cryptoResult)
+		}
+	}
+
 	return nil
+}
+
+// buildCryptoResult aggregates detected libraries, cipher suites, and operations
+// from the tracer and HTTP events into a CryptoResult.
+func buildCryptoResult(tracer httptrace.Tracer, httpEvents []config.HTTPAccessEntry) *config.CryptoResult {
+	result := &config.CryptoResult{Platform: "linux"}
+
+	// Collect libraries from tracer
+	for _, lib := range tracer.DetectedLibraries() {
+		result.Libraries = append(result.Libraries, config.CryptoLibrary{
+			Name:    lib.Name,
+			Version: lib.Version,
+			Path:    lib.Path,
+			Source:  lib.Source,
+		})
+	}
+
+	// Retroactively populate missing cipher info on HTTP events
+	if cl, ok := tracer.(interface {
+		CipherForConnID(uint64, uint32) (httptrace.CipherResult, bool)
+	}); ok {
+		for i := range httpEvents {
+			e := &httpEvents[i]
+			if e.Cipher == "" {
+				if cr, found := cl.CipherForConnID(0, e.PID); found {
+					e.Cipher = cr.Name
+					e.CipherIANAName = cr.IANAName
+					e.CipherIANAID = cr.IANAID
+					e.TLSVersion = cr.Protocol
+					e.CipherBits = cr.Bits
+				}
+			}
+		}
+	}
+
+	// Deduplicate ciphers and collect operations
+	seenCiphers := make(map[string]bool)
+	seenOps := make(map[string]*config.CryptoOperation)
+
+	for _, e := range httpEvents {
+		if e.Cipher == "" {
+			continue
+		}
+		// Check for crypto operation entries
+		if e.Cipher == "MD5" || e.Cipher == "SHA-1" || e.Cipher == "SHA-256" || e.Cipher == "SHA-512" || e.Cipher == "AES" || e.Cipher == "SHA-224" || e.Cipher == "SHA-384" {
+			opType := "digest"
+			if e.Cipher == "AES" {
+				if e.CipherBits == 6 {
+					opType = "decrypt"
+				} else {
+					opType = "encrypt"
+				}
+			}
+			key := opType + ":" + e.Cipher
+			if op, exists := seenOps[key]; exists {
+				op.Count++
+			} else {
+				seenOps[key] = &config.CryptoOperation{
+					Type:      opType,
+					Algorithm: e.Cipher,
+					Library:   "OpenSSL/Go internal",
+					PID:       e.PID,
+					Count:     1,
+				}
+			}
+			continue
+		}
+
+		key := e.Cipher + ":" + e.CryptoLibrary
+		if seenCiphers[key] {
+			continue
+		}
+		seenCiphers[key] = true
+
+		dec := httptrace.DecomposeCipherName(e.Cipher)
+		result.Ciphers = append(result.Ciphers, config.CipherInfo{
+			Name:           e.Cipher,
+			IANAName:       e.CipherIANAName,
+			IANAID:         e.CipherIANAID,
+			Protocol:       e.TLSVersion,
+			Bits:           e.CipherBits,
+			KeyExchange:    dec.KeyExchange,
+			Authentication: dec.Authentication,
+			Encryption:     dec.Encryption,
+			EncryptionBits: dec.EncryptionBits,
+			Hash:           dec.Hash,
+			Mode:           dec.Mode,
+			Library:        e.CryptoLibrary,
+			LibraryVersion: e.CryptoLibraryVersion,
+			PID:            e.PID,
+		})
+	}
+
+	for _, op := range seenOps {
+		result.Operations = append(result.Operations, *op)
+	}
+
+	if result.Libraries == nil {
+		result.Libraries = []config.CryptoLibrary{}
+	}
+	if result.Ciphers == nil {
+		result.Ciphers = []config.CipherInfo{}
+	}
+	if result.Operations == nil {
+		result.Operations = []config.CryptoOperation{}
+	}
+
+	return result
+}
+
+// cbomDoc is a minimal CycloneDX CBOM document structure.
+type cbomDoc struct {
+	BomFormat   string          `json:"bomFormat"`
+	SpecVersion string          `json:"specVersion"`
+	Version     int             `json:"version"`
+	Components  []cbomComponent `json:"components,omitempty"`
+}
+
+type cbomComponent struct {
+	Type             string           `json:"type"`
+	Name             string           `json:"name"`
+	Version          string           `json:"version,omitempty"`
+	CryptoProperties *cbomCryptoProps `json:"cryptoProperties,omitempty"`
+}
+
+type cbomCryptoProps struct {
+	AssetType                  string            `json:"assetType"`
+	AlgorithmProperties        *cbomAlgoProps    `json:"algorithmProperties,omitempty"`
+	RelatedCryptoMaterialProps *cbomRelatedProps `json:"relatedCryptoMaterialProperties,omitempty"`
+}
+
+type cbomAlgoProps struct {
+	Primitive              string   `json:"primitive,omitempty"`
+	ParameterSetIdentifier string   `json:"parameterSetIdentifier,omitempty"`
+	Mode                   string   `json:"mode,omitempty"`
+	ExecutionEnvironment   string   `json:"executionEnvironment,omitempty"`
+	ImplementationPlatform string   `json:"implementationPlatform,omitempty"`
+	CryptoFunctions        []string `json:"cryptoFunctions,omitempty"`
+	ClassicalSecurityLevel int      `json:"classicalSecurityLevel,omitempty"`
+}
+
+type cbomRelatedProps struct {
+	Type string `json:"type"`
+}
+
+// writeCBOMFile writes a minimal CycloneDX CBOM JSON document to the given path.
+func writeCBOMFile(path string, cryptoResult *config.CryptoResult) {
+	doc := cbomDoc{
+		BomFormat:   "CycloneDX",
+		SpecVersion: "1.7",
+		Version:     1,
+	}
+
+	for _, lib := range cryptoResult.Libraries {
+		ver := lib.Version
+		if ver == "" {
+			ver = "unknown"
+		}
+		doc.Components = append(doc.Components, cbomComponent{
+			Type:    "cryptographic-asset",
+			Name:    lib.Name,
+			Version: ver,
+			CryptoProperties: &cbomCryptoProps{
+				AssetType: "related-crypto-material",
+				RelatedCryptoMaterialProps: &cbomRelatedProps{
+					Type: "library",
+				},
+			},
+		})
+	}
+
+	for _, c := range cryptoResult.Ciphers {
+		funcs := []string{"encrypt"}
+		if c.Mode != "" {
+			funcs = append(funcs, "decrypt")
+		}
+		doc.Components = append(doc.Components, cbomComponent{
+			Type:    "cryptographic-asset",
+			Name:    c.Name,
+			Version: c.Protocol,
+			CryptoProperties: &cbomCryptoProps{
+				AssetType: "algorithm",
+				AlgorithmProperties: &cbomAlgoProps{
+					Primitive:              algoPrimitive(c),
+					ParameterSetIdentifier: c.Hash,
+					Mode:                   c.Mode,
+					ExecutionEnvironment:   c.Library,
+					ImplementationPlatform: c.Library,
+					CryptoFunctions:        funcs,
+					ClassicalSecurityLevel: c.Bits,
+				},
+			},
+		})
+	}
+
+	data, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: cbom marshal: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: cbom write: %v\n", err)
+	}
+}
+
+func algoPrimitive(c config.CipherInfo) string {
+	switch {
+	case c.Mode == "GCM" || c.Mode == "CCM" || c.Mode == "POLY1305":
+		return "aead"
+	case c.Encryption != "":
+		return "block-cipher"
+	case c.KeyExchange != "":
+		return "key-agree"
+	default:
+		return "other"
+	}
 }
 
 // runLearn executes the command in learning mode using strace to observe behavior.
 func runLearn(cfg config.ExecConfig) error {
 	l := learner.New()
+
+	// Auto-enable HTTP URL tracing if crypto tracing is requested
+	if cfg.TraceCrypto && !cfg.TraceHTTPURLs {
+		cfg.TraceHTTPURLs = true
+	}
 
 	// Set up eBPF HTTP tracer if requested
 	var httpTracer httptrace.Tracer
@@ -449,17 +727,32 @@ func runLearn(cfg config.ExecConfig) error {
 	if cfg.TraceHTTPURLs {
 		if tr, err := httptrace.New(); err == nil {
 			httpTracer = tr
+
+			// Enable crypto tracing if requested
+			if cfg.TraceCrypto {
+				if err2 := httpTracer.EnableCryptoTracing(); err2 != nil {
+					fmt.Fprintf(os.Stderr, "safer-exec: warning: crypto-trace: %v\n", err2)
+				}
+			}
+
 			// In learn mode with strace, we set trace-all because we don't
 			// know child PIDs ahead of time; strace spawns them itself.
 			_ = tr.SetTraceAll(true)
 			go func() {
 				for ev := range tr.Events() {
 					httpEntries = append(httpEntries, config.HTTPAccessEntry{
-						Method: ev.Method,
-						Host:   ev.Host,
-						Path:   ev.Path,
-						Source: ev.Source.String(),
-						PID:    ev.PID,
+						Method:               ev.Method,
+						Host:                 ev.Host,
+						Path:                 ev.Path,
+						Source:               ev.Source.String(),
+						PID:                  ev.PID,
+						Cipher:               ev.CipherName,
+						CipherIANAName:       httptrace.IANACipherName(ev.CipherName),
+						CipherIANAID:         ev.CipherSuite,
+						TLSVersion:           ev.TLSVersion,
+						CipherBits:           ev.CipherBits,
+						CryptoLibrary:        ev.CryptoLibrary,
+						CryptoLibraryVersion: ev.CryptoLibraryVersion,
 					})
 				}
 			}()
@@ -484,6 +777,23 @@ func runLearn(cfg config.ExecConfig) error {
 		// Synthesise AllowURLRules from observed HTTP access for use as an
 		// enforcement policy in subsequent runs with --policy-file.
 		policy.AllowURLRules = config.SynthesiseURLRules(httpEntries)
+	}
+
+	// Build and emit crypto result if tracing was enabled
+	if cfg.TraceCrypto && httpTracer != nil {
+		cryptoResult := buildCryptoResult(httpTracer, httpEntries)
+		policy.CryptoCiphers = cryptoResult.Ciphers
+		policy.CryptoLibraries = cryptoResult.Libraries
+		policy.CryptoOperations = cryptoResult.Operations
+		if cfg.EnableAudit {
+			logAuditCryptoResult(cfg, cryptoResult)
+		}
+		if data, err := json.Marshal(cryptoResult); err == nil {
+			writeStructured(cfg, "CRYPTO:", data)
+		}
+		if cfg.CBOMOutputPath != "" {
+			writeCBOMFile(cfg.CBOMOutputPath, cryptoResult)
+		}
 	}
 
 	data, _ := json.Marshal(policy)
@@ -575,6 +885,7 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 	// SetTraceAll is used here because in reduced mode there is no PID namespace
 	// isolation, and the PID filter may not correctly resolve child PIDs on some
 	// kernels (e.g. OrbStack, custom VMM kernels).
+	var httpEventsDone chan struct{}
 	if httpTracer != nil {
 		rootPID := uint32(cmd.Process.Pid)
 		_ = httpTracer.AddPID(rootPID)
@@ -595,7 +906,9 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 			}
 		}()
 
+		httpEventsDone = make(chan struct{})
 		go func() {
+			defer close(httpEventsDone)
 			for ev := range httpTracer.Events() {
 				entry := config.HTTPAccessEntry{
 					Method:   ev.Method,
@@ -626,6 +939,9 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 	if httpTracer != nil {
 		time.Sleep(100 * time.Millisecond)
 		httpTracer.Close()
+		if httpEventsDone != nil {
+			<-httpEventsDone
+		}
 	}
 
 	if waitErr != nil {
@@ -1401,7 +1717,93 @@ func logAuditHTTPEntry(e config.HTTPAccessEntry) {
 	if e.Body != "" {
 		entry["body"] = e.Body
 	}
+	if e.Cipher != "" {
+		entry["cipher"] = e.Cipher
+	}
+	if e.CipherIANAName != "" {
+		entry["cipherIanaName"] = e.CipherIANAName
+	}
+	if e.CipherIANAID != 0 {
+		entry["cipherIanaId"] = e.CipherIANAID
+	}
+	if e.TLSVersion != "" {
+		entry["tlsVersion"] = e.TLSVersion
+	}
+	if e.CipherBits != 0 {
+		entry["cipherBits"] = e.CipherBits
+	}
+	if e.CryptoLibrary != "" {
+		entry["cryptoLibrary"] = e.CryptoLibrary
+	}
+	if e.CryptoLibraryVersion != "" {
+		entry["cryptoLibraryVersion"] = e.CryptoLibraryVersion
+	}
 	data, _ := json.Marshal(entry)
+	auditFD := os.Getenv("SAFER_EXEC_AUDIT_FD")
+	if auditFD != "" {
+		fd, _ := strconv.Atoi(auditFD)
+		syscall.Write(fd, append(data, '\n'))
+	} else {
+		fmt.Fprintf(os.Stderr, "%s\n", string(data))
+	}
+}
+
+// logAuditCryptoResult emits audit events for ciphers, libraries, and operations.
+func logAuditCryptoResult(cfg config.ExecConfig, r *config.CryptoResult) {
+	if r == nil {
+		return
+	}
+	// Log ciphers
+	for _, c := range r.Ciphers {
+		entry := map[string]interface{}{
+			"type":           "crypto-cipher",
+			"name":           c.Name,
+			"ianaName":       c.IANAName,
+			"ianaId":         c.IANAID,
+			"protocol":       c.Protocol,
+			"bits":           c.Bits,
+			"keyExchange":    c.KeyExchange,
+			"authentication": c.Authentication,
+			"encryption":     c.Encryption,
+			"encryptionBits": c.EncryptionBits,
+			"hash":           c.Hash,
+			"mode":           c.Mode,
+			"library":        c.Library,
+			"libraryVersion": c.LibraryVersion,
+			"pid":            c.PID,
+		}
+		data, _ := json.Marshal(entry)
+		writeAuditRaw(data)
+	}
+	// Log libraries
+	for _, l := range r.Libraries {
+		entry := map[string]interface{}{
+			"type":    "crypto-library",
+			"name":    l.Name,
+			"version": l.Version,
+			"path":    l.Path,
+			"source":  l.Source,
+		}
+		data, _ := json.Marshal(entry)
+		writeAuditRaw(data)
+	}
+	// Log operations
+	for _, o := range r.Operations {
+		entry := map[string]interface{}{
+			"type":           "crypto-operation",
+			"operation":      o.Type,
+			"algorithm":      o.Algorithm,
+			"library":        o.Library,
+			"libraryVersion": o.LibraryVersion,
+			"pid":            o.PID,
+			"count":          o.Count,
+		}
+		data, _ := json.Marshal(entry)
+		writeAuditRaw(data)
+	}
+}
+
+func writeAuditRaw(data []byte) {
 	auditFD := os.Getenv("SAFER_EXEC_AUDIT_FD")
 	if auditFD != "" {
 		fd, _ := strconv.Atoi(auditFD)
@@ -1834,9 +2236,13 @@ func runDiagnostics() config.DiagnosticsResult {
 		case "0":
 			detail += " (unprivileged BPF enabled)"
 		case "1":
-			detail += " (CAP_BPF required)"
+			detail += " (CAP_BPF/CAP_SYS_ADMIN required)"
 		case "2":
-			detail += " (CAP_BPF required, locked)"
+			detail += " (CAP_BPF/CAP_SYS_ADMIN required, locked)"
+		}
+		// Verify if we have actually load privilege or if root/sudo is needed
+		if os.Getuid() != 0 {
+			detail += " - WARNING: running as non-root user (UID != 0). eBPF tracing requires sudo or CAP_BPF+CAP_PERFMON+CAP_SYS_RESOURCE capabilities."
 		}
 		result.Capabilities["ebpf"] = config.CapabilityInfo{Available: true, Detail: detail}
 	} else {
@@ -1871,6 +2277,14 @@ func runDiagnostics() config.DiagnosticsResult {
 		}
 	} else {
 		result.Capabilities["fips_detection"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
+	// System-wide Go runtime binary check
+	systemBin := "/usr/local/bin/safer-exec-rt"
+	if _, err := os.Stat(systemBin); err == nil {
+		result.Capabilities["system_runtime_binary"] = config.CapabilityInfo{Available: true, Detail: fmt.Sprintf("safer-exec-rt found at %s", systemBin)}
+	} else {
+		result.Capabilities["system_runtime_binary"] = config.CapabilityInfo{Available: false, Detail: fmt.Sprintf("safer-exec-rt NOT found at %s. Consider running: sudo cp <path>/safer-exec-rt %s", systemBin, systemBin)}
 	}
 
 	// Map capabilities to features
@@ -1909,11 +2323,14 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["trace_libraries"] = true
 	result.Features["trace_http_urls"] = bpfForTrace
 	result.Features["allow_url_rules"] = bpfForTrace
+	result.Features["trace_crypto"] = bpfForTrace
 	result.Features["time_isolation"] = result.Capabilities["time_namespace"].Available
 	result.Features["ipc_isolation"] = result.Capabilities["ipc_namespace"].Available
 	result.Features["landlock_filesystem"] = result.Capabilities["landlock_filesystem"].Available
 	result.Features["apparmor_safer_exec"] = result.Capabilities["apparmor_safer_exec"].Available
 	result.Features["proc_hidepid"] = true // fresh proc mount always attempted after pivot_root
+	result.Features["lsm_bpf"] = bpfForTrace
+	result.Features["crypto_ops_auditing"] = true
 
 	return result
 }

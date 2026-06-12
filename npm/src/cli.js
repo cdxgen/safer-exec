@@ -92,6 +92,9 @@ Options:
   --trace-output-file=<file> Write tracked libraries to file (implies trace-libraries)
   --trace-temp-dir=<dir>     Temporary directory to extract dynamic library helper to (implies trace-libraries)
   --trace-http-urls          Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only, requires CAP_BPF)
+  --trace-crypto             Enable cryptographic tracing: cipher suites, libraries (auto-enables --trace-http-urls)
+  --cbom-output=<file>       Write CycloneDX CBOM JSON to file (requires --trace-crypto)
+  --crypto-probe-mode=<mode> Crypto probe depth: "tls-only" (default) or "operations"
 
   -d, --diff                 Enable filesystem mutation diffing
   -l, --learn                Enable behavioral auto-profiling (learning mode)
@@ -108,6 +111,7 @@ Options:
 
 Diagnostics:
   safer-exec diagnostics        Show OS capabilities and feature support
+  safer-exec bootstrap-apparmor Load AppArmor profile for user namespaces (Linux, requires sudo)
 
 Examples:
   # Run npm install with the NPM policy
@@ -194,6 +198,15 @@ function parseCliArgs() {
       'trace-http-urls': {
         type: 'boolean',
       },
+      'trace-crypto': {
+        type: 'boolean',
+      },
+      'cbom-output': {
+        type: 'string',
+      },
+      'crypto-probe-mode': {
+        type: 'string',
+      },
       'trace-output-file': {
         type: 'string',
       },
@@ -229,6 +242,10 @@ function parseCliArgs() {
         short: 'H',
       },
       'allow-url': {
+        type: 'string',
+        multiple: true,
+      },
+      'allow-cipher': {
         type: 'string',
         multiple: true,
       },
@@ -517,6 +534,18 @@ function buildExec(values, cmd, args) {
   if (values['trace-http-urls']) {
     exec.traceHTTPURLs();
   }
+  if (values['trace-crypto']) {
+    exec.traceCrypto();
+  }
+  if (values['cbom-output']) {
+    exec.cbom(values['cbom-output']);
+  }
+  if (values['allow-cipher']) {
+    exec.allowCiphers(values['allow-cipher']);
+  }
+  if (values['crypto-probe-mode']) {
+    exec.cryptoProbeMode(values['crypto-probe-mode']);
+  }
   if (values['trace-libraries'] || values['trace-output-file'] || values['trace-temp-dir']) {
     exec.traceLibraries();
     if (values['trace-output-file']) {
@@ -596,6 +625,7 @@ async function runDiagnosticsAndPrint() {
     trace_libraries: 'Library Tracing',
     trace_http_urls: 'HTTP URL Tracing',
     allow_url_rules: 'Allow URL Rules',
+    trace_crypto: 'Cryptographic Tracing',
     time_isolation: 'Time Namespace',
     ipc_isolation: 'IPC Namespace',
     landlock_filesystem: 'Landlock Filesystem',
@@ -641,6 +671,38 @@ async function main() {
   if (positionals.length === 1 && positionals[0] === 'diagnostics') {
     await runDiagnosticsAndPrint();
     process.exit(0);
+  }
+
+  // Handle bootstrap-apparmor command
+  if (positionals.length === 1 && positionals[0] === 'bootstrap-apparmor') {
+    const { execSync } = await import('node:child_process');
+    const { writeFileSync, existsSync } = await import('node:fs');
+    if (process.getuid?.() !== 0) {
+      process.stderr.write('[safer-exec] Error: bootstrap-apparmor command requires root/sudo privileges.\n');
+      process.exit(1);
+    }
+    const profilePath = '/etc/apparmor.d/safer-exec';
+    const profileContent = `
+# AppArmor profile for safer-exec — grants permission to create
+# unprivileged user namespaces required for full sandbox isolation.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile safer-exec /usr/local/bin/safer-exec-rt flags=(unconfined) {
+  userns,
+}
+`;
+    try {
+      process.stdout.write(`Writing AppArmor profile to ${profilePath}...\n`);
+      writeFileSync(profilePath, profileContent.trim() + '\n');
+      process.stdout.write('Parsing and loading AppArmor profile...\n');
+      execSync(`apparmor_parser -r ${profilePath}`);
+      process.stdout.write('AppArmor profile loaded successfully! Verify with: sudo aa-status | grep safer-exec\n');
+      process.exit(0);
+    } catch (err) {
+      process.stderr.write(`[safer-exec] Error loading AppArmor profile: ${err.message}\n`);
+      process.exit(1);
+    }
   }
 
   // Extract command and args from positionals (after --)
