@@ -883,17 +883,18 @@ int probe_crypto_sha384(struct pt_regs *ctx) {
 struct path {
     struct vfsmount *mnt;
     struct dentry *dentry;
-};
+} __attribute__((preserve_access_index));
 
 struct file {
+    void *dummy; // Force non-zero offset for f_path to generate CO-RE relocation
     struct path f_path;
-};
+} __attribute__((preserve_access_index));
 
 struct linux_binprm {
     char buf[128];
     void *page;
     struct file *file;
-};
+} __attribute__((preserve_access_index));
 
 SEC("lsm/bprm_check_security")
 int BPF_PROG(bprm_check_security, struct linux_binprm *bprm) {
