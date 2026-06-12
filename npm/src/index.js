@@ -1470,17 +1470,51 @@ export class SaferExec extends EventEmitter {
       }
     }
 
+    // Always ensure the Node.js runtime directories (raw and resolved realpath) are readable
+    // to allow executing Node.js under the sandbox.
+    try {
+      const nodeBinDir = dirname(process.execPath);
+      const nodeLibDir = nodeBinDir.replace(/bin$/, 'lib');
+      if (!effectiveReadPaths.includes(nodeBinDir)) {
+        effectiveReadPaths.push(nodeBinDir);
+      }
+      if (!effectiveReadPaths.includes(nodeLibDir)) {
+        effectiveReadPaths.push(nodeLibDir);
+      }
+    } catch {}
+
+    try {
+      const nodeRealBinDir = dirname(realpathSync(process.execPath));
+      const nodeRealLibDir = nodeRealBinDir.replace(/bin$/, 'lib');
+      if (!effectiveReadPaths.includes(nodeRealBinDir)) {
+        effectiveReadPaths.push(nodeRealBinDir);
+      }
+      if (!effectiveReadPaths.includes(nodeRealLibDir)) {
+        effectiveReadPaths.push(nodeRealLibDir);
+      }
+    } catch {}
+
     // Filter non-existent paths to prevent Go bind mount warnings/errors
     effectiveReadPaths = effectiveReadPaths.filter(p => existsSync(p));
     let effectiveWritePaths = [...this._writePaths].filter(p => existsSync(p));
 
     if (!this._allowHidden) {
       const hiddenRegex = /(^|\/)\.[^\/]+/;
-      const nodeBinDir = dirname(process.execPath);
-      const nodeLibDir = nodeBinDir.replace(/bin$/, 'lib');
+      const nodeDirs = new Set();
+      try {
+        const rawBin = dirname(process.execPath);
+        nodeDirs.add(rawBin);
+        nodeDirs.add(rawBin.replace(/bin$/, 'lib'));
+      } catch {}
+      try {
+        const realBin = dirname(realpathSync(process.execPath));
+        nodeDirs.add(realBin);
+        nodeDirs.add(realBin.replace(/bin$/, 'lib'));
+      } catch {}
 
       effectiveReadPaths = effectiveReadPaths.filter(p => {
-        if (p === nodeBinDir || p === nodeLibDir || p.startsWith(nodeBinDir + '/') || p.startsWith(nodeLibDir + '/')) {
+        const isNodeDir = Array.from(nodeDirs).some(nd => p === nd || p.startsWith(nd + '/'));
+        if (isNodeDir) {
           return true;
         }
         return !hiddenRegex.test(p);
