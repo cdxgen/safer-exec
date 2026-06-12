@@ -48,6 +48,7 @@ const (
 	bpfJmpEq            = 0x15 // BPF_JMP | BPF_JEQ | BPF_K
 	bpfJmpSet           = 0x45 // BPF_JMP | BPF_JSET | BPF_K
 	bpfJmpReturn        = 0x06 // BPF_RET | BPF_K
+	bpfAluAnd           = 0x54 // BPF_ALU | BPF_AND | BPF_K
 )
 
 // cloneThreadFlag is CLONE_THREAD: set when clone creates a thread, not a child process.
@@ -1744,6 +1745,36 @@ func applySeccomp(cfg config.ExecConfig) error {
 			syscall.SockFilter{Code: bpfJmpSet, Jt: 1, K: cloneThreadFlag},
 			syscall.SockFilter{Code: bpfJmpReturn, K: retKillOrTrap},
 			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0},
+		)
+	}
+
+	// Socket filtering (UNIX domain socket AF_UNIX, Netlink AF_NETLINK, UDP SOCK_DGRAM, RAW SOCK_RAW)
+	{
+		const (
+			afUnix       = 1
+			afNetlink    = 16
+			sockDgram    = 2
+			sockRaw      = 3
+			sockTypeMask = 0xf
+		)
+
+		retKillOrTrapSocket := uint32(seccompRetKill)
+		if cfg.EnableAudit {
+			trapVal := uint16(6 | (syscall.SYS_SOCKET&0xFF)<<8)
+			retKillOrTrapSocket = uint32(seccompRetTrap) | uint32(trapVal)
+		}
+
+		insts = append(insts,
+			syscall.SockFilter{Code: bpfJmpEq, Jf: 9, K: uint32(syscall.SYS_SOCKET)},
+			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 16}, // args[0] (domain)
+			syscall.SockFilter{Code: bpfJmpEq, Jt: 5, K: afUnix},
+			syscall.SockFilter{Code: bpfJmpEq, Jt: 4, K: afNetlink},
+			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 24}, // args[1] (type)
+			syscall.SockFilter{Code: bpfAluAnd, K: sockTypeMask},
+			syscall.SockFilter{Code: bpfJmpEq, Jt: 1, K: sockDgram},
+			syscall.SockFilter{Code: bpfJmpEq, Jt: 0, Jf: 1, K: sockRaw},
+			syscall.SockFilter{Code: bpfJmpReturn, K: retKillOrTrapSocket},
+			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0}, // reload
 		)
 	}
 
