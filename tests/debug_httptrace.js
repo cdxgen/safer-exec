@@ -1,5 +1,5 @@
 import { execSync, spawn } from 'node:child_process';
-import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, writeFileSync, unlinkSync, copyFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -66,6 +66,16 @@ try {
 console.log('\n=== TESTING SAFER-EXEC BINARY DIRECTLY ===');
 const localBinary = join(__dirname, '..', 'go', 'bin', 'safer-exec-rt');
 const systemBinary = '/usr/local/bin/safer-exec-rt';
+
+if (process.getuid?.() === 0 && existsSync(localBinary)) {
+  try {
+    copyFileSync(localBinary, systemBinary);
+    console.log(`Successfully bootstrapped local binary to ${systemBinary}`);
+  } catch (err) {
+    console.warn(`Warning: failed to bootstrap local binary to ${systemBinary}:`, err.message);
+  }
+}
+
 const binaryToUse = existsSync(systemBinary) ? systemBinary : localBinary;
 
 console.log(`Using binary: ${binaryToUse}`);
@@ -75,9 +85,15 @@ if (!existsSync(binaryToUse)) {
 }
 
 // Helper: run safer-exec with a given config and return { stdout, stderr, code }
-function runSaferExec(config) {
+function runSaferExec(config, useStrace = false) {
   return new Promise((resolve) => {
-    const child = spawn(binaryToUse, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let cmd = binaryToUse;
+    let args = [];
+    if (useStrace) {
+      cmd = 'strace';
+      args = ['-f', '-s', '512', binaryToUse];
+    }
+    const child = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => { stdout += d.toString(); });
@@ -152,6 +168,13 @@ if (curlPath) {
   console.log('\n=== STDERR ===');
   console.log(curlResult.stderr || '(empty)');
 
+  if (curlResult.code !== 0) {
+    console.log('\n=== RUNNING WITH STRACE FOR DIAGNOSTICS (curl) ===');
+    const straceRes = await runSaferExec(curlConfig, true);
+    console.log('=== STRACE OUTPUT ===');
+    console.log(straceRes.stderr);
+  }
+
   console.log('\n=== ANALYZED EVENTS (curl) ===');
   const curlAnalysis = analyseEvents(curlResult.stderr);
   console.log(`- Captured http-request: ${curlAnalysis.hasHttpReq ? 'YES' : 'NO'}`);
@@ -220,6 +243,13 @@ console.log('\n=== STDOUT ===');
 console.log(nodeResult.stdout || '(empty)');
 console.log('\n=== STDERR ===');
 console.log(nodeResult.stderr || '(empty)');
+
+if (nodeResult.code !== 0) {
+  console.log('\n=== RUNNING WITH STRACE FOR DIAGNOSTICS (node) ===');
+  const straceRes = await runSaferExec(nodeConfig, true);
+  console.log('=== STRACE OUTPUT ===');
+  console.log(straceRes.stderr);
+}
 
 console.log('\n=== ANALYZED EVENTS (node + getCipher) ===');
 const nodeAnalysis = analyseEvents(nodeResult.stderr);

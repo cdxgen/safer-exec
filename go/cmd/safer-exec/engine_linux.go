@@ -1761,10 +1761,6 @@ func applySeccomp(cfg config.ExecConfig) error {
 		)
 
 		retKillOrTrapSocket := uint32(seccompRetErrno) | uint32(syscall.EACCES)
-		if cfg.EnableAudit {
-			trapVal := uint16(6 | (syscall.SYS_SOCKET&0xFF)<<8)
-			retKillOrTrapSocket = uint32(seccompRetTrap) | uint32(trapVal)
-		}
 
 		insts = append(insts,
 			syscall.SockFilter{Code: bpfJmpEq, Jf: 7, K: uint32(syscall.SYS_SOCKET)},
@@ -1781,12 +1777,11 @@ func applySeccomp(cfg config.ExecConfig) error {
 
 	for _, call := range actualBlockCalls {
 		insts = append(insts, syscall.SockFilter{Code: bpfJmpEq, Jf: 1, K: uint32(call)})
-		if cfg.EnableAudit {
-			trapVal := uint16(6 | (call&0xFF)<<8)
-			insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: uint32(seccompRetTrap) | uint32(trapVal)})
-		} else {
-			insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: uint32(seccompRetErrno) | uint32(syscall.EPERM)})
-		}
+		// Always return EPERM for the default hardening blocklist.
+		// This allows runtime engines (like Node.js/V8, Go, Python) to handle
+		// the permission error gracefully and fallback, rather than crashing
+		// with SIGSYS (bad system call) when audit is enabled.
+		insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: uint32(seccompRetErrno) | uint32(syscall.EPERM)})
 	}
 	insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: seccompRetAllow})
 
