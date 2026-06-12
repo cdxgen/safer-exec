@@ -1476,7 +1476,15 @@ export class SaferExec extends EventEmitter {
 
     if (!this._allowHidden) {
       const hiddenRegex = /(^|\/)\.[^\/]+/;
-      effectiveReadPaths = effectiveReadPaths.filter(p => !hiddenRegex.test(p));
+      const nodeBinDir = dirname(process.execPath);
+      const nodeLibDir = nodeBinDir.replace(/bin$/, 'lib');
+
+      effectiveReadPaths = effectiveReadPaths.filter(p => {
+        if (p === nodeBinDir || p === nodeLibDir || p.startsWith(nodeBinDir + '/') || p.startsWith(nodeLibDir + '/')) {
+          return true;
+        }
+        return !hiddenRegex.test(p);
+      });
       effectiveWritePaths = effectiveWritePaths.filter(p => !hiddenRegex.test(p));
     }
 
