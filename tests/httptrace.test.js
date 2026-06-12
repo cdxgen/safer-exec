@@ -9,6 +9,7 @@ class SaferExec extends OriginalSaferExec {
   constructor(options = {}) {
     super(options);
     this.readPaths('/tmp');
+    this.writePaths('/tmp');
   }
 }
 
