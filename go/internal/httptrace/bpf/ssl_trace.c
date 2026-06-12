@@ -907,16 +907,11 @@ int BPF_PROG(bprm_check_security, struct linux_binprm *bprm) {
             return 0;
     }
 
-    struct file *file = NULL;
-    if (bpf_probe_read_kernel(&file, sizeof(file), &bprm->file) < 0 || !file)
-        return 0;
-
-    struct path f_path;
-    if (bpf_probe_read_kernel(&f_path, sizeof(f_path), &file->f_path) < 0)
+    if (!bprm || !bprm->file)
         return 0;
 
     char path_buf[256];
-    long len = bpf_d_path(&f_path, path_buf, sizeof(path_buf));
+    long len = bpf_d_path(&bprm->file->f_path, path_buf, sizeof(path_buf));
     if (len < 0)
         len = 0;
 
@@ -955,12 +950,8 @@ int BPF_PROG(file_open, struct file *file, int mask) {
     if (!file)
         return 0;
 
-    struct path f_path;
-    if (bpf_probe_read_kernel(&f_path, sizeof(f_path), &file->f_path) < 0)
-        return 0;
-
     char path_buf[256];
-    long len = bpf_d_path(&f_path, path_buf, sizeof(path_buf));
+    long len = bpf_d_path(&file->f_path, path_buf, sizeof(path_buf));
     if (len < 0)
         len = 0;
 
