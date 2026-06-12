@@ -42,6 +42,7 @@ const (
 const (
 	seccompRetKill  = 0x00000000
 	seccompRetTrap  = 0x00030000
+	seccompRetErrno = 0x00050000
 	seccompRetAllow = 0x7fff0000
 )
 
@@ -1750,30 +1751,28 @@ func applySeccomp(cfg config.ExecConfig) error {
 		)
 	}
 
-	// Socket filtering (UNIX domain socket AF_UNIX, Netlink AF_NETLINK, UDP SOCK_DGRAM, RAW SOCK_RAW)
+	// Socket filtering (UNIX domain socket AF_UNIX, Netlink AF_NETLINK, RAW SOCK_RAW)
 	{
 		const (
 			afUnix       = 1
 			afNetlink    = 16
-			sockDgram    = 2
 			sockRaw      = 3
 			sockTypeMask = 0xf
 		)
 
-		retKillOrTrapSocket := uint32(seccompRetKill)
+		retKillOrTrapSocket := uint32(seccompRetErrno) | uint32(syscall.EACCES)
 		if cfg.EnableAudit {
 			trapVal := uint16(6 | (syscall.SYS_SOCKET&0xFF)<<8)
 			retKillOrTrapSocket = uint32(seccompRetTrap) | uint32(trapVal)
 		}
 
 		insts = append(insts,
-			syscall.SockFilter{Code: bpfJmpEq, Jf: 9, K: uint32(syscall.SYS_SOCKET)},
+			syscall.SockFilter{Code: bpfJmpEq, Jf: 7, K: uint32(syscall.SYS_SOCKET)},
 			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 16}, // args[0] (domain)
-			syscall.SockFilter{Code: bpfJmpEq, Jt: 5, K: afUnix},
-			syscall.SockFilter{Code: bpfJmpEq, Jt: 4, K: afNetlink},
+			syscall.SockFilter{Code: bpfJmpEq, Jt: 4, K: afUnix},
+			syscall.SockFilter{Code: bpfJmpEq, Jt: 3, K: afNetlink},
 			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 24}, // args[1] (type)
 			syscall.SockFilter{Code: bpfAluAnd, K: sockTypeMask},
-			syscall.SockFilter{Code: bpfJmpEq, Jt: 1, K: sockDgram},
 			syscall.SockFilter{Code: bpfJmpEq, Jt: 0, Jf: 1, K: sockRaw},
 			syscall.SockFilter{Code: bpfJmpReturn, K: retKillOrTrapSocket},
 			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0}, // reload
