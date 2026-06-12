@@ -1684,6 +1684,16 @@ func applySeccomp(cfg config.ExecConfig) error {
 		syscall.SYS_REMOVEXATTR, syscall.SYS_LREMOVEXATTR, syscall.SYS_FREMOVEXATTR,
 		// Block eBPF, perf monitoring, tracepoints, userfaultfd, and kernel key manager
 		syscall.SYS_BPF, syscall.SYS_PERF_EVENT_OPEN, syscall.SYS_USERFAULTFD, syscall.SYS_KEYCTL,
+		// Block time manipulation
+		syscall.SYS_SETTIMEOFDAY, syscall.SYS_CLOCK_SETTIME, syscall.SYS_ADJTIMEX,
+		// Block kernel logging / dmesg address leaks
+		syscall.SYS_SYSLOG,
+		// Block raw port IO and hardware control
+		syscall.SYS_IOPERM, syscall.SYS_IOPL,
+		// Block limit alterations
+		syscall.SYS_SETRLIMIT, syscall.SYS_PRLIMIT64,
+		// Block accounting, reboot, and chroot
+		syscall.SYS_ACCT, syscall.SYS_REBOOT, syscall.SYS_KEXEC_LOAD, syscall.SYS_CHROOT,
 	}
 	if cfg.BlockFork {
 		// SYS_CLONE is handled separately below with a flag check to allow thread creation.
