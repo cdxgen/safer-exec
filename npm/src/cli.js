@@ -103,7 +103,9 @@ Options:
   -a, --audit                Enable sandbox violation auditing
       --audit-output-file=<f> Write audit log to file (implies audit)
   -s, --strict               Treat sandbox setup warnings as errors
-      --sanitize-env          Strip sensitive env vars (TOKEN, SECRET, etc.)
+      --allow-envs=<vars>     Comma-separated host env vars to pass through (always sanitized by default)
+      --allow-hidden          Allow access to hidden files and directories (blocked by default)
+      --allow-listen=<list>   Comma-separated list of IP addresses or ip:port strings to allow listening on (blocked by default)
 
   -j, --json                 Output results as JSON
   -h, --help                 Show this help message
@@ -311,8 +313,16 @@ function parseCliArgs() {
         type: 'boolean',
         short: 's',
       },
-      'sanitize-env': {
+      'allow-envs': {
+        type: 'string',
+        multiple: true,
+      },
+      'allow-hidden': {
         type: 'boolean',
+      },
+      'allow-listen': {
+        type: 'string',
+        multiple: true,
       },
       json: {
         type: 'boolean',
@@ -484,8 +494,22 @@ function buildExec(values, cmd, args) {
     exec.traceExec();
   }
 
-    if (values['sanitize-env']) {
-    exec.sanitizeEnv();
+  if (values['allow-envs'] && values['allow-envs'].length > 0) {
+    const list = [];
+    for (const item of values['allow-envs']) {
+      list.push(...item.split(',').map(s => s.trim()).filter(Boolean));
+    }
+    exec.allowEnvs(...list);
+  }
+  if (values['allow-hidden']) {
+    exec.allowHidden();
+  }
+  if (values['allow-listen'] && values['allow-listen'].length > 0) {
+    const list = [];
+    for (const item of values['allow-listen']) {
+      list.push(...item.split(',').map(s => s.trim()).filter(Boolean));
+    }
+    exec.allowListen(list);
   }
 
   // Features

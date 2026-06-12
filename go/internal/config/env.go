@@ -8,13 +8,22 @@ import (
 
 var sensitivePatterns = []string{"TOKEN", "PASSWORD", "SECRET", "API_KEY", "CLIENT_SECRET", "SESSION", "COOKIE", "AUTH", "KEY"}
 
-// SanitizeEnv removes sensitive environment variables from the map.
-func SanitizeEnv(env map[string]string) map[string]string {
+// SanitizeEnv removes sensitive environment variables from the map, except those explicitly allowed.
+func SanitizeEnv(env map[string]string, allowEnvs []string) map[string]string {
 	if len(env) == 0 {
 		return env
 	}
+	allowMap := make(map[string]bool)
+	for _, ae := range allowEnvs {
+		allowMap[ae] = true
+	}
+
 	result := make(map[string]string, len(env))
 	for k, v := range env {
+		if allowMap[k] {
+			result[k] = v
+			continue
+		}
 		uk := strings.ToUpper(k)
 		sensitive := false
 		for _, p := range sensitivePatterns {
@@ -54,35 +63,32 @@ func FilteredEnviron() []string {
 }
 
 // BuildEnv returns the slice of environment variables to set for the process.
-// It merges the specified Env map with host PATH and HOME if they are not overridden.
-// If the Env map is empty, it returns the minimal filtered environment.
+// It merges the specified Env map with host safe variables (PATH, HOME, TERM, LANG, LC_*) if they are not overridden.
 func BuildEnv(cfgEnv map[string]string) []string {
-	if len(cfgEnv) == 0 {
-		return FilteredEnviron()
-	}
-
 	var env []string
-	hasPath := false
-	hasHome := false
+
+	// Collect keys present in cfgEnv
+	envKeys := make(map[string]bool)
 	for k := range cfgEnv {
-		if k == "PATH" {
-			hasPath = true
-		} else if k == "HOME" {
-			hasHome = true
+		envKeys[k] = true
+	}
+
+	// Always inherit safe host environment variables if not overridden
+	for _, envVar := range os.Environ() {
+		parts := strings.SplitN(envVar, "=", 2)
+		if len(parts) == 0 {
+			continue
+		}
+		key := parts[0]
+		if !envKeys[key] {
+			if key == "PATH" || key == "HOME" || key == "TERM" || key == "LANG" || strings.HasPrefix(key, "LC_") {
+				env = append(env, envVar)
+				envKeys[key] = true
+			}
 		}
 	}
 
-	if !hasPath {
-		if val, ok := os.LookupEnv("PATH"); ok {
-			env = append(env, fmt.Sprintf("PATH=%s", val))
-		}
-	}
-	if !hasHome {
-		if val, ok := os.LookupEnv("HOME"); ok {
-			env = append(env, fmt.Sprintf("HOME=%s", val))
-		}
-	}
-
+	// Append custom environment variables
 	for k, v := range cfgEnv {
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}

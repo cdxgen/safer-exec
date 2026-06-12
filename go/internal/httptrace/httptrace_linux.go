@@ -1431,19 +1431,21 @@ func (t *linuxTracer) readCipherLoop() {
 // parseSNI parses Server Name Indication (SNI) hostname from the raw TLS ClientHello payload.
 // Logic details based on RFC 5246 (TLSv1.2) & RFC 8446 (TLSv1.3) Record/Handshake structures:
 // 1. Check TLS Record Header (payload[0:5]):
-//    - payload[0] == 0x16 (Handshake record type)
-//    - payload[1:3] == 0x03 0x01 / 0x03 0x03 (TLS Protocol Version)
+//   - payload[0] == 0x16 (Handshake record type)
+//   - payload[1:3] == 0x03 0x01 / 0x03 0x03 (TLS Protocol Version)
+//
 // 2. Check Handshake Header:
-//    - payload[5] == 0x01 (Handshake Type: ClientHello)
+//   - payload[5] == 0x01 (Handshake Type: ClientHello)
+//
 // 3. Skip Client Version (2 bytes) + Random (32 bytes) starting at byte 6 -> sessionID offset is 43.
 // 4. Parse Session ID (payload[43] is length, skip it).
 // 5. Parse Cipher Suites (length is 2 bytes at current offset, skip suite list bytes).
 // 6. Parse Compression Methods (length is 1 byte, skip compress byte).
 // 7. Parse Extensions:
-//    - Read Extensions block length (2 bytes).
-//    - Iterate through extensions: each has Type (2 bytes) + Length (2 bytes) + Value.
-//    - Look for Extension Type 0x0000 (Server Name Indication, RFC 6066 Section 3).
-//    - Extract the Server Name list: read Server Name Type (0x00 for HostName), read HostName length (2 bytes), and return the name string.
+//   - Read Extensions block length (2 bytes).
+//   - Iterate through extensions: each has Type (2 bytes) + Length (2 bytes) + Value.
+//   - Look for Extension Type 0x0000 (Server Name Indication, RFC 6066 Section 3).
+//   - Extract the Server Name list: read Server Name Type (0x00 for HostName), read HostName length (2 bytes), and return the name string.
 func parseSNI(payload []byte) (string, bool) {
 	if len(payload) < 44 {
 		return "", false

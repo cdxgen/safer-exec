@@ -276,10 +276,14 @@ type ExecConfig struct {
 	// The file is created with 0600 permissions and deleted after reading.
 	ConfigFilePath string `json:"configFilePath,omitempty"`
 
-	// SanitizeEnv, when true, strips sensitive environment variables (containing
-	// TOKEN, PASSWORD, SECRET, API_KEY, etc.) from the environment before passing
-	// them to the sandboxed process.
-	SanitizeEnv bool `json:"sanitizeEnv"`
+	// AllowEnvs is a list of environment variables allowed to pass through
+	AllowEnvs []string `json:"allowEnvs"`
+
+	// AllowHidden, when true, permits read/write to hidden files and directories
+	AllowHidden bool `json:"allowHidden"`
+
+	// AllowListen is a list of IP addresses or ip:port strings allowed to bind/listen to.
+	AllowListen []string `json:"allowListen"`
 }
 
 // HTTPAccessEntry records a single HTTP request observed during eBPF tracing.
@@ -473,6 +477,7 @@ type PolicyFile struct {
 	AllowHosts     []string `json:"allowHosts,omitempty"`
 	AllowIPs       []string `json:"allowIPs,omitempty"`
 	AllowPorts     []int    `json:"allowPorts,omitempty"`
+	AllowListen    []string `json:"allowListen,omitempty"`
 
 	// Environment — prefer Env map; EnvVars is legacy (list of names only)
 	Env     map[string]string `json:"env,omitempty"`

@@ -37,8 +37,8 @@ safer-exec --block-exec=sh -- npm install
 safer-exec --block-fork -- npm install
 safer-exec --trace-exec -- npm install
 
-# Strip sensitive environment variables
-safer-exec --sanitize-env -- npm install
+# Pass through specific environment variables from the host (environment is sanitized by default)
+safer-exec --allow-envs=VAR1,VAR2 -- npm install
 
 # Validate Seatbelt profile syntax (macOS)
 safer-exec --validate-profile -- cat /etc/hosts
@@ -116,7 +116,9 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 | `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks                                                                                                       |
 | `traceLibraries`     | `boolean`  | `false`         | Track dynamic library loading (opt-in)                                                                                                           |
 | `traceHTTPURLs`      | `boolean`  | `false`         | Capture HTTPS request URLs via eBPF uprobes (Linux only, requires CAP_BPF)                                                                       |
-| `sanitizeEnv`        | `boolean`  | `false`         | Strip sensitive env vars (TOKEN, SECRET, etc.) before passing to sandbox                                                                         |
+| `allowEnvs`          | `string[]` | `[]`            | Host env vars to pass through (environment is sanitized by default)                                                                              |
+| `allowHidden`        | `boolean`  | `false`         | Allow read/write access to hidden files and directories (dotfiles)                                                                               |
+| `allowListen`        | `string[]` | `[]`            | IP addresses or ip:port strings to allow listening on (blocked by default, even on loopback)                                                     |
 | `traceCrypto`        | `boolean`  | `false`         | Enable cryptographic tracing — cipher suites and library detection (Linux only, requires CAP_BPF). Auto-enables `traceHTTPURLs`.                 |
 | `cbomOutputPath`     | `string`   | `""`            | Write a CycloneDX CBOM JSON document to this path when `traceCrypto` is active                                                                   |
 | `cryptoProbeMode`    | `string`   | `"tls-only"`    | Crypto probe depth: `"tls-only"` (default) captures TLS ciphers; `"operations"` also captures digest, encrypt, sign operations (higher overhead) |
@@ -165,10 +167,38 @@ All methods return `this` for chaining except `.run()`.
 | `.spoofAntiVM()`         | Intercept debugger & virtualization checks                                                                           |
 | `.traceLibraries()`      | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS)                                             |
 | `.traceHTTPURLs()`       | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)                                                 |
-| `.sanitizeEnv(val)`      | Strip sensitive env vars (TOKEN, SECRET, AUTH, etc.) before passing to sandbox                                       |
+| `.allowEnvs(...keys)`    | Allow specific host environment variables to pass through from the host process                                      |
+| `.allowHidden(allow)`    | Allow/disallow access to hidden files and directories (dotfiles)                                                     |
+| `.allowListen(list)`     | Allow listening/binding on specific IP addresses or ip:port strings (blocked by default, even loopback)              |
 | `.traceCrypto()`         | Enable TLS cipher suite and crypto library detection via eBPF uprobes (Linux only). Auto-enables `.traceHTTPURLs()`. |
 | `.cbom(path)`            | Set the output path for the CycloneDX CBOM JSON document (requires `.traceCrypto()`)                                 |
 | `.cryptoProbeMode(mode)` | Set crypto probe depth: `"tls-only"` (default) or `"operations"` (also captures digest/sign ops)                     |
+
+### OS & Capability Support Matrix
+
+| API Method                             | macOS | Linux | Windows / BSD | Required Capabilities / Permissions                    | Notes                                                                          |
+| :------------------------------------- | :---: | :---: | :-----------: | :----------------------------------------------------- | :----------------------------------------------------------------------------- |
+| `.allowHosts(...)`                     |  Yes  |  Yes  |      No       | None                                                   | On Linux: DNS resolution to IP. On macOS: Seatbelt rules.                      |
+| `.allowListen(...)`                    |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | Blocks loopback port binding by default unless explicitly permitted.           |
+| `.allowPorts(...)`                     |  Yes  |  Yes  |      No       | None                                                   | Restricts outbound ports. macOS uses Seatbelt; Linux uses Landlock.            |
+| `.allowUrls(...)`                      |  No   |  Yes  |      No       | `CAP_BPF`, `CAP_PERFMON`                               | Requires eBPF tracing engine.                                                  |
+| `.readPaths(...)` / `.writePaths(...)` |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | Restricts filesystem access. macOS uses Seatbelt; Linux uses Mount Namespaces. |
+| `.disableNetwork()`                    |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS blocks outbound; Linux unshares Net Namespace.                           |
+| `.maxMemory(...)`                      |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_AS`. Linux: cgroups v2 `memory.max`.                            |
+| `.maxCPUCores(...)`                    |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_CPU`. Linux: cgroups v2 `cpu.max`.                              |
+| `.maxProcesses(...)`                   |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_NPROC`. Linux: cgroups v2 `pids.max`.                           |
+| `.maxReadIOPS(...)` etc.               |  No   |  Yes  |      No       | Cgroups write permission                               | Linux cgroups v2 `io.max` throttling.                                          |
+| `.enableAudit()`                       |  Yes  |  Yes  |      No       | None                                                   | macOS uses Seatbelt trace; Linux uses Seccomp-BPF trap.                        |
+| `.enableDiff()`                        |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS: Shadow dir snapshot. Linux: OverlayFS mount.                            |
+| `.enableLearn()`                       |  Yes  |  Yes  |      No       | None (macOS), `SYS_PTRACE` or `ptrace_scope=0` (Linux) | macOS parses Seatbelt trace logs. Linux uses `strace` or fallback.             |
+| `.allowExec(...)` / `.blockExec(...)`  |  Yes  |  Yes  |      No       | None                                                   | Restricts process execution. macOS uses Seatbelt; Linux uses Seccomp.          |
+| `.blockFork()`                         |  Yes  |  Yes  |      No       | None                                                   | macOS uses Seatbelt; Linux uses Seccomp.                                       |
+| `.traceExec()`                         |  Yes  |  Yes  |      No       | None                                                   | Logs child spawns. macOS: Seatbelt trace. Linux: Seccomp trap.                 |
+| `.allowGPU(...)`                       |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Bind mounts device nodes to sandbox.                               |
+| `.blockTPM()`                          |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Restricts access to `/dev/tpm*`.                                   |
+| `.spoofAntiVM()`                       |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Conceals sandbox execution details.                                |
+| `.traceLibraries()`                    |  Yes  |  Yes  |      No       | None                                                   | macOS: `DYLD_INSERT_LIBRARIES`. Linux: `LD_AUDIT`.                             |
+| `.traceHTTPURLs()` / `.traceCrypto()`  |  No   |  Yes  |      No       | `CAP_BPF`, `CAP_PERFMON`                               | Linux eBPF TLS uprobes.                                                        |
 
 ### Static Methods
 

@@ -17,19 +17,21 @@ import (
 
 // TraceParser parses Seatbelt trace output files.
 type TraceParser struct {
-	readPaths  map[string]bool
-	writePaths map[string]bool
-	allowIPs   map[string]bool
-	allowPorts map[int]bool
+	readPaths   map[string]bool
+	writePaths  map[string]bool
+	allowIPs    map[string]bool
+	allowPorts  map[int]bool
+	allowListen map[string]bool
 }
 
 // NewTraceParser creates a new trace parser.
 func NewTraceParser() *TraceParser {
 	return &TraceParser{
-		readPaths:  make(map[string]bool),
-		writePaths: make(map[string]bool),
-		allowIPs:   make(map[string]bool),
-		allowPorts: make(map[int]bool),
+		readPaths:   make(map[string]bool),
+		writePaths:  make(map[string]bool),
+		allowIPs:    make(map[string]bool),
+		allowPorts:  make(map[int]bool),
+		allowListen: make(map[string]bool),
 	}
 }
 
@@ -88,20 +90,32 @@ func (p *TraceParser) parseLine(line string) {
 			}
 		}
 	}
+
+	// Network bind / inbound
+	if strings.Contains(line, "network-bind") || strings.Contains(line, "network-inbound") {
+		if ip, port := extractListenTarget(line); ip != "" {
+			if port > 0 {
+				p.allowListen[fmt.Sprintf("%s:%d", ip, port)] = true
+			} else {
+				p.allowListen[ip] = true
+			}
+		}
+	}
 }
 
 // BuildPolicy converts the parsed trace into a PolicyFile.
 func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.PolicyFile {
 	// Initialize all slices to empty arrays (not nil) so JSON serializes as [] not null
 	policy := &config.PolicyFile{
-		Cmd:        cmd,
-		Args:       args,
-		ReadPaths:  []string{},
-		WritePaths: []string{},
-		AllowHosts: []string{},
-		AllowIPs:   []string{},
-		AllowPorts: []int{},
-		EnvVars:    []string{},
+		Cmd:         cmd,
+		Args:        args,
+		ReadPaths:   []string{},
+		WritePaths:  []string{},
+		AllowHosts:  []string{},
+		AllowIPs:    []string{},
+		AllowPorts:  []int{},
+		AllowListen: []string{},
+		EnvVars:     []string{},
 	}
 
 	// Deduplicate paths
@@ -125,6 +139,12 @@ func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.PolicyFile 
 		policy.AllowPorts = append(policy.AllowPorts, port)
 	}
 	sort.Ints(policy.AllowPorts)
+
+	// Listen
+	for item := range p.allowListen {
+		policy.AllowListen = append(policy.AllowListen, item)
+	}
+	sort.Strings(policy.AllowListen)
 
 	// Determine Crypto and FIPS controls based on observed paths
 	hasCryptoRead := false
@@ -248,4 +268,21 @@ func dedupPaths(paths map[string]bool) []string {
 	}
 
 	return result
+}
+
+// extractListenTarget parses IP and port from a network-bind or network-inbound trace line.
+func extractListenTarget(line string) (string, int) {
+	target := extractPath(line)
+	if target == "" {
+		return "", 0
+	}
+	parts := strings.Split(target, ":")
+	if len(parts) == 2 {
+		port, _ := strconv.Atoi(parts[1])
+		return parts[0], port
+	}
+	if len(parts) == 1 {
+		return parts[0], 0
+	}
+	return target, 0
 }

@@ -51,7 +51,8 @@ The Node.js layer serializes an `ExecConfig` object to JSON. The Go struct expec
 | `blockFork`       | boolean  | Prevent forking                    |
 | `traceExec`       | boolean  | Log child processes                |
 | `strict`          | boolean  | Treat warnings as hard errors      |
-| `sanitizeEnv`     | boolean  | Strip sensitive env vars           |
+| `allowEnvs`       | string[] | Allowed host env vars              |
+| `allowHidden`     | boolean  | Allow hidden paths read/write      |
 | `traceCrypto`     | boolean  | Capture TLS & non-TLS operations   |
 | `cbomOutputPath`  | string   | Write CycloneDX CBOM JSON file     |
 | `cryptoProbeMode` | string   | Depth of crypto probe (operations) |
@@ -150,9 +151,9 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **Impact:** The command may use different configuration, connect to different hosts, or behave differently than expected.
 
-**How isolation works:** When `env()` is called, the sandbox sets only PATH, HOME, and the specified variables. When no env is set, the full parent environment is inherited. The `sanitizeEnv` flag strips keys containing TOKEN, PASSWORD, SECRET, API_KEY, CLIENT_SECRET, SESSION, COOKIE, AUTH, or KEY before execution.
+**How isolation works:** By default, the sandbox does not inherit host environment variables other than safe defaults (such as PATH, HOME, TERM, LANG, and LC\_\*). Custom environment variables can be set via `env()`, and host environment variables can be allowed via `allowEnvs()`. Environment variables are sanitized by default: any key containing TOKEN, PASSWORD, SECRET, API_KEY, CLIENT_SECRET, SESSION, COOKIE, AUTH, or KEY is stripped before execution, unless the key was explicitly permitted via `allowEnvs()` which bypasses this sanitization.
 
-**Residual risk:** PATH and HOME are always inherited even when a custom environment is set. This means the command uses the same executable search path and home directory as the parent process. The `sanitizeEnv` check is case-insensitive but does not inspect environment variable values, only key names.
+**Residual risk:** PATH, HOME, and other safe defaults are inherited even when a custom environment is set. The sanitization check is case-insensitive but does not inspect environment variable values, only key names.
 
 ### 3.6 Seatbelt Profile Construction (macOS)
 
@@ -249,6 +250,9 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 A new network namespace is created when `disableNetwork` is true. This prevents the sandboxed process from observing host network interfaces, listening sockets, or network connection state. When a new network namespace is active, explicit `allowHosts` / `allowPorts` configuration is required for outbound connectivity.
 
+**Network Port Listening Restriction:**
+By default, the sandboxed process is prevented from listening on any network port (including local loopback `lo`) on both macOS and Linux. Listening or binding to specific IP addresses or ports must be explicitly permitted using `allowListen` / `--allow-listen`.
+
 **macOS escape paths:**
 
 1. Fork child processes that read files (allowed, children inherit the Seatbelt profile).
@@ -274,6 +278,19 @@ Policies are resolved at runtime based on the operating system. The following pl
 
 **Residual risk:** If the target binary lives in a non-standard location, the policy may not include the correct read path. For example, Homebrew-installed tools on macOS live in `/opt/homebrew/bin` on Apple Silicon, which is not covered by the default policies.
 
+## 4.5 Advanced Sandbox Escape Vector Analysis
+
+This section analyzes advanced threat vectors, escape techniques, and how `safer-exec` counters them.
+
+| Escape Vector                      | Technical Mechanism                                                                                                                                                                      | `safer-exec` Mitigation Status                                                                                                        |
+| :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------ |
+| **Kernel Exploits via Namespaces** | Attackers use unprivileged user namespaces (`CLONE_NEWUSER`) to gain local capabilities (e.g., `CAP_NET_ADMIN`) and exploit bugs in kernel subsystems (like `netfilter` or `OverlayFS`). | **Mitigated**: Seccomp blocks `unshare` and namespace clone flags by default. `PR_SET_NO_NEW_PRIVS` prevents privilege transitions.   |
+| **Mach Port IPC Exploits (macOS)** | Sandboxed processes target system daemons over Mach IPC to run code in a privileged context.                                                                                             | **Mitigated**: Seatbelt profiles restrict Mach port service lookups to the absolute minimum required bootstrap components.            |
+| **eBPF/LSM/Perf Monitoring**       | Attackers load eBPF probes, performance monitors (`perf_event_open`), or uprobes to spy on memory, environment variables, or other processes.                                            | **Mitigated**: Seccomp blocks `bpf`, `perf_event_open`, `userfaultfd`, and `keyctl` system calls by default.                          |
+| **Privilege Escalation**           | Processes use `setuid`, `setgid`, or `setcap` to gain elevated access or modify attributes.                                                                                              | **Mitigated**: Seccomp blocks all `setuid`, `setgid`, `capset`, and `setxattr` / extended attribute manipulation syscalls by default. |
+| **UDP Socket Evasion**             | Landlock limits network rules to TCP. Attackers use UDP or RAW sockets to bypass restrictions.                                                                                           | **Mitigated**: Active network namespace unsharing (`CLONE_NEWNET`) cuts off all socket families (UDP, Netlink, RAW) entirely.         |
+| **Sandbox Tool Reuse**             | Attackers execute `safer-exec` or `safer-exec-rt` to spawn secondary escaped tasks.                                                                                                      | **Mitigated**: Default `BlockExec` rules automatically register and forbid the execution of the sandbox binary itself.                |
+
 ## 5. Assumptions
 
 1. The Go binary itself is not tampered with. It is statically compiled and shipped with the npm package.
@@ -292,5 +309,5 @@ Policies are resolved at runtime based on the operating system. The following pl
 6. **Support policy composition.** Allow combining multiple policies with explicit merge semantics rather than the current additive approach.
 7. **Add Homebrew path detection.** On macOS, detect `/opt/homebrew/bin` and `/opt/homebrew/lib` for Apple Silicon installations.
 8. **Document fork/exec overhead.** The `traceExec` flag adds seccomp `SIGSYS` trapping on every `execve` call. This adds latency to child process spawns. Document the expected overhead.
-9. **Use `--sanitize-env` in CI/CD environments.** Enable sanitize-env to strip sensitive environment variables (API keys, tokens, secrets) before sandboxed execution.
+9. **Sanitized Environment by Default.** Environment sanitization is enabled by default to strip sensitive environment variables (API keys, tokens, secrets) before sandboxed execution. Use `allowEnvs` to explicitly allow specific host variables when necessary.
 10. **Keep `pivot_root` failures as hard errors.** Relying on degraded mode without `pivot_root` weakens filesystem isolation. Use `--strict` to enforce this in production.

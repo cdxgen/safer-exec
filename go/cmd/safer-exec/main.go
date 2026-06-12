@@ -93,7 +93,7 @@ func main() {
 
 	// Handle version flag
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
-		fmt.Println("safer-exec 0.10.0")
+		fmt.Println("safer-exec 0.11.0")
 		return
 	}
 
@@ -104,10 +104,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Sanitize environment variables if requested
-	if cfg.SanitizeEnv {
-		cfg.Env = config.SanitizeEnv(cfg.Env)
-	}
+	// Sanitize environment variables by default
+	cfg.Env = config.SanitizeEnv(cfg.Env, cfg.AllowEnvs)
 
 	// Detect and warn about sensitive environment variables prior to execution
 	checkSensitiveEnv(cfg.Env)

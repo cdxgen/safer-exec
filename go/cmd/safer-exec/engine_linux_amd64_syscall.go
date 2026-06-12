@@ -7,10 +7,14 @@ package main
 // so we hardcode them. SYS_FORK and SYS_VFORK are available in the standard
 // library but we alias them here for consistency with the arm64 build tag.
 const (
-	sysKCMP_unified     = 312
-	sysSYSCALL_unified  = 9999
-	sysFORK_unified     = 57
-	sysVFORK_unified    = 58
-	sysEXECVEAT_unified = 322
-	sysCLONE3_unified   = 435
+	sysKCMP_unified        = 312
+	sysSYSCALL_unified     = 9999
+	sysFORK_unified        = 57
+	sysVFORK_unified       = 58
+	sysEXECVEAT_unified    = 322
+	sysCLONE3_unified      = 435
+	sysBPF_unified         = 321
+	sysUSERFAULTFD_unified = 323
+	sysIOPERM_unified      = 173
+	sysIOPL_unified        = 172
 )
