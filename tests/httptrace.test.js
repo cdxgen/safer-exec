@@ -3,7 +3,14 @@ import strict from 'node:assert/strict';
 import { writeFileSync, unlinkSync, copyFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SaferExec } from '../npm/src/index.js';
+import { SaferExec as OriginalSaferExec } from '../npm/src/index.js';
+
+class SaferExec extends OriginalSaferExec {
+  constructor(options = {}) {
+    super(options);
+    this.readPaths('/tmp');
+  }
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
