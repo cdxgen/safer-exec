@@ -1785,7 +1785,7 @@ func applySeccomp(cfg config.ExecConfig) error {
 			trapVal := uint16(6 | (call&0xFF)<<8)
 			insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: uint32(seccompRetTrap) | uint32(trapVal)})
 		} else {
-			insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: seccompRetKill})
+			insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: uint32(seccompRetErrno) | uint32(syscall.EPERM)})
 		}
 	}
 	insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: seccompRetAllow})
@@ -2068,6 +2068,10 @@ func writeConfigToTempFile(data []byte) (string, error) {
 // Used when resolving symlinks in read/write paths to prevent mounting targets
 // that fall outside the declared policy.
 func isPathAllowed(resolved string, readPaths, writePaths []string) bool {
+	// Explicitly allow systemd resolved files which are symlink targets of /etc/resolv.conf
+	if resolved == "/run/systemd/resolve/stub-resolv.conf" || resolved == "/run/systemd/resolve/resolv.conf" {
+		return true
+	}
 	for _, rp := range readPaths {
 		if resolved == rp || strings.HasPrefix(resolved, rp+"/") {
 			return true
