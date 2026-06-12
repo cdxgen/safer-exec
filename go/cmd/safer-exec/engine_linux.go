@@ -1695,8 +1695,6 @@ func applySeccomp(cfg config.ExecConfig) error {
 		syscall.SYS_SYSLOG,
 		// Block raw port IO and hardware control
 		sysIOPERM, sysIOPL,
-		// Block limit alterations
-		syscall.SYS_SETRLIMIT, syscall.SYS_PRLIMIT64,
 		// Block accounting, reboot, and chroot
 		syscall.SYS_ACCT, syscall.SYS_REBOOT, syscall.SYS_KEXEC_LOAD, syscall.SYS_CHROOT,
 	}
