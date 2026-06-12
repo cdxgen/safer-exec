@@ -278,6 +278,19 @@ Policies are resolved at runtime based on the operating system. The following pl
 
 **Residual risk:** If the target binary lives in a non-standard location, the policy may not include the correct read path. For example, Homebrew-installed tools on macOS live in `/opt/homebrew/bin` on Apple Silicon, which is not covered by the default policies.
 
+## 4.5 Advanced Sandbox Escape Vector Analysis
+
+This section analyzes advanced threat vectors, escape techniques, and how `safer-exec` counters them.
+
+| Escape Vector                      | Technical Mechanism                                                                                                                                                                      | `safer-exec` Mitigation Status                                                                                                        |
+| :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------ |
+| **Kernel Exploits via Namespaces** | Attackers use unprivileged user namespaces (`CLONE_NEWUSER`) to gain local capabilities (e.g., `CAP_NET_ADMIN`) and exploit bugs in kernel subsystems (like `netfilter` or `OverlayFS`). | **Mitigated**: Seccomp blocks `unshare` and namespace clone flags by default. `PR_SET_NO_NEW_PRIVS` prevents privilege transitions.   |
+| **Mach Port IPC Exploits (macOS)** | Sandboxed processes target system daemons over Mach IPC to run code in a privileged context.                                                                                             | **Mitigated**: Seatbelt profiles restrict Mach port service lookups to the absolute minimum required bootstrap components.            |
+| **eBPF/LSM/Perf Monitoring**       | Attackers load eBPF probes, performance monitors (`perf_event_open`), or uprobes to spy on memory, environment variables, or other processes.                                            | **Mitigated**: Seccomp blocks `bpf`, `perf_event_open`, `userfaultfd`, and `keyctl` system calls by default.                          |
+| **Privilege Escalation**           | Processes use `setuid`, `setgid`, or `setcap` to gain elevated access or modify attributes.                                                                                              | **Mitigated**: Seccomp blocks all `setuid`, `setgid`, `capset`, and `setxattr` / extended attribute manipulation syscalls by default. |
+| **UDP Socket Evasion**             | Landlock limits network rules to TCP. Attackers use UDP or RAW sockets to bypass restrictions.                                                                                           | **Mitigated**: Active network namespace unsharing (`CLONE_NEWNET`) cuts off all socket families (UDP, Netlink, RAW) entirely.         |
+| **Sandbox Tool Reuse**             | Attackers execute `safer-exec` or `safer-exec-rt` to spawn secondary escaped tasks.                                                                                                      | **Mitigated**: Default `BlockExec` rules automatically register and forbid the execution of the sandbox binary itself.                |
+
 ## 5. Assumptions
 
 1. The Go binary itself is not tampered with. It is statically compiled and shipped with the npm package.
