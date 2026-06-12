@@ -27,12 +27,16 @@ import (
 const cgroupV2Root = "/sys/fs/cgroup"
 
 const (
-	sysKCMP     = sysKCMP_unified
-	sysSYSCALL  = sysSYSCALL_unified
-	sysFORK     = sysFORK_unified
-	sysVFORK    = sysVFORK_unified
-	sysEXECVEAT = sysEXECVEAT_unified
-	sysCLONE3   = sysCLONE3_unified
+	sysKCMP        = sysKCMP_unified
+	sysSYSCALL     = sysSYSCALL_unified
+	sysFORK        = sysFORK_unified
+	sysVFORK       = sysVFORK_unified
+	sysEXECVEAT    = sysEXECVEAT_unified
+	sysCLONE3      = sysCLONE3_unified
+	sysBPF         = sysBPF_unified
+	sysUSERFAULTFD = sysUSERFAULTFD_unified
+	sysIOPERM      = sysIOPERM_unified
+	sysIOPL        = sysIOPL_unified
 )
 
 const (
@@ -1684,13 +1688,13 @@ func applySeccomp(cfg config.ExecConfig) error {
 		syscall.SYS_SETXATTR, syscall.SYS_LSETXATTR, syscall.SYS_FSETXATTR,
 		syscall.SYS_REMOVEXATTR, syscall.SYS_LREMOVEXATTR, syscall.SYS_FREMOVEXATTR,
 		// Block eBPF, perf monitoring, tracepoints, userfaultfd, and kernel key manager
-		syscall.SYS_BPF, syscall.SYS_PERF_EVENT_OPEN, syscall.SYS_USERFAULTFD, syscall.SYS_KEYCTL,
+		sysBPF, syscall.SYS_PERF_EVENT_OPEN, sysUSERFAULTFD, syscall.SYS_KEYCTL,
 		// Block time manipulation
 		syscall.SYS_SETTIMEOFDAY, syscall.SYS_CLOCK_SETTIME, syscall.SYS_ADJTIMEX,
 		// Block kernel logging / dmesg address leaks
 		syscall.SYS_SYSLOG,
 		// Block raw port IO and hardware control
-		syscall.SYS_IOPERM, syscall.SYS_IOPL,
+		sysIOPERM, sysIOPL,
 		// Block limit alterations
 		syscall.SYS_SETRLIMIT, syscall.SYS_PRLIMIT64,
 		// Block accounting, reboot, and chroot
