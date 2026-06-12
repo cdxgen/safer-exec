@@ -230,7 +230,7 @@ export class SaferExec extends EventEmitter {
    * @param {boolean} [options.enableDiff] - Enable filesystem mutation diffing
    * @param {boolean} [options.enableLearn] - Enable behavioral auto-profiling (learning mode)
    * @param {boolean} [options.resolveSymlinks] - Resolve target command symlink in PATH
-   * @param {boolean} [options.sanitizeEnv] - Strip sensitive env vars before passing to sandbox
+   * @param {string[]} [options.allowEnvs] - Host environment variables allowed to pass through
    */
   constructor(options = {}) {
     super();
@@ -324,8 +324,11 @@ export class SaferExec extends EventEmitter {
     /** @type {boolean} Opt-in to resolve target command symlink */
     this._resolveSymlinks = options.resolveSymlinks || false;
 
-    /** @type {boolean} Strip sensitive env vars before passing to sandbox */
-    this._sanitizeEnv = options.sanitizeEnv || false;
+    /** @type {string[]} Environment variables allowed to pass through */
+    this._allowEnvs = options.allowEnvs || [];
+
+    /** @type {boolean} Allow reading/writing hidden files and directories */
+    this._allowHidden = options.allowHidden || false;
 
     /** @type {boolean} Allow cryptographic library and device access */
     this._allowCrypto = options.allowCrypto !== false;
@@ -1104,17 +1107,28 @@ export class SaferExec extends EventEmitter {
   }
 
   /**
-   * Strip sensitive environment variables before passing to the sandbox.
+   * Allow specific environment variables to pass through from the host process.
    *
-   * When enabled, environment variable keys containing substrings like
-   * TOKEN, PASSWORD, SECRET, API_KEY, CLIENT_SECRET, SESSION, COOKIE,
-   * AUTH, or KEY are removed from the environment before execution.
-   *
-   * @param {boolean} [val=true] - Whether to sanitize the environment
+   * @param {...string} envs - Names of environment variables to allow
    * @returns {SaferExec} This instance for chaining
    */
-  sanitizeEnv(val = true) {
-    this._sanitizeEnv = val;
+  allowEnvs(...envs) {
+    for (const env of envs) {
+      if (typeof env === 'string' && env && !this._allowEnvs.includes(env)) {
+        this._allowEnvs.push(env);
+      }
+    }
+    return this;
+  }
+
+  /**
+   * Allow/disallow reading and writing to hidden files and directories.
+   *
+   * @param {boolean} [allow=true] - Whether to allow hidden paths
+   * @returns {SaferExec} This instance for chaining
+   */
+  allowHidden(allow = true) {
+    this._allowHidden = allow;
     return this;
   }
 
@@ -1384,15 +1398,50 @@ export class SaferExec extends EventEmitter {
       effectiveReadPaths.push(this._workingDir);
     }
     if (process.platform === 'linux') {
-      // These paths are required for dynamically linked binaries, shells,
-      // and basic system resolution to work inside an isolated tmpfs root.
+      // Only allow safe, public system binary and library directories
       const essentialLinuxPaths = [
-        '/bin', '/sbin', '/usr', '/lib', '/lib64', '/etc', '/dev', '/run',
-        '/tmp', '/var/tmp', '/proc', '/sys'
+        '/bin', '/sbin', '/usr', '/lib', '/lib64'
       ];
+
+      // Instead of mounting the entire '/etc' and '/dev', specify only 
+      // safe, non-sensitive system files and standard device nodes.
+      const essentialLinuxFiles = [
+        // Linker dynamic library configurations (required for binary execution)
+        '/etc/ld.so.cache',
+        '/etc/ld.so.conf',
+        '/etc/ld.so.conf.d',
+
+        // Public SSL/TLS root certificates (required for secure outgoing requests)
+        '/etc/ssl',
+        '/etc/pki',
+
+        // System runtime configs and system release identifiers
+        '/etc/alternatives',
+        '/etc/os-release',
+        '/etc/nsswitch.conf',
+
+        // Standard safe device nodes (prevents raw host disk access while preserving standard piping)
+        '/dev/null',
+        '/dev/zero',
+        '/dev/random',
+        '/dev/urandom'
+      ];
+
+      // Only mount name resolution files if network access is actually active
+      if (!this._disableNetwork) {
+        essentialLinuxFiles.push('/etc/resolv.conf');
+        essentialLinuxFiles.push('/etc/hosts');
+      }
+
       for (const p of essentialLinuxPaths) {
         if (!effectiveReadPaths.includes(p) && existsSync(p)) {
           effectiveReadPaths.push(p);
+        }
+      }
+
+      for (const f of essentialLinuxFiles) {
+        if (!effectiveReadPaths.includes(f) && existsSync(f)) {
+          effectiveReadPaths.push(f);
         }
       }
     }
@@ -1400,6 +1449,12 @@ export class SaferExec extends EventEmitter {
     // Filter non-existent paths to prevent Go bind mount warnings/errors
     effectiveReadPaths = effectiveReadPaths.filter(p => existsSync(p));
     let effectiveWritePaths = [...this._writePaths].filter(p => existsSync(p));
+
+    if (!this._allowHidden) {
+      const hiddenRegex = /(^|\/)\.[^\/]+/;
+      effectiveReadPaths = effectiveReadPaths.filter(p => !hiddenRegex.test(p));
+      effectiveWritePaths = effectiveWritePaths.filter(p => !hiddenRegex.test(p));
+    }
 
     // Deduplicate
     effectiveReadPaths = Array.from(new Set(effectiveReadPaths));
@@ -1415,8 +1470,13 @@ export class SaferExec extends EventEmitter {
 
     const finalEnv = {
       ...this._env,
-      RUNNING_IN_SAFER_EXEC_SANDBOX: 'true',
     };
+    for (const name of this._allowEnvs) {
+      if (process.env[name] !== undefined && finalEnv[name] === undefined) {
+        finalEnv[name] = process.env[name];
+      }
+    }
+    finalEnv.RUNNING_IN_SAFER_EXEC_SANDBOX = 'true';
 
     // Build the config object
     const config = {
@@ -1466,7 +1526,8 @@ export class SaferExec extends EventEmitter {
       cbomOutputPath: this._cbomOutputPath,
       cryptoProbeMode: this._cryptoProbeMode,
       allowURLRules: this._allowURLRules,
-      sanitizeEnv: this._sanitizeEnv,
+      allowEnvs: this._allowEnvs,
+      allowHidden: this._allowHidden,
     };
 
     const effectiveTimeout = this._timeoutMs;

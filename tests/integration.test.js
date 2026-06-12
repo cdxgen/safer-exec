@@ -150,6 +150,7 @@ describe('Integration Tests', () => {
       process.env.SECRET_KEY = 'super_secret';
 
       const result = await new SaferExec()
+        .allowEnvs('SECRET_KEY')
         .env('SECRET_KEY', 'sandboxed_secret')
         .run('sh', ['-c', 'echo $SECRET_KEY']);
 

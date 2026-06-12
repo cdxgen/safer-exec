@@ -51,7 +51,8 @@ The Node.js layer serializes an `ExecConfig` object to JSON. The Go struct expec
 | `blockFork`       | boolean  | Prevent forking                    |
 | `traceExec`       | boolean  | Log child processes                |
 | `strict`          | boolean  | Treat warnings as hard errors      |
-| `sanitizeEnv`     | boolean  | Strip sensitive env vars           |
+| `allowEnvs`       | string[] | Allowed host env vars              |
+| `allowHidden`     | boolean  | Allow hidden paths read/write      |
 | `traceCrypto`     | boolean  | Capture TLS & non-TLS operations   |
 | `cbomOutputPath`  | string   | Write CycloneDX CBOM JSON file     |
 | `cryptoProbeMode` | string   | Depth of crypto probe (operations) |
@@ -150,9 +151,9 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **Impact:** The command may use different configuration, connect to different hosts, or behave differently than expected.
 
-**How isolation works:** When `env()` is called, the sandbox sets only PATH, HOME, and the specified variables. When no env is set, the full parent environment is inherited. The `sanitizeEnv` flag strips keys containing TOKEN, PASSWORD, SECRET, API_KEY, CLIENT_SECRET, SESSION, COOKIE, AUTH, or KEY before execution.
+**How isolation works:** By default, the sandbox does not inherit host environment variables other than safe defaults (such as PATH, HOME, TERM, LANG, and LC\_\*). Custom environment variables can be set via `env()`, and host environment variables can be allowed via `allowEnvs()`. Environment variables are sanitized by default: any key containing TOKEN, PASSWORD, SECRET, API_KEY, CLIENT_SECRET, SESSION, COOKIE, AUTH, or KEY is stripped before execution, unless the key was explicitly permitted via `allowEnvs()` which bypasses this sanitization.
 
-**Residual risk:** PATH and HOME are always inherited even when a custom environment is set. This means the command uses the same executable search path and home directory as the parent process. The `sanitizeEnv` check is case-insensitive but does not inspect environment variable values, only key names.
+**Residual risk:** PATH, HOME, and other safe defaults are inherited even when a custom environment is set. The sanitization check is case-insensitive but does not inspect environment variable values, only key names.
 
 ### 3.6 Seatbelt Profile Construction (macOS)
 
@@ -292,5 +293,5 @@ Policies are resolved at runtime based on the operating system. The following pl
 6. **Support policy composition.** Allow combining multiple policies with explicit merge semantics rather than the current additive approach.
 7. **Add Homebrew path detection.** On macOS, detect `/opt/homebrew/bin` and `/opt/homebrew/lib` for Apple Silicon installations.
 8. **Document fork/exec overhead.** The `traceExec` flag adds seccomp `SIGSYS` trapping on every `execve` call. This adds latency to child process spawns. Document the expected overhead.
-9. **Use `--sanitize-env` in CI/CD environments.** Enable sanitize-env to strip sensitive environment variables (API keys, tokens, secrets) before sandboxed execution.
+9. **Sanitized Environment by Default.** Environment sanitization is enabled by default to strip sensitive environment variables (API keys, tokens, secrets) before sandboxed execution. Use `allowEnvs` to explicitly allow specific host variables when necessary.
 10. **Keep `pivot_root` failures as hard errors.** Relying on degraded mode without `pivot_root` weakens filesystem isolation. Use `--strict` to enforce this in production.

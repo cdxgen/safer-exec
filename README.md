@@ -37,8 +37,8 @@ safer-exec --block-exec=sh -- npm install
 safer-exec --block-fork -- npm install
 safer-exec --trace-exec -- npm install
 
-# Strip sensitive environment variables
-safer-exec --sanitize-env -- npm install
+# Pass through specific environment variables from the host (environment is sanitized by default)
+safer-exec --allow-envs=VAR1,VAR2 -- npm install
 
 # Validate Seatbelt profile syntax (macOS)
 safer-exec --validate-profile -- cat /etc/hosts
@@ -116,7 +116,8 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 | `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks                                                                                                       |
 | `traceLibraries`     | `boolean`  | `false`         | Track dynamic library loading (opt-in)                                                                                                           |
 | `traceHTTPURLs`      | `boolean`  | `false`         | Capture HTTPS request URLs via eBPF uprobes (Linux only, requires CAP_BPF)                                                                       |
-| `sanitizeEnv`        | `boolean`  | `false`         | Strip sensitive env vars (TOKEN, SECRET, etc.) before passing to sandbox                                                                         |
+| `allowEnvs`          | `string[]` | `[]`            | Host env vars to pass through (environment is sanitized by default)                                                                              |
+| `allowHidden`        | `boolean`  | `false`         | Allow read/write access to hidden files and directories (dotfiles)                                                                               |
 | `traceCrypto`        | `boolean`  | `false`         | Enable cryptographic tracing — cipher suites and library detection (Linux only, requires CAP_BPF). Auto-enables `traceHTTPURLs`.                 |
 | `cbomOutputPath`     | `string`   | `""`            | Write a CycloneDX CBOM JSON document to this path when `traceCrypto` is active                                                                   |
 | `cryptoProbeMode`    | `string`   | `"tls-only"`    | Crypto probe depth: `"tls-only"` (default) captures TLS ciphers; `"operations"` also captures digest, encrypt, sign operations (higher overhead) |
@@ -165,7 +166,8 @@ All methods return `this` for chaining except `.run()`.
 | `.spoofAntiVM()`         | Intercept debugger & virtualization checks                                                                           |
 | `.traceLibraries()`      | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS)                                             |
 | `.traceHTTPURLs()`       | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)                                                 |
-| `.sanitizeEnv(val)`      | Strip sensitive env vars (TOKEN, SECRET, AUTH, etc.) before passing to sandbox                                       |
+| `.allowEnvs(...keys)`    | Allow specific host environment variables to pass through from the host process                                      |
+| `.allowHidden(allow)`    | Allow/disallow access to hidden files and directories (dotfiles)                                                     |
 | `.traceCrypto()`         | Enable TLS cipher suite and crypto library detection via eBPF uprobes (Linux only). Auto-enables `.traceHTTPURLs()`. |
 | `.cbom(path)`            | Set the output path for the CycloneDX CBOM JSON document (requires `.traceCrypto()`)                                 |
 | `.cryptoProbeMode(mode)` | Set crypto probe depth: `"tls-only"` (default) or `"operations"` (also captures digest/sign ops)                     |

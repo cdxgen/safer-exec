@@ -45,6 +45,7 @@ describe('Security Tests', () => {
     it('should read multiple files simultaneously', async () => {
       const etc = realpathSync('/etc');
       const result = await new SaferExec()
+        .readPaths(etc)
         .run('sh', ['-c', `cat ${etc}/hosts ${etc}/protocols 2>/dev/null`]);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
@@ -103,6 +104,7 @@ describe('Security Tests', () => {
       process.env.AWS_ACCESS_KEY_ID = 'AKIAIO...MPLE';
 
       const result = await new SaferExec()
+        .allowEnvs('AWS_SECRET_ACCESS_KEY', 'AWS_ACCESS_KEY_ID')
         .env('AWS_SECRET_ACCESS_KEY', 'secret1')
         .env('AWS_ACCESS_KEY_ID', 'key1')
         .run('sh', ['-c', 'echo $AWS_SECRET_ACCESS_KEY:$AWS_ACCESS_KEY_ID']);

@@ -640,6 +640,12 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	sb.WriteString("(allow user-preference-read)\n")
 	sb.WriteString("(allow file-read-metadata)\n")
 
+	// Deny hidden files/directories if AllowHidden is false
+	if !cfg.AllowHidden {
+		sb.WriteString("(deny file-read* (regex #\"/\\.[^/]+\"))\n")
+		sb.WriteString("(deny file-write* (regex #\"/\\.[^/]+\"))\n")
+	}
+
 	// Network rules
 	resolvedIPs := cfg.AllowIPs
 	if len(cfg.AllowHosts) > 0 {

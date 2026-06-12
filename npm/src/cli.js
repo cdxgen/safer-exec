@@ -103,7 +103,8 @@ Options:
   -a, --audit                Enable sandbox violation auditing
       --audit-output-file=<f> Write audit log to file (implies audit)
   -s, --strict               Treat sandbox setup warnings as errors
-      --sanitize-env          Strip sensitive env vars (TOKEN, SECRET, etc.)
+      --allow-envs=<vars>     Comma-separated host env vars to pass through (always sanitized by default)
+      --allow-hidden          Allow access to hidden files and directories (blocked by default)
 
   -j, --json                 Output results as JSON
   -h, --help                 Show this help message
@@ -311,7 +312,11 @@ function parseCliArgs() {
         type: 'boolean',
         short: 's',
       },
-      'sanitize-env': {
+      'allow-envs': {
+        type: 'string',
+        multiple: true,
+      },
+      'allow-hidden': {
         type: 'boolean',
       },
       json: {
@@ -484,8 +489,15 @@ function buildExec(values, cmd, args) {
     exec.traceExec();
   }
 
-    if (values['sanitize-env']) {
-    exec.sanitizeEnv();
+  if (values['allow-envs'] && values['allow-envs'].length > 0) {
+    const list = [];
+    for (const item of values['allow-envs']) {
+      list.push(...item.split(',').map(s => s.trim()).filter(Boolean));
+    }
+    exec.allowEnvs(...list);
+  }
+  if (values['allow-hidden']) {
+    exec.allowHidden();
   }
 
   // Features

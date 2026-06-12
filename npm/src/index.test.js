@@ -123,38 +123,120 @@ describe('SaferExec', () => {
     });
   });
 
-    describe('sanitizeEnv', () => {
-    it('should default to false', () => {
+  describe('allowEnvs', () => {
+    it('should default to empty array', () => {
       const exec = new SaferExec();
-      strict.equal(exec._sanitizeEnv, false);
+      strict.deepEqual(exec._allowEnvs, []);
     });
 
     it('should be settable via constructor option', () => {
-      const exec = new SaferExec({ sanitizeEnv: true });
-      strict.equal(exec._sanitizeEnv, true);
+      const exec = new SaferExec({ allowEnvs: ['TEST_VAR'] });
+      strict.deepEqual(exec._allowEnvs, ['TEST_VAR']);
     });
 
     it('should return this for chaining', () => {
       const exec = new SaferExec();
-      strict.equal(exec.sanitizeEnv(), exec);
+      strict.equal(exec.allowEnvs('TEST_VAR'), exec);
     });
 
-    it('should set _sanitizeEnv to true', () => {
+    it('should accumulate allowed environment variables', () => {
       const exec = new SaferExec();
-      exec.sanitizeEnv();
-      strict.equal(exec._sanitizeEnv, true);
+      exec.allowEnvs('VAR1');
+      exec.allowEnvs('VAR2');
+      strict.deepEqual(exec._allowEnvs, ['VAR1', 'VAR2']);
     });
 
-    it('should set _sanitizeEnv to false when called with false', () => {
-      const exec = new SaferExec();
-      exec.sanitizeEnv(false);
-      strict.equal(exec._sanitizeEnv, false);
-    });
-
-    it('should include sanitizeEnv in _buildConfig output', async () => {
-      const exec = new SaferExec({ sanitizeEnv: true });
+    it('should include allowEnvs in _buildConfig output', async () => {
+      const exec = new SaferExec({ allowEnvs: ['TEST_VAR'] });
       const { config } = await exec._buildConfig('echo', ['test']);
-      strict.equal(config.sanitizeEnv, true);
+      strict.deepEqual(config.allowEnvs, ['TEST_VAR']);
+    });
+  });
+
+  describe('allowHidden', () => {
+    it('should default to false', () => {
+      const exec = new SaferExec();
+      strict.equal(exec._allowHidden, false);
+    });
+
+    it('should be settable via constructor option', () => {
+      const exec = new SaferExec({ allowHidden: true });
+      strict.equal(exec._allowHidden, true);
+    });
+
+    it('should return this for chaining', () => {
+      const exec = new SaferExec();
+      strict.equal(exec.allowHidden(true), exec);
+    });
+
+    it('should set allowHidden to false when called with false', () => {
+      const exec = new SaferExec();
+      exec.allowHidden(false);
+      strict.equal(exec._allowHidden, false);
+    });
+
+    it('should include allowHidden in _buildConfig output', async () => {
+      const exec = new SaferExec({ allowHidden: true });
+      const { config } = await exec._buildConfig('echo', ['test']);
+      strict.equal(config.allowHidden, true);
+    });
+
+    it('should filter hidden read/write paths by default', async () => {
+      const { mkdirSync, rmSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      const { tmpdir } = await import('node:os');
+      const baseTmp = join(tmpdir(), 'safer-test-hidden-' + Date.now());
+      mkdirSync(baseTmp);
+      
+      const normalRead = join(baseTmp, 'normal_read');
+      const hiddenRead = join(baseTmp, '.hidden_read');
+      const normalWrite = join(baseTmp, 'normal_write');
+      const hiddenWrite = join(baseTmp, '.hidden_write');
+      
+      mkdirSync(normalRead);
+      mkdirSync(hiddenRead);
+      mkdirSync(normalWrite);
+      mkdirSync(hiddenWrite);
+      
+      try {
+        const exec = new SaferExec();
+        exec.readPaths(normalRead, hiddenRead);
+        exec.writePaths(normalWrite, hiddenWrite);
+        const { config } = await exec._buildConfig('echo', ['test']);
+        
+        strict.ok(config.readPaths.includes(normalRead), 'should include normal read path');
+        strict.ok(!config.readPaths.includes(hiddenRead), 'should filter out hidden read path');
+        strict.ok(config.writePaths.includes(normalWrite), 'should include normal write path');
+        strict.ok(!config.writePaths.includes(hiddenWrite), 'should filter out hidden write path');
+      } finally {
+        rmSync(baseTmp, { recursive: true, force: true });
+      }
+    });
+
+    it('should preserve hidden read/write paths if allowHidden is true', async () => {
+      const { mkdirSync, rmSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      const { tmpdir } = await import('node:os');
+      const baseTmp = join(tmpdir(), 'safer-test-hidden-2-' + Date.now());
+      mkdirSync(baseTmp);
+      
+      const hiddenRead = join(baseTmp, '.hidden_read');
+      const hiddenWrite = join(baseTmp, '.hidden_write');
+      
+      mkdirSync(hiddenRead);
+      mkdirSync(hiddenWrite);
+      
+      try {
+        const exec = new SaferExec({ allowHidden: true });
+        exec.readPaths(hiddenRead);
+        exec.writePaths(hiddenWrite);
+        const { config } = await exec._buildConfig('echo', ['test']);
+        
+        strict.ok(config.readPaths.includes(hiddenRead), 'should include hidden read path when allowed');
+        strict.ok(config.writePaths.includes(hiddenWrite), 'should include hidden write path when allowed');
+      } finally {
+        rmSync(baseTmp, { recursive: true, force: true });
+      }
     });
   });
 
@@ -938,6 +1020,30 @@ describe('SaferExec', () => {
 
       strict.equal(result.exitCode, 0);
       strict.ok(!result.stdout.includes('sensitive-token'), 'should not contain the secret host env variable');
+    });
+
+    it('should allow env variables passed via allowEnvs', async () => {
+      process.env.SAFE_VAR_TEST_XYZ = 'safe-value';
+      const result = await new SaferExec()
+        .allowEnvs('SAFE_VAR_TEST_XYZ')
+        .run('sh', ['-c', 'echo "VAL:${SAFE_VAR_TEST_XYZ}:VAL"']);
+
+      delete process.env.SAFE_VAR_TEST_XYZ;
+
+      strict.equal(result.exitCode, 0);
+      strict.ok(result.stdout.includes('safe-value'), 'should contain the allowed host env variable');
+    });
+
+    it('should allow even sensitive env variables if explicitly passed via allowEnvs', async () => {
+      process.env.SECRET_VAR_TEST_XYZ = 'secret-value';
+      const result = await new SaferExec()
+        .allowEnvs('SECRET_VAR_TEST_XYZ')
+        .run('sh', ['-c', 'echo "VAL:${SECRET_VAR_TEST_XYZ}:VAL"']);
+
+      delete process.env.SECRET_VAR_TEST_XYZ;
+
+      strict.equal(result.exitCode, 0);
+      strict.ok(result.stdout.includes('secret-value'), 'should contain the allowed sensitive host env variable');
     });
 
     it('should support BlockExec wildcard preventing executions of other processes', async () => {
