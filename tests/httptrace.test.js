@@ -1398,6 +1398,21 @@ describe('SaferExec Cryptographic Tracing Integration', { skip: !isLinux || !isR
         c.type === 'cryptographic-asset' || c.name === 'OpenSSL'
       );
       strict.ok(cryptoAsset, 'CBOM components should list cryptographic assets');
+
+      // Assert capture of cryptographic operations/ciphers with cryptoProperties (CycloneDX 1.7 Spec)
+      const componentsWithCrypto = cbomContent.components.filter(c => c.cryptoProperties);
+      strict.ok(componentsWithCrypto.length > 0, 'Should have components with cryptoProperties');
+
+      const algoComponent = componentsWithCrypto.find(c => c.cryptoProperties.assetType === 'algorithm');
+      strict.ok(algoComponent, 'Should have at least one cryptographic algorithm component');
+      strict.ok(algoComponent.cryptoProperties.algorithmProperties, 'Algorithm component should have algorithmProperties');
+      strict.ok(algoComponent.cryptoProperties.algorithmProperties.primitive, 'Algorithm primitive should be present');
+      strict.ok(Array.isArray(algoComponent.cryptoProperties.algorithmProperties.cryptoFunctions), 'Algorithm should have cryptoFunctions array');
+
+      const materialComponent = componentsWithCrypto.find(c => c.cryptoProperties.assetType === 'related-crypto-material');
+      strict.ok(materialComponent, 'Should have at least one related-crypto-material component');
+      strict.ok(materialComponent.cryptoProperties.relatedCryptoMaterialProperties, 'Material component should have relatedCryptoMaterialProperties');
+      strict.equal(materialComponent.cryptoProperties.relatedCryptoMaterialProperties.type, 'library', 'Material type should be library');
     });
     
     try { unlinkSync(cbomPath); } catch {}
