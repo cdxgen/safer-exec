@@ -629,6 +629,7 @@ type cbomCryptoProps struct {
 	AssetType                  string            `json:"assetType"`
 	AlgorithmProperties        *cbomAlgoProps    `json:"algorithmProperties,omitempty"`
 	RelatedCryptoMaterialProps *cbomRelatedProps `json:"relatedCryptoMaterialProperties,omitempty"`
+	ProtocolProperties         *cbomProtoProps   `json:"protocolProperties,omitempty"`
 }
 
 type cbomAlgoProps struct {
@@ -643,6 +644,17 @@ type cbomAlgoProps struct {
 
 type cbomRelatedProps struct {
 	Type string `json:"type"`
+}
+
+type cbomProtoProps struct {
+	Type         string            `json:"type"`
+	Version      string            `json:"version,omitempty"`
+	CipherSuites []cbomCipherSuite `json:"cipherSuites,omitempty"`
+}
+
+type cbomCipherSuite struct {
+	Name       string   `json:"name"`
+	Algorithms []string `json:"algorithms,omitempty"`
 }
 
 // writeCBOMFile writes a minimal CycloneDX CBOM JSON document to the given path.
@@ -690,6 +702,64 @@ func writeCBOMFile(path string, cryptoResult *config.CryptoResult) {
 					ImplementationPlatform: c.Library,
 					CryptoFunctions:        funcs,
 					ClassicalSecurityLevel: c.Bits,
+				},
+			},
+		})
+	}
+
+	seenProtocols := make(map[string]bool)
+	for _, c := range cryptoResult.Ciphers {
+		if c.Protocol == "" {
+			continue
+		}
+		protoKey := c.Protocol
+		if seenProtocols[protoKey] {
+			continue
+		}
+		seenProtocols[protoKey] = true
+
+		protoVersion := c.Protocol
+		if strings.HasPrefix(protoVersion, "TLSv") {
+			protoVersion = strings.TrimPrefix(protoVersion, "TLSv")
+		}
+
+		var suites []cbomCipherSuite
+		for _, o := range cryptoResult.Ciphers {
+			if o.Protocol == c.Protocol {
+				name := o.IANAName
+				if name == "" {
+					name = o.Name
+				}
+				var algs []string
+				if o.KeyExchange != "" && o.KeyExchange != "inline" {
+					algs = append(algs, o.KeyExchange)
+				}
+				if o.Authentication != "" && o.Authentication != "inline" {
+					algs = append(algs, o.Authentication)
+				}
+				if o.Encryption != "" {
+					algs = append(algs, o.Encryption)
+				}
+				if o.Hash != "" {
+					algs = append(algs, o.Hash)
+				}
+				suites = append(suites, cbomCipherSuite{
+					Name:       name,
+					Algorithms: algs,
+				})
+			}
+		}
+
+		doc.Components = append(doc.Components, cbomComponent{
+			Type:    "cryptographic-asset",
+			Name:    c.Protocol,
+			Version: protoVersion,
+			CryptoProperties: &cbomCryptoProps{
+				AssetType: "protocol",
+				ProtocolProperties: &cbomProtoProps{
+					Type:         "tls",
+					Version:      protoVersion,
+					CipherSuites: suites,
 				},
 			},
 		})

@@ -1413,6 +1413,15 @@ describe('SaferExec Cryptographic Tracing Integration', { skip: !isLinux || !isR
       strict.ok(materialComponent, 'Should have at least one related-crypto-material component');
       strict.ok(materialComponent.cryptoProperties.relatedCryptoMaterialProperties, 'Material component should have relatedCryptoMaterialProperties');
       strict.equal(materialComponent.cryptoProperties.relatedCryptoMaterialProperties.type, 'library', 'Material type should be library');
+
+      const protocolComponent = componentsWithCrypto.find(c => c.cryptoProperties.assetType === 'protocol');
+      strict.ok(protocolComponent, 'Should have at least one cryptographic protocol component');
+      strict.ok(protocolComponent.cryptoProperties.protocolProperties, 'Protocol component should have protocolProperties');
+      strict.equal(protocolComponent.cryptoProperties.protocolProperties.type, 'tls', 'Protocol type should be tls');
+      strict.ok(protocolComponent.cryptoProperties.protocolProperties.version, 'Protocol version should be present');
+      strict.ok(Array.isArray(protocolComponent.cryptoProperties.protocolProperties.cipherSuites), 'Protocol cipherSuites should be an array');
+      strict.ok(protocolComponent.cryptoProperties.protocolProperties.cipherSuites.length > 0, 'Protocol cipherSuites should not be empty');
+      strict.ok(protocolComponent.cryptoProperties.protocolProperties.cipherSuites[0].name, 'Cipher suite name should be present');
     });
     
     try { unlinkSync(cbomPath); } catch {}
