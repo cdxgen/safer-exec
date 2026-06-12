@@ -1403,7 +1403,7 @@ describe('SaferExec Cryptographic Tracing Integration', { skip: !isLinux || !isR
     try { unlinkSync(cbomPath); } catch {}
   });
 
-  it.skip('[Node] traceCrypto should emit crypto-related audit events', async () => {
+  it('[Node] traceCrypto should emit crypto-related audit events', async () => {
     const scriptPath = '/tmp/tmp_test_crypto_audit.js';
     
     await withTempFile(scriptPath, nodeScript('https://registry.npmjs.org/'), async () => {
@@ -1429,14 +1429,13 @@ describe('SaferExec Cryptographic Tracing Integration', { skip: !isLinux || !isR
       strict.ok(httpRequest, 'should capture http-request event');
       strict.ok(httpRequest.cipher || httpRequest.cryptoLibrary, 'http-request event should have crypto details');
 
-      // Verify that crypto audit events were emitted (library is mandatory, cipher is optional depending on TLS handshake negotiation)
+      // Verify that crypto audit events were emitted (both library and cipher are mandatory)
       const cryptoLib = events.find(e => e.type === 'crypto-library');
       strict.ok(cryptoLib, 'should emit crypto-library audit events');
 
       const cryptoCipher = events.find(e => e.type === 'crypto-cipher');
-      if (cryptoCipher) {
-        strict.ok(cryptoCipher.name, 'crypto-cipher event should have name');
-      }
+      strict.ok(cryptoCipher, 'should emit crypto-cipher audit events');
+      strict.ok(cryptoCipher.name, 'crypto-cipher event should have name');
     });
   });
 

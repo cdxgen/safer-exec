@@ -85,15 +85,9 @@ if (!existsSync(binaryToUse)) {
 }
 
 // Helper: run safer-exec with a given config and return { stdout, stderr, code }
-function runSaferExec(config, useStrace = false) {
+function runSaferExec(config) {
   return new Promise((resolve) => {
-    let cmd = binaryToUse;
-    let args = [];
-    if (useStrace) {
-      cmd = 'strace';
-      args = ['-f', '-s', '512', binaryToUse];
-    }
-    const child = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(binaryToUse, [], { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => { stdout += d.toString(); });
@@ -168,12 +162,7 @@ if (curlPath) {
   console.log('\n=== STDERR ===');
   console.log(curlResult.stderr || '(empty)');
 
-  if (curlResult.code !== 0) {
-    console.log('\n=== RUNNING WITH STRACE FOR DIAGNOSTICS (curl) ===');
-    const straceRes = await runSaferExec(curlConfig, true);
-    console.log('=== STRACE OUTPUT ===');
-    console.log(straceRes.stderr);
-  }
+
 
   console.log('\n=== ANALYZED EVENTS (curl) ===');
   const curlAnalysis = analyseEvents(curlResult.stderr);
@@ -244,12 +233,7 @@ console.log(nodeResult.stdout || '(empty)');
 console.log('\n=== STDERR ===');
 console.log(nodeResult.stderr || '(empty)');
 
-if (nodeResult.code !== 0) {
-  console.log('\n=== RUNNING WITH STRACE FOR DIAGNOSTICS (node) ===');
-  const straceRes = await runSaferExec(nodeConfig, true);
-  console.log('=== STRACE OUTPUT ===');
-  console.log(straceRes.stderr);
-}
+
 
 console.log('\n=== ANALYZED EVENTS (node + getCipher) ===');
 const nodeAnalysis = analyseEvents(nodeResult.stderr);
