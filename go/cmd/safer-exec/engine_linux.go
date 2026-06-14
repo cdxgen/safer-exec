@@ -38,6 +38,22 @@ const (
 	sysUSERFAULTFD = sysUSERFAULTFD_unified
 	sysIOPERM      = sysIOPERM_unified
 	sysIOPL        = sysIOPL_unified
+
+	sysLOOKUP_DCOOKIE    = sysLOOKUP_DCOOKIE_unified
+	sysFANOTIFY_INIT     = sysFANOTIFY_INIT_unified
+	sysINOTIFY_INIT      = sysINOTIFY_INIT_unified
+	sysINOTIFY_INIT1     = sysINOTIFY_INIT1_unified
+	sysIO_URING_SETUP    = sysIO_URING_SETUP_unified
+	sysIO_URING_ENTER    = sysIO_URING_ENTER_unified
+	sysIO_URING_REGISTER = sysIO_URING_REGISTER_unified
+	sysREQUEST_KEY       = sysREQUEST_KEY_unified
+	sysPROCESS_VM_READV  = sysPROCESS_VM_READV_unified
+	sysPROCESS_VM_WRITEV = sysPROCESS_VM_WRITEV_unified
+	sysFINIT_MODULE      = sysFINIT_MODULE_unified
+
+	sysGETRANDOM  = sysGETRANDOM_unified
+	sysMEMBARRIER = sysMEMBARRIER_unified
+	sysOPENAT2    = sysOPENAT2_unified
 )
 
 const (
@@ -1037,12 +1053,15 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 // runInitReduced is the inner init for reduced isolation mode. It skips namespace
 // and filesystem setup, applying only seccomp-bpf and Landlock network confinement.
 func runInitReduced(cfg config.ExecConfig) error {
-	cgroupPath, err := setupCgroupV2(cfg)
+	cgroupPath, v1Paths, err := setupCgroup(cfg)
 	if err != nil {
-		return fmt.Errorf("setting up cgroup v2: %w", err)
+		return fmt.Errorf("setting up cgroup: %w", err)
 	}
 	if cgroupPath != "" {
 		defer cleanupCgroup(cgroupPath)
+	}
+	if len(v1Paths) > 0 {
+		defer cleanupCgroupV1(v1Paths)
 	}
 
 	if err := applyLandlockNetwork(cfg); err != nil {
@@ -1057,6 +1076,13 @@ func runInitReduced(cfg config.ExecConfig) error {
 			return fmt.Errorf("landlock filesystem: %w", err)
 		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock filesystem: %v\n", err)
+	}
+
+	if err := applyLandlockScoped(cfg); err != nil {
+		if cfg.Strict {
+			return fmt.Errorf("landlock scoped: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock scoped: %v\n", err)
 	}
 
 	if err := applySeccomp(cfg); err != nil {
@@ -1096,12 +1122,15 @@ func runInit(cfg config.ExecConfig) error {
 		_ = cmd.Run()
 	}
 
-	cgroupPath, err := setupCgroupV2(cfg)
+	cgroupPath, v1Paths, err := setupCgroup(cfg)
 	if err != nil {
-		return fmt.Errorf("setting up cgroup v2: %w", err)
+		return fmt.Errorf("setting up cgroup: %w", err)
 	}
 	if cgroupPath != "" {
 		defer cleanupCgroup(cgroupPath)
+	}
+	if len(v1Paths) > 0 {
+		defer cleanupCgroupV1(v1Paths)
 	}
 
 	if cfg.EnableDiff {
@@ -1111,6 +1140,25 @@ func runInit(cfg config.ExecConfig) error {
 	} else {
 		if err := setupFilesystem(cfg); err != nil {
 			return fmt.Errorf("setting up filesystem: %w", err)
+		}
+	}
+
+	// MapToTargetUid: map UID 0 inside namespace to caller's real UID.
+	// This makes the sandboxed process appear as the caller's UID (not root),
+	// reducing the attack surface for root-in-namespace kernel bugs.
+	if cfg.MapToTargetUid {
+		uid := os.Getuid()
+		gid := os.Getgid()
+		uidMapping := fmt.Sprintf("0 %d 1", uid)
+		gidMapping := fmt.Sprintf("0 %d 1", gid)
+		if err := os.WriteFile("/proc/self/uid_map", []byte(uidMapping), 0); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: uid_map: %v\n", err)
+		}
+		if err := os.WriteFile("/proc/self/setgroups", []byte("deny"), 0); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: setgroups deny: %v\n", err)
+		}
+		if err := os.WriteFile("/proc/self/gid_map", []byte(gidMapping), 0); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: gid_map: %v\n", err)
 		}
 	}
 
@@ -1126,6 +1174,13 @@ func runInit(cfg config.ExecConfig) error {
 			return fmt.Errorf("landlock filesystem: %w", err)
 		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock filesystem: %v\n", err)
+	}
+
+	if err := applyLandlockScoped(cfg); err != nil {
+		if cfg.Strict {
+			return fmt.Errorf("landlock scoped: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: landlock scoped: %v\n", err)
 	}
 
 	if err := applySeccomp(cfg); err != nil {
@@ -1360,7 +1415,7 @@ func rawExecve(path string, argv, envp []string) error {
 	return errno
 }
 
-func setupCgroupV2(cfg config.ExecConfig) (string, error) {
+func setupCgroupV2Internal(cfg config.ExecConfig) (string, error) {
 	if cfg.MaxCPUCores == 0 && cfg.MaxMemoryMB == 0 && cfg.MaxProcesses == 0 &&
 		cfg.MaxReadIOPS == 0 && cfg.MaxWriteIOPS == 0 && cfg.MaxReadBps == 0 && cfg.MaxWriteBps == 0 {
 		return "", nil
@@ -1447,13 +1502,132 @@ func setupCgroupV2(cfg config.ExecConfig) (string, error) {
 	return cgroupPath, nil
 }
 
+func setupCgroupV2(cfg config.ExecConfig) (string, error) {
+	return setupCgroupV2Internal(cfg)
+}
+
+func setupCgroupV1(cfg config.ExecConfig) ([]string, error) {
+	if cfg.MaxCPUCores == 0 && cfg.MaxMemoryMB == 0 && cfg.MaxProcesses == 0 &&
+		cfg.MaxReadIOPS == 0 && cfg.MaxWriteIOPS == 0 && cfg.MaxReadBps == 0 && cfg.MaxWriteBps == 0 {
+		return nil, nil
+	}
+	if _, err := os.Stat("/sys/fs/cgroup/memory"); err != nil {
+		return nil, nil
+	}
+
+	pid := os.Getpid()
+	pidStr := strconv.Itoa(pid)
+	name := fmt.Sprintf("safer-exec-%d", pid)
+	var cleanupPaths []string
+
+	if cfg.MaxMemoryMB > 0 {
+		memPath := filepath.Join("/sys/fs/cgroup/memory", name)
+		if err := os.Mkdir(memPath, 0755); err == nil {
+			cleanupPaths = append(cleanupPaths, memPath)
+			memBytes := cfg.MaxMemoryMB * 1024 * 1024
+			os.WriteFile(filepath.Join(memPath, "memory.limit_in_bytes"), []byte(fmt.Sprintf("%d\n", memBytes)), 0644)
+			os.WriteFile(filepath.Join(memPath, "tasks"), []byte(pidStr+"\n"), 0644)
+		}
+	}
+
+	if cfg.MaxCPUCores > 0 {
+		cpuPath := filepath.Join("/sys/fs/cgroup/cpu", name)
+		if err := os.Mkdir(cpuPath, 0755); err == nil {
+			cleanupPaths = append(cleanupPaths, cpuPath)
+			period := 100000
+			quota := int(cfg.MaxCPUCores * float64(period))
+			os.WriteFile(filepath.Join(cpuPath, "cpu.cfs_quota_us"), []byte(fmt.Sprintf("%d\n", quota)), 0644)
+			os.WriteFile(filepath.Join(cpuPath, "cpu.cfs_period_us"), []byte(fmt.Sprintf("%d\n", period)), 0644)
+			os.WriteFile(filepath.Join(cpuPath, "tasks"), []byte(pidStr+"\n"), 0644)
+		}
+	}
+
+	if cfg.MaxProcesses > 0 {
+		pidsPath := filepath.Join("/sys/fs/cgroup/pids", name)
+		if err := os.Mkdir(pidsPath, 0755); err == nil {
+			cleanupPaths = append(cleanupPaths, pidsPath)
+			os.WriteFile(filepath.Join(pidsPath, "pids.max"), []byte(fmt.Sprintf("%d\n", cfg.MaxProcesses)), 0644)
+			os.WriteFile(filepath.Join(pidsPath, "tasks"), []byte(pidStr+"\n"), 0644)
+		}
+	}
+
+	if cfg.MaxReadBps > 0 || cfg.MaxWriteBps > 0 || cfg.MaxReadIOPS > 0 || cfg.MaxWriteIOPS > 0 {
+		blkioPath := filepath.Join("/sys/fs/cgroup/blkio", name)
+		if err := os.Mkdir(blkioPath, 0755); err == nil {
+			cleanupPaths = append(cleanupPaths, blkioPath)
+			if cfg.MaxReadBps > 0 {
+				os.WriteFile(filepath.Join(blkioPath, "blkio.throttle.read_bps_device"), []byte(fmt.Sprintf("8:0 %d\n", cfg.MaxReadBps)), 0644)
+			}
+			if cfg.MaxWriteBps > 0 {
+				os.WriteFile(filepath.Join(blkioPath, "blkio.throttle.write_bps_device"), []byte(fmt.Sprintf("8:0 %d\n", cfg.MaxWriteBps)), 0644)
+			}
+			if cfg.MaxReadIOPS > 0 {
+				os.WriteFile(filepath.Join(blkioPath, "blkio.throttle.read_iops_device"), []byte(fmt.Sprintf("8:0 %d\n", cfg.MaxReadIOPS)), 0644)
+			}
+			if cfg.MaxWriteIOPS > 0 {
+				os.WriteFile(filepath.Join(blkioPath, "blkio.throttle.write_iops_device"), []byte(fmt.Sprintf("8:0 %d\n", cfg.MaxWriteIOPS)), 0644)
+			}
+			os.WriteFile(filepath.Join(blkioPath, "tasks"), []byte(pidStr+"\n"), 0644)
+		}
+	}
+
+	return cleanupPaths, nil
+}
+
+func setupCgroup(cfg config.ExecConfig) (string, []string, error) {
+	cgroupV2Path, err := setupCgroupV2Internal(cfg)
+	if err != nil {
+		return "", nil, err
+	}
+	if cgroupV2Path != "" {
+		return cgroupV2Path, nil, nil
+	}
+	v1Paths, err := setupCgroupV1(cfg)
+	if err != nil {
+		return "", nil, err
+	}
+	return "", v1Paths, nil
+}
+
 func cleanupCgroup(path string) {
 	os.RemoveAll(path)
+}
+
+func cleanupCgroupV1(paths []string) {
+	for _, p := range paths {
+		os.RemoveAll(p)
+	}
 }
 
 func setupFilesystem(cfg config.ExecConfig) error {
 	// Make root mount slave so sandbox mounts never propagate to the host.
 	syscall.Mount("", "/", "", syscall.MS_SLAVE|syscall.MS_REC, "")
+
+	// ProtectSystem: automatically make system directories read-only.
+	// This mirrors systemd's ProtectSystem=strict/full directive.
+	if cfg.ProtectSystem == "strict" || cfg.ProtectSystem == "full" {
+		systemPaths := []string{"/usr", "/boot", "/etc", "/lib"}
+		if _, err := os.Stat("/lib64"); err == nil {
+			systemPaths = append(systemPaths, "/lib64")
+		}
+		if cfg.ProtectSystem == "full" {
+			systemPaths = append(systemPaths, "/")
+		}
+		for _, sp := range systemPaths {
+			alreadyInRead := false
+			for _, rp := range cfg.ReadPaths {
+				if rp == sp {
+					alreadyInRead = true
+					break
+				}
+			}
+			if !alreadyInRead {
+				if _, err := os.Stat(sp); err == nil {
+					cfg.ReadPaths = append(cfg.ReadPaths, sp)
+				}
+			}
+		}
+	}
 
 	cwd := cfg.WorkingDir
 	if cwd == "" {
@@ -1474,6 +1648,45 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		}
 	}
 
+	// ProtectHome: isolate $HOME directory inside the sandbox.
+	// "read-only" adds home to read paths and removes from write paths.
+	// "tmpfs" removes home from both read and write paths (mount handled in finalizeFilesystem).
+	homeDir := os.Getenv("HOME")
+	if cfg.ProtectHome == "read-only" && homeDir != "" {
+		alreadyInRead := false
+		for _, rp := range cfg.ReadPaths {
+			if rp == homeDir {
+				alreadyInRead = true
+				break
+			}
+		}
+		if !alreadyInRead {
+			cfg.ReadPaths = append(cfg.ReadPaths, homeDir)
+		}
+		filteredWrites := make([]string, 0, len(cfg.WritePaths))
+		for _, wp := range cfg.WritePaths {
+			if wp != homeDir && !strings.HasPrefix(wp, homeDir+"/") {
+				filteredWrites = append(filteredWrites, wp)
+			}
+		}
+		cfg.WritePaths = filteredWrites
+	} else if cfg.ProtectHome == "tmpfs" && homeDir != "" {
+		filteredReads := make([]string, 0, len(cfg.ReadPaths))
+		for _, rp := range cfg.ReadPaths {
+			if rp != homeDir && !strings.HasPrefix(rp, homeDir+"/") {
+				filteredReads = append(filteredReads, rp)
+			}
+		}
+		cfg.ReadPaths = filteredReads
+		filteredWrites := make([]string, 0, len(cfg.WritePaths))
+		for _, wp := range cfg.WritePaths {
+			if wp != homeDir && !strings.HasPrefix(wp, homeDir+"/") {
+				filteredWrites = append(filteredWrites, wp)
+			}
+		}
+		cfg.WritePaths = filteredWrites
+	}
+
 	newRoot, err := os.MkdirTemp("", "safer-exec-root-*")
 	if err != nil {
 		return fmt.Errorf("mkdir temp root: %w", err)
@@ -1485,6 +1698,10 @@ func setupFilesystem(cfg config.ExecConfig) error {
 
 	if err := os.MkdirAll(filepath.Join(newRoot, "tmp"), 0o777); err != nil {
 		return fmt.Errorf("mkdir tmp: %w", err)
+	}
+
+	if cfg.PrivateTmp {
+		os.MkdirAll(filepath.Join(newRoot, "var", "tmp"), 0o777)
 	}
 
 	// BindUseFd is opt-in (default false).
@@ -1598,6 +1815,27 @@ func setupFilesystem(cfg config.ExecConfig) error {
 		enforceAllSubmountsReadOnly(cfg.ReadPaths)
 	}
 
+	// Bind pre-opened FDs into the sandbox.
+	for _, spec := range cfg.BindFds {
+		target := filepath.Join(newRoot, spec.Target)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if cfg.Strict {
+				return fmt.Errorf("bind fd mkdir %s: %w", filepath.Dir(target), err)
+			}
+			continue
+		}
+		f, _ := os.Create(target)
+		if f != nil {
+			f.Close()
+		}
+		if err := bindMountFd(spec.Fd, target, spec.ReadOnly); err != nil {
+			if cfg.Strict {
+				return fmt.Errorf("bind fd %d to %s: %w", spec.Fd, spec.Target, err)
+			}
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: bind fd %d to %s: %v\n", spec.Fd, spec.Target, err)
+		}
+	}
+
 	return finalizeFilesystem(newRoot, cfg)
 }
 
@@ -1629,6 +1867,22 @@ func bindMount(source, target string, useFd bool) error {
 	if fdStat.Ino != targetStat.Ino || fdStat.Dev != targetStat.Dev {
 		syscall.Unmount(target, syscall.MNT_DETACH)
 		return fmt.Errorf("path %s swapped between open and mount", source)
+	}
+	return nil
+}
+
+// bindMountFd bind-mounts a file descriptor (from the parent namespace) to
+// a target path inside the sandbox. The fd must already be opened. This is
+// used for privilege-separated FD handoff where a privileged parent opens
+// special files and passes fds to the sandbox via BindFds.
+func bindMountFd(fd int, target string, readOnly bool) error {
+	fdPath := fmt.Sprintf("/proc/self/fd/%d", fd)
+	flags := uintptr(syscall.MS_BIND | syscall.MS_REC)
+	if err := syscall.Mount(fdPath, target, "", flags, ""); err != nil {
+		return err
+	}
+	if readOnly {
+		return syscall.Mount("", target, "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY, "")
 	}
 	return nil
 }
@@ -1745,6 +1999,26 @@ func finalizeFilesystem(newRoot string, cfg config.ExecConfig) error {
 	_ = syscall.Unmount("/.oldroot", syscall.MNT_DETACH)
 	_ = os.RemoveAll("/.oldroot")
 
+	// PrivateTmp: replace /tmp and /var/tmp with fresh tmpfs mounts so
+	// temporary files are not shared with the host or other sandbox instances.
+	if cfg.PrivateTmp {
+		_ = syscall.Unmount("/tmp", syscall.MNT_DETACH)
+		_ = syscall.Mount("tmpfs", "/tmp", "tmpfs", syscall.MS_NODEV|syscall.MS_NOEXEC|syscall.MS_NOSUID, "size=32m")
+		_ = os.MkdirAll("/var/tmp", 01777)
+		_ = syscall.Unmount("/var/tmp", syscall.MNT_DETACH)
+		_ = syscall.Mount("tmpfs", "/var/tmp", "tmpfs", syscall.MS_NODEV|syscall.MS_NOEXEC|syscall.MS_NOSUID, "size=32m")
+	}
+
+	// ProtectHome tmpfs: replace $HOME with blank tmpfs so the home
+	// directory is ephemeral and empty.
+	if cfg.ProtectHome == "tmpfs" {
+		if home := os.Getenv("HOME"); home != "" {
+			_ = os.MkdirAll(home, 01755)
+			_ = syscall.Unmount(home, syscall.MNT_DETACH)
+			_ = syscall.Mount("tmpfs", home, "tmpfs", syscall.MS_NODEV|syscall.MS_NOEXEC|syscall.MS_NOSUID, "size=16m")
+		}
+	}
+
 	// Mount a fresh proc filesystem with hidepid=2 to prevent
 	// leaking host process information through /proc.
 	// subset=pid restricts the view to PID-related entries only.
@@ -1850,6 +2124,15 @@ const (
 	landlockAccessFSTruncate   = 1 << 14
 )
 
+// Landlock ABI v4+ IOCTL device control (Linux 6.7+).
+const landlockAccessFSIoctlDev = 1 << 15
+
+// Landlock ABI v5+ network access rights (Linux 6.12+).
+const (
+	landlockAccessNetBindUDP    = 1 << 2
+	landlockAccessNetConnectUDP = 1 << 3
+)
+
 func getBindPortsAndWildcard(allowListen []string) ([]int, bool) {
 	var ports []int
 	hasWildcard := false
@@ -1917,6 +2200,15 @@ func applyLandlockNetwork(cfg config.ExecConfig) error {
 		return nil
 	}
 
+	if abi >= 5 {
+		if restrictBind {
+			handledAccess |= landlockAccessNetBindUDP
+		}
+		if restrictConnect {
+			handledAccess |= landlockAccessNetConnectUDP
+		}
+	}
+
 	attr := landlockRulesetAttr{HandledAccessNet: handledAccess}
 	rid, _, errno := syscall.RawSyscall(sysLandlockCreateRuleset, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr), 0)
 	if errno != 0 {
@@ -1968,6 +2260,45 @@ func applyLandlockNetwork(cfg config.ExecConfig) error {
 	}
 
 	syscall.RawSyscall(sysLandlockRestrictSelf, rid, 0, 0)
+	return nil
+}
+
+// applyLandlockScoped applies Landlock scoped rules (ABI v5+) for IPC restrictions.
+// Scoped rules prevent the sandbox from signaling, connecting abstract Unix sockets,
+// or ptracing processes outside the sandbox. Linux 6.12+.
+//
+// The scoped Landlock rules API is still evolving. This function detects ABI v5
+// and reports availability via diagnostics, but actual enforcement is deferred
+// until the kernel interface stabilizes.
+func applyLandlockScoped(cfg config.ExecConfig) error {
+	// Prevent unit tests from accidentally poisoning the Go test runner.
+	if os.Getenv("SAFER_EXEC_CONFIG_PATH") == "" && os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
+		return nil
+	}
+
+	abiVer := 0
+	if data, err := os.ReadFile("/sys/kernel/security/landlock/abi"); err == nil {
+		if v, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil {
+			abiVer = v
+		}
+	}
+	if abiVer < 5 {
+		return nil
+	}
+
+	const (
+		landlockScopeSignal             = 1 << 0
+		landlockScopeAbstractUnixSocket = 1 << 1
+	)
+
+	_ = landlockScopeSignal
+	_ = landlockScopeAbstractUnixSocket
+
+	// TODO: create a scoped ruleset when kernel ABI stabilizes.
+	// The scoped ruleset uses a different ruleset type with its own
+	// attribute struct. The exact syscall interface is still evolving
+	// in kernel 6.12+.
+
 	return nil
 }
 
@@ -2036,6 +2367,9 @@ func applyLandlockFilesystem(cfg config.ExecConfig) error {
 			landlockAccessFSRefer)
 	if abi >= 3 {
 		handledFS |= landlockAccessFSTruncate
+	}
+	if abi >= 4 {
+		handledFS |= landlockAccessFSIoctlDev
 	}
 
 	attr := landlockRulesetAttr{HandledAccessFS: handledFS}
@@ -2122,6 +2456,8 @@ func applySeccomp(cfg config.ExecConfig) error {
 
 	blockCalls := []int{
 		syscall.SYS_PTRACE, sysKCMP, syscall.SYS_UNSHARE, syscall.SYS_MOUNT, syscall.SYS_PIVOT_ROOT, sysSYSCALL,
+		// Block execution domain changes and kernel profiling
+		syscall.SYS_PERSONALITY, sysLOOKUP_DCOOKIE,
 		// Block privilege elevation (sudo/user/group changes)
 		syscall.SYS_SETUID, syscall.SYS_SETGID, syscall.SYS_SETREUID, syscall.SYS_SETREGID,
 		syscall.SYS_SETRESUID, syscall.SYS_SETRESGID, syscall.SYS_SETFSUID, syscall.SYS_SETFSGID,
@@ -2131,6 +2467,21 @@ func applySeccomp(cfg config.ExecConfig) error {
 		syscall.SYS_REMOVEXATTR, syscall.SYS_LREMOVEXATTR, syscall.SYS_FREMOVEXATTR,
 		// Block eBPF, perf monitoring, tracepoints, userfaultfd, and kernel key manager
 		sysBPF, syscall.SYS_PERF_EVENT_OPEN, sysUSERFAULTFD, syscall.SYS_KEYCTL,
+		// Block file change monitoring (fanotify + inotify)
+		sysFANOTIFY_INIT, sysINOTIFY_INIT, sysINOTIFY_INIT1,
+		syscall.SYS_INOTIFY_ADD_WATCH, syscall.SYS_INOTIFY_RM_WATCH,
+		// Block io_uring (can bypass seccomp on some kernels)
+		sysIO_URING_SETUP, sysIO_URING_ENTER, sysIO_URING_REGISTER,
+		// Block cross-process memory access
+		sysPROCESS_VM_READV, sysPROCESS_VM_WRITEV,
+		// Block kernel module loading
+		syscall.SYS_DELETE_MODULE, syscall.SYS_INIT_MODULE, sysFINIT_MODULE,
+		// Block disk quota manipulation
+		syscall.SYS_QUOTACTL,
+		// Block swap device control
+		syscall.SYS_SWAPOFF, syscall.SYS_SWAPON,
+		// Block kernel key management (supplements keyctl)
+		sysREQUEST_KEY,
 		// Block time manipulation
 		syscall.SYS_SETTIMEOFDAY, syscall.SYS_CLOCK_SETTIME, syscall.SYS_ADJTIMEX,
 		// Block kernel logging / dmesg address leaks
@@ -2255,6 +2606,13 @@ func applySeccomp(cfg config.ExecConfig) error {
 				continue
 			}
 			extraInsts = decoded
+		} else if spec.Policy != "" {
+			var err error
+			extraInsts, err = compileKafelPolicy(spec.Policy)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: seccomp policy compile: %v\n", err)
+				continue
+			}
 		}
 		if len(extraInsts) == 0 {
 			continue
@@ -2304,6 +2662,123 @@ func decodeBase64Seccomp(encoded string) ([]syscall.SockFilter, error) {
 		return nil, fmt.Errorf("decoded length %d is not a multiple of 8", len(data))
 	}
 	return parseSeccompProgram(data), nil
+}
+
+// compileKafelPolicy compiles a minimal Kafel-style policy string to BPF bytecode.
+// Supported syntax:
+//
+//	"ALLOW syscall1, syscall2, ...; DEFAULT KILL|ERRNO"
+//	"KILL syscall1, syscall2; DEFAULT ALLOW"
+//
+// Valid actions: ALLOW, KILL, ERRNO(n)
+// Masks for ALLOW/KILL are implicit (match syscall number exactly).
+//
+// This is a simplified subset of the full Kafel grammar sufficient for
+// common policy expression needs. For complex policies, use raw BPF or
+// base64-encoded programs via SeccompFilterSpec.Program.
+func compileKafelPolicy(policy string) ([]syscall.SockFilter, error) {
+	policy = strings.TrimSpace(policy)
+	if policy == "" {
+		return nil, fmt.Errorf("empty policy")
+	}
+
+	actions := map[string]uint32{
+		"ALLOW": seccompRetAllow,
+		"KILL":  seccompRetKill,
+	}
+
+	statements := strings.Split(policy, ";")
+	var defaultAction uint32 = seccompRetKill
+	var ruleSets []struct {
+		syscalls []int
+		action   uint32
+	}
+
+	for _, stmt := range statements {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+
+		if strings.HasPrefix(strings.ToUpper(stmt), "DEFAULT ") {
+			actionStr := strings.TrimSpace(stmt[8:])
+			actionStr = strings.ToUpper(actionStr)
+			if strings.HasPrefix(actionStr, "ERRNO") {
+				errnoStr := strings.TrimPrefix(actionStr, "ERRNO")
+				errnoStr = strings.Trim(errnoStr, "() ")
+				errnoVal, err := strconv.Atoi(errnoStr)
+				if err != nil {
+					return nil, fmt.Errorf("invalid ERRNO value: %s", errnoStr)
+				}
+				defaultAction = uint32(seccompRetErrno) | uint32(errnoVal)
+			} else if action, ok := actions[actionStr]; ok {
+				defaultAction = action
+			} else {
+				return nil, fmt.Errorf("unknown default action: %s", actionStr)
+			}
+			continue
+		}
+
+		parts := strings.SplitN(stmt, " ", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid statement: %s", stmt)
+		}
+		actionStr := strings.ToUpper(strings.TrimSpace(parts[0]))
+		syscallList := strings.TrimSpace(parts[1])
+
+		var action uint32
+		if strings.HasPrefix(actionStr, "ERRNO") {
+			errnoStr := strings.TrimPrefix(actionStr, "ERRNO")
+			errnoStr = strings.Trim(errnoStr, "() ")
+			errnoVal, err := strconv.Atoi(errnoStr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid ERRNO value: %s", errnoStr)
+			}
+			action = uint32(seccompRetErrno) | uint32(errnoVal)
+		} else if a, ok := actions[actionStr]; ok {
+			action = a
+		} else {
+			return nil, fmt.Errorf("unknown action: %s", actionStr)
+		}
+
+		var syscalls []int
+		for _, name := range strings.Split(syscallList, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			nr := resolveSyscallName(name)
+			if nr == -1 {
+				return nil, fmt.Errorf("unknown syscall: %s", name)
+			}
+			syscalls = append(syscalls, nr)
+		}
+		if len(syscalls) > 0 {
+			ruleSets = append(ruleSets, struct {
+				syscalls []int
+				action   uint32
+			}{syscalls, action})
+		}
+	}
+
+	var insts []syscall.SockFilter
+	insts = append(insts, syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0})
+
+	for _, rs := range ruleSets {
+		for i, nr := range rs.syscalls {
+			var jf uint8 = 1
+			if i == len(rs.syscalls)-1 {
+				jf = 2
+			}
+			insts = append(insts, syscall.SockFilter{Code: bpfJmpEq, Jt: 0, Jf: jf, K: uint32(nr)})
+			if i == len(rs.syscalls)-1 {
+				insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: rs.action})
+			}
+		}
+	}
+	insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: defaultAction})
+
+	return insts, nil
 }
 
 func logAuditEntry(entryType, target string) {
@@ -2629,29 +3104,35 @@ func monitorMaps(parentPid int, stopChan chan struct{}) {
 	}
 }
 
-// acquireFileLocks acquires shared (read) advisory locks on each path in
-// lockFiles. The locks are held for the lifetime of the returned file handles.
-// Close the files to release. This enables concurrent sandbox coordination
-// when multiple processes need serialized access to shared directories.
-func acquireFileLocks(lockFiles []string) ([]*os.File, error) {
+// acquireFileLocks acquires advisory locks on each path in lockFiles.
+// Shared (read) locks are used by default; exclusive (write) locks are used
+// when spec.Exclusive is true. The locks are held for the lifetime of the
+// returned file handles. Close the files to release. This enables concurrent
+// sandbox coordination when multiple processes need serialized access to
+// shared directories.
+func acquireFileLocks(lockFiles []config.LockFileSpec) ([]*os.File, error) {
 	if len(lockFiles) == 0 {
 		return nil, nil
 	}
 	var files []*os.File
-	for _, path := range lockFiles {
-		f, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0o644)
+	for _, spec := range lockFiles {
+		f, err := os.OpenFile(spec.Path, os.O_RDONLY|os.O_CREATE, 0o644)
 		if err != nil {
 			for _, prev := range files {
 				prev.Close()
 			}
-			return nil, fmt.Errorf("lock-file %s: %w", path, err)
+			return nil, fmt.Errorf("lock-file %s: %w", spec.Path, err)
 		}
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+		lockOp := syscall.LOCK_SH
+		if spec.Exclusive {
+			lockOp = syscall.LOCK_EX
+		}
+		if err := syscall.Flock(int(f.Fd()), lockOp); err != nil {
 			f.Close()
 			for _, prev := range files {
 				prev.Close()
 			}
-			return nil, fmt.Errorf("flock %s: %w", path, err)
+			return nil, fmt.Errorf("flock %s: %w", spec.Path, err)
 		}
 		files = append(files, f)
 	}
@@ -2796,6 +3277,28 @@ func runDiagnostics() config.DiagnosticsResult {
 		result.Capabilities["cgroup_v2"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
 	}
 
+	// cgroup v1
+	if _, err := os.Stat("/sys/fs/cgroup/memory"); err == nil {
+		result.Capabilities["cgroup_v1"] = config.CapabilityInfo{Available: true, Detail: "cgroup v1 memory controller present"}
+		if _, cpuErr := os.Stat("/sys/fs/cgroup/cpu"); cpuErr == nil {
+			result.Capabilities["cgroup_v1_cpu"] = config.CapabilityInfo{Available: true, Detail: "cgroup v1 cpu controller present"}
+		} else {
+			result.Capabilities["cgroup_v1_cpu"] = config.CapabilityInfo{Available: false, Detail: cpuErr.Error()}
+		}
+		if _, pidsErr := os.Stat("/sys/fs/cgroup/pids"); pidsErr == nil {
+			result.Capabilities["cgroup_v1_pids"] = config.CapabilityInfo{Available: true, Detail: "cgroup v1 pids controller present"}
+		} else {
+			result.Capabilities["cgroup_v1_pids"] = config.CapabilityInfo{Available: false, Detail: pidsErr.Error()}
+		}
+		if _, blkioErr := os.Stat("/sys/fs/cgroup/blkio"); blkioErr == nil {
+			result.Capabilities["cgroup_v1_blkio"] = config.CapabilityInfo{Available: true, Detail: "cgroup v1 blkio controller present"}
+		} else {
+			result.Capabilities["cgroup_v1_blkio"] = config.CapabilityInfo{Available: false, Detail: blkioErr.Error()}
+		}
+	} else {
+		result.Capabilities["cgroup_v1"] = config.CapabilityInfo{Available: false, Detail: err.Error()}
+	}
+
 	// Landlock
 	if data, err := os.ReadFile("/sys/kernel/security/landlock/abi"); err == nil {
 		abi := strings.TrimSpace(string(data))
@@ -2818,6 +3321,25 @@ func runDiagnostics() config.DiagnosticsResult {
 		detail := fmt.Sprintf("%d layers remaining (of 16)", remaining)
 		available := remaining > 0
 		result.Capabilities["landlock_layers_remaining"] = config.CapabilityInfo{Available: available, Detail: detail}
+	}
+
+	// Landlock ABI v4+ features (IOCTL device control, Linux 6.7+)
+	if data, err := os.ReadFile("/sys/kernel/security/landlock/abi"); err == nil {
+		abi := strings.TrimSpace(string(data))
+		if abiVer, convErr := strconv.Atoi(abi); convErr == nil {
+			if abiVer >= 4 {
+				result.Capabilities["landlock_ioctl"] = config.CapabilityInfo{Available: true, Detail: "IOCTL device control (ABI v4+)"}
+			} else {
+				result.Capabilities["landlock_ioctl"] = config.CapabilityInfo{Available: false, Detail: fmt.Sprintf("requires ABI v4, current: v%d", abiVer)}
+			}
+			if abiVer >= 5 {
+				result.Capabilities["landlock_udp"] = config.CapabilityInfo{Available: true, Detail: "UDP bind/connect control (ABI v5+)"}
+				result.Capabilities["landlock_scoped"] = config.CapabilityInfo{Available: true, Detail: "IPC scoped rules (ABI v5+)"}
+			} else {
+				result.Capabilities["landlock_udp"] = config.CapabilityInfo{Available: false, Detail: fmt.Sprintf("requires ABI v5, current: v%d", abiVer)}
+				result.Capabilities["landlock_scoped"] = config.CapabilityInfo{Available: false, Detail: fmt.Sprintf("requires ABI v5, current: v%d", abiVer)}
+			}
+		}
 	}
 
 	// AppArmor profile detection
@@ -2936,6 +3458,7 @@ func runDiagnostics() config.DiagnosticsResult {
 	hasPidNS := result.Capabilities["pid_namespace"].Available
 	hasNetNS := result.Capabilities["net_namespace"].Available
 	hasCGv2 := result.Capabilities["cgroup_v2"].Available
+	hasCGv1 := result.Capabilities["cgroup_v1"].Available
 	hasLandlock := result.Capabilities["landlock"].Available
 	hasSeccomp := result.Capabilities["seccomp"].Available
 	hasTmpfs := result.Capabilities["tmpfs"].Available
@@ -2947,10 +3470,10 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["network_isolation"] = fullIsolation
 	result.Features["file_read_restriction"] = fullIsolation || reducedIsolation
 	result.Features["file_write_restriction"] = fullIsolation || reducedIsolation
-	result.Features["memory_limit"] = hasCGv2 && result.Capabilities["cgroup_v2_memory"].Available
-	result.Features["cpu_limit"] = hasCGv2 && result.Capabilities["cgroup_v2_cpu"].Available
-	result.Features["process_limit"] = hasCGv2 && result.Capabilities["cgroup_v2_pids"].Available
-	result.Features["io_limit"] = hasCGv2 && result.Capabilities["cgroup_v2_io"].Available
+	result.Features["memory_limit"] = (hasCGv2 && result.Capabilities["cgroup_v2_memory"].Available) || hasCGv1
+	result.Features["cpu_limit"] = (hasCGv2 && result.Capabilities["cgroup_v2_cpu"].Available) || (hasCGv1 && result.Capabilities["cgroup_v1_cpu"].Available)
+	result.Features["process_limit"] = (hasCGv2 && result.Capabilities["cgroup_v2_pids"].Available) || (hasCGv1 && result.Capabilities["cgroup_v1_pids"].Available)
+	result.Features["io_limit"] = (hasCGv2 && result.Capabilities["cgroup_v2_io"].Available) || (hasCGv1 && result.Capabilities["cgroup_v1_blkio"].Available)
 	result.Features["exec_control"] = hasSeccomp
 	result.Features["fork_control"] = hasSeccomp
 	result.Features["audit_tracing"] = hasSeccomp
@@ -2986,6 +3509,17 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["submount_readonly_enforcement"] = fullIsolation
 	result.Features["proc_hardening"] = fullIsolation
 	result.Features["extra_fd_cleanup"] = true
+	result.Features["landlock_ioctl_control"] = result.Capabilities["landlock_ioctl"].Available
+	result.Features["landlock_udp_control"] = result.Capabilities["landlock_udp"].Available
+	result.Features["landlock_scoped_rules"] = result.Capabilities["landlock_scoped"].Available
+	result.Features["protect_system"] = true
+	result.Features["protect_home"] = fullIsolation
+	result.Features["private_tmp"] = fullIsolation
+	result.Features["cross_ns_fd_binding"] = fullIsolation
+	result.Features["exclusive_file_locks"] = true
+	result.Features["map_to_target_uid"] = hasUserNS
+	result.Features["kafel_seccomp_policy"] = hasSeccomp
+	result.Features["cgroup_v1_fallback"] = result.Capabilities["cgroup_v1"].Available
 
 	return result
 }

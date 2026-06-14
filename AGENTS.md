@@ -183,6 +183,51 @@ Policies are plain JavaScript functions that return config objects. They are pla
 3. Register in `POLICIES` map in `index.js`
 4. Add test in `npm/src/policies.test.js`
 
+### New Security Features since v0.12.0
+
+The following features were added as hardening measures. Some are now enabled by default; all fall back gracefully on platforms or kernels that lack the required support.
+
+#### Filesystem Isolation
+
+| Feature              | Config Field           | Description                                                                                                                   |
+| -------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| ProtectSystem        | `protectSystem`        | Auto-make `/usr`, `/boot`, `/etc`, `/lib` read-only. Modes: "strict", "full", "off". Mirrors systemd's ProtectSystem. Opt-in. |
+| ProtectHome          | `protectHome`          | Isolate `$HOME`. Modes: "read-only" (bind-mount ro), "tmpfs" (blank tmpfs), "off".                                            |
+| PrivateTmp           | `privateTmp`           | Replace `/tmp` and `/var/tmp` with fresh tmpfs mounts. Prevents temp file leakage.                                            |
+| Cross-ns FD Binding  | `bindFds`              | Bind-mount pre-opened file descriptors into the sandbox. Enables privileged parent → sandbox FD handoff.                      |
+| Exclusive File Locks | `lockFiles` (enhanced) | LockFileSpec now supports `exclusive: true` for `LOCK_EX` semantics. `lockFilesExclusive()` convenience method added.         |
+| setUpDev             | `setUpDev`             | Minimal `/dev` setup inside sandbox (null, zero, random, urandom, tty). Enabled by default.                                   |
+| dieWithParent        | `dieWithParent`        | Kill sandboxed process when parent exits (PR_SET_PDEATHSIG). Enabled by default.                                              |
+| newSession           | `newSession`           | Disconnect from controlling terminal (setsid). Enabled by default.                                                            |
+| bindUseFd            | `bindUseFd`            | FD-based bind mounts with TOCTTOU safety checks. Opt-in.                                                                      |
+
+#### Seccomp Hardening
+
+| Feature               | Config Field              | Description                                                                                                                                                                                                 |
+| --------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Enhanced Blocklist    | N/A (always on)           | Added 18 syscalls to default blocklist: personality, lookup*dcookie, fanotify_init, inotify*_, io*uring*_, process*vm*\*, delete_module, init_module, finit_module, quotactl, swapoff, swapon, request_key. |
+| Kafel Policy Language | `seccompFilters[].policy` | Compile seccomp filters from a simple policy language: "ALLOW syscall1, syscall2; DEFAULT KILL".                                                                                                            |
+
+#### Resource Limits
+
+| Feature            | Config Field    | Description                                                                                                                |
+| ------------------ | --------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Cgroup v1 Fallback | N/A (automatic) | Falls back to cgroup v1 controllers when `/sys/fs/cgroup/cgroup.controllers` is absent. Supports memory, cpu, pids, blkio. |
+
+#### Landlock Enhancements (Linux 6.7+)
+
+| Feature                | Description                                                              |
+| ---------------------- | ------------------------------------------------------------------------ |
+| IOCTL Control (ABI v4) | Restrict ioctl operations on devices via `LANDLOCK_ACCESS_FS_IOCTL_DEV`  |
+| UDP Rules (ABI v5)     | Add `LANDLOCK_ACCESS_NET_BIND_UDP` and `LANDLOCK_ACCESS_NET_CONNECT_UDP` |
+| Scoped Rules (ABI v5)  | IPC restrictions: prevent signaling/ptrace outside the sandbox           |
+
+#### Namespace Hardening
+
+| Feature           | Config Field     | Description                                                                                |
+| ----------------- | ---------------- | ------------------------------------------------------------------------------------------ |
+| Multi-UID Mapping | `mapToTargetUid` | Map UID 0 inside namespace to caller's real UID. Reduces root-in-namespace attack surface. |
+
 ---
 
 ## Coding Conventions
@@ -207,6 +252,7 @@ Policies are plain JavaScript functions that return config objects. They are pla
 ### Binary Resolution
 
 The `resolveBinaryPath()` function in `runner.js` locates the Go engine binary. It searches in this priority order:
+
 1. `go/bin/safer-exec-rt-{platform}-{arch}` (platform-specific local build)
 2. `go/bin/safer-exec-rt` (generic local build)
 3. Platform-specific npm optional dependencies in `node_modules`
@@ -234,8 +280,9 @@ The `resolveBinaryPath()` function in `runner.js` locates the Go engine binary. 
 4. Add method to `SaferExec` class in `npm/src/index.js`
 5. If the feature has user-facing config, add the field to `PolicyFile` in `config.go` and the `applyPolicyFile` method in `index.js`
 6. Add CLI flag in `npm/src/cli.js`
-7. Add tests to both platform test files and Node.js tests
-8. **Update documentation** (update README.md to describe the new configuration settings, CLI flags, and API methods)
+7. **Add test fixtures** — Create unit tests in `npm/src/` and integration tests in `tests/`.
+8. Add tests to both platform test files and Node.js tests
+9. **Update documentation** (update README.md to describe the new configuration settings, CLI flags, and API methods)
 
 ### Adding a New Ecosystem Policy
 

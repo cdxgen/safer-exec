@@ -42,6 +42,25 @@ type AllowURLRule struct {
 	Methods []string `json:"methods,omitempty"`
 }
 
+// BindFdSpec describes a file descriptor to bind-mount into the sandbox.
+// The FD must be opened by the parent process before sandbox entry.
+// This enables privilege-separated FD handoff from a privileged parent to
+// the sandbox for pre-opened sockets, device nodes, and special files.
+// Linux-only.
+type BindFdSpec struct {
+	Fd       int    `json:"fd"`
+	Target   string `json:"target"`
+	ReadOnly bool   `json:"readOnly,omitempty"`
+}
+
+// LockFileSpec describes a file lock to acquire before sandbox entry.
+// Path is the file path, Exclusive controls whether to use LOCK_EX (exclusive)
+// or LOCK_SH (shared, default).
+type LockFileSpec struct {
+	Path      string `json:"path"`
+	Exclusive bool   `json:"exclusive,omitempty"`
+}
+
 // ExecConfig is the canonical JSON structure the Go binary reads from stdin.
 // The Node.js wrapper populates this after DNS resolution and path expansion.
 type ExecConfig struct {
@@ -328,11 +347,12 @@ type ExecConfig struct {
 	// Linux-only. Requires kernel overlay + userxattr support.
 	TmpOverlayPaths []string `json:"tmpOverlayPaths,omitempty"`
 
-	// LockFiles lists file paths on which a shared flock is acquired for the
-	// duration of the sandbox. Enables concurrent sandbox coordination —
-	// exclusive locks can be used externally to serialize operations on
-	// shared directories. Linux+macoS.
-	LockFiles []string `json:"lockFiles,omitempty"`
+	// LockFiles lists file lock specifications to acquire before sandbox entry.
+	// Each entry specifies a file path and whether the lock should be exclusive
+	// (LOCK_EX) or shared (LOCK_SH, default). These locks are held for the
+	// duration of the sandbox, enabling concurrent sandbox coordination.
+	// Linux+macOS.
+	LockFiles []LockFileSpec `json:"lockFiles,omitempty"`
 
 	// JsonStatusFd is a writable file descriptor number for lifecycle
 	// notifications. The engine writes JSON-lines on sandbox start
@@ -355,17 +375,50 @@ type ExecConfig struct {
 	// This enables policy composition across organizational boundaries.
 	// Linux-only.
 	SeccompFilters []SeccompFilterSpec `json:"seccompFilters,omitempty"`
+
+	// ProtectSystem controls automatic read-only protection of system
+	// directories. "strict" makes /usr, /boot, /etc, /lib, /lib64 read-only.
+	// "full" is the same as "strict" but also includes /. "off" (default)
+	// preserves the current behavior. Linux-only.
+	ProtectSystem string `json:"protectSystem,omitempty"`
+
+	// ProtectHome controls $HOME directory isolation inside the sandbox.
+	// "read-only" makes the home directory read-only. "tmpfs" replaces the
+	// home directory with a fresh tmpfs mount (ephemeral). "off" (default)
+	// preserves the current behavior. Linux-only.
+	ProtectHome string `json:"protectHome,omitempty"`
+
+	// PrivateTmp, when true, mounts a fresh tmpfs on /tmp and /var/tmp
+	// inside the sandbox so temporary files are not shared with the host
+	// or other sandbox instances. Linux-only.
+	PrivateTmp bool `json:"privateTmp,omitempty"`
+
+	// BindFds lists file descriptors to bind-mount into the sandbox from
+	// the parent process. Each entry specifies a source FD (opened by the
+	// parent) and a target mount path inside the sandbox. This enables
+	// privilege-separated FD handoff for pre-opened sockets, device nodes,
+	// and special files. Linux-only.
+	BindFds []BindFdSpec `json:"bindFds,omitempty"`
+
+	// MapToTargetUid, when true, maps UID 0 inside the user namespace to
+	// the caller's real UID so the sandboxed process runs with the caller's
+	// identity rather than appearing as root. Linux-only.
+	MapToTargetUid bool `json:"mapToTargetUid,omitempty"`
 }
 
 // SeccompFilterSpec describes an additional seccomp-bpf filter to stack.
 type SeccompFilterSpec struct {
 	// Program is a base64-encoded BPF program (SockFilter array).
-	// Mutually exclusive with Path.
+	// Mutually exclusive with Path and Policy.
 	Program string `json:"program,omitempty"`
 
 	// Path is a filesystem path to a file containing raw BPF bytecode
-	// (struct sock_filter array). Mutually exclusive with Program.
+	// (struct sock_filter array). Mutually exclusive with Program and Policy.
 	Path string `json:"path,omitempty"`
+
+	// Policy is a Kafel-style policy string (e.g. "ALLOW openat, read; DEFAULT KILL").
+	// Compiles to BPF at runtime. Mutually exclusive with Program and Path.
+	Policy string `json:"policy,omitempty"`
 }
 
 // HTTPAccessEntry records a single HTTP request observed during eBPF tracing.
@@ -560,6 +613,13 @@ type PolicyFile struct {
 	AllowIPs       []string `json:"allowIPs,omitempty"`
 	AllowPorts     []int    `json:"allowPorts,omitempty"`
 	AllowListen    []string `json:"allowListen,omitempty"`
+
+	// Filesystem isolation
+	ProtectSystem  string         `json:"protectSystem,omitempty"`
+	ProtectHome    string         `json:"protectHome,omitempty"`
+	PrivateTmp     bool           `json:"privateTmp,omitempty"`
+	MapToTargetUid bool           `json:"mapToTargetUid,omitempty"`
+	LockFiles      []LockFileSpec `json:"lockFiles,omitempty"`
 
 	// Environment — prefer Env map; EnvVars is legacy (list of names only)
 	Env     map[string]string `json:"env,omitempty"`

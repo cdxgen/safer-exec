@@ -390,14 +390,14 @@ export class SaferExec extends EventEmitter {
      */
     this._allowURLRules = options.allowURLRules || [];
 
-    /** @type {boolean} Set up minimal /dev inside sandbox (Linux only, default false, opt-in) */
-    this._setUpDev = options.setUpDev || false;
+    /** @type {boolean} Set up minimal /dev inside sandbox (Linux only) */
+    this._setUpDev = options.setUpDev !== undefined ? options.setUpDev : true;
 
     /** @type {boolean} Kill sandboxed process when parent dies (PR_SET_PDEATHSIG) */
-    this._dieWithParent = options.dieWithParent || false;
+    this._dieWithParent = options.dieWithParent !== undefined ? options.dieWithParent : true;
 
     /** @type {boolean} Disconnect from controlling terminal (setsid) */
-    this._newSession = options.newSession || false;
+    this._newSession = options.newSession !== undefined ? options.newSession : true;
 
     /** @type {string[]} Create ephemeral writable overlay at paths (Linux only) */
     this._tmpOverlayPaths = Array.isArray(options.tmpOverlayPaths) ? options.tmpOverlayPaths : [];
@@ -405,8 +405,8 @@ export class SaferExec extends EventEmitter {
     /** @type {string[]} Advisory file locks during sandbox execution */
     this._lockFiles = Array.isArray(options.lockFiles) ? options.lockFiles : [];
 
-    /** @type {boolean} Use fd-based bind mounting for TOCTTOU safety (default false, opt-in) */
-    this._bindUseFd = options.bindUseFd || false;
+    /** @type {boolean} Use fd-based bind mounting for TOCTTOU safety (opt-in, may break DNS on some kernels) */
+    this._bindUseFd = options.bindUseFd !== undefined ? options.bindUseFd : false;
 
     /** @type {Array<{program?: string, path?: string}>} Stackable seccomp-bpf filters */
     this._seccompFilters = Array.isArray(options.seccompFilters) ? options.seccompFilters : [];
@@ -419,6 +419,21 @@ export class SaferExec extends EventEmitter {
 
     /** @type {boolean} Enforce submount read-only (default false, opt-in) */
     this._submountEnforce = options.submountEnforce || false;
+
+    /** @type {string} Auto-make system directories read-only: "strict", "full", or "off" */
+    this._protectSystem = options.protectSystem || 'off';
+
+    /** @type {string} Home directory isolation: "read-only", "tmpfs", or "off" */
+    this._protectHome = options.protectHome || 'off';
+
+    /** @type {boolean} Mount fresh tmpfs on /tmp and /var/tmp (Linux only, opt-in) */
+    this._privateTmp = options.privateTmp !== undefined ? options.privateTmp : false;
+
+    /** @type {Array<{fd: number, target: string, readOnly?: boolean}>} Pre-opened FDs to bind-mount */
+    this._bindFds = Array.isArray(options.bindFds) ? options.bindFds : [];
+
+    /** @type {boolean} Map UID 0 inside namespace to caller's real UID (Linux only, opt-in) */
+    this._mapToTargetUid = options.mapToTargetUid || false;
   }
 
   /**
@@ -675,7 +690,25 @@ export class SaferExec extends EventEmitter {
       this.tmpOverlayPaths(...raw.tmpOverlayPaths);
     }
     if (Array.isArray(raw.lockFiles) && raw.lockFiles.length > 0) {
-      this.lockFiles(...raw.lockFiles);
+      for (const lock of raw.lockFiles) {
+        if (typeof lock === 'string') {
+          this._lockFiles.push({ path: lock, exclusive: false });
+        } else if (lock && lock.path) {
+          this._lockFiles.push({ path: lock.path, exclusive: lock.exclusive || false });
+        }
+      }
+    }
+    if (typeof raw.protectSystem === 'string') {
+      this._protectSystem = raw.protectSystem;
+    }
+    if (typeof raw.protectHome === 'string') {
+      this._protectHome = raw.protectHome;
+    }
+    if (typeof raw.privateTmp === 'boolean') {
+      this._privateTmp = raw.privateTmp;
+    }
+    if (typeof raw.mapToTargetUid === 'boolean') {
+      this._mapToTargetUid = raw.mapToTargetUid;
     }
     if (raw.setUpDev !== undefined) {
       this.setUpDev(raw.setUpDev);
@@ -1209,13 +1242,13 @@ export class SaferExec extends EventEmitter {
 
   /**
    * Enable or disable minimal /dev setup inside the sandbox.
-   * When enabled (default), essential device nodes like /dev/null, /dev/zero,
-   * /dev/random, /dev/urandom, /dev/tty are created from a fresh tmpfs.
+   * Essential device nodes like /dev/null, /dev/zero, /dev/random, /dev/urandom,
+   * /dev/tty are created from a fresh tmpfs. Enabled by default.
    *
-   * @param {boolean} [enable=true] - Whether to set up /dev
+   * @param {boolean} [enable=true] - Pass false to disable
    * @returns {SaferExec} This instance for chaining
    */
-  setUpDev(enable = false) {
+  setUpDev(enable = true) {
     this._setUpDev = enable;
     return this;
   }
@@ -1258,26 +1291,109 @@ export class SaferExec extends EventEmitter {
   }
 
   /**
-   * Kill the sandboxed process with SIGKILL when its parent process dies.
-   * Uses PR_SET_PDEATHSIG to prevent orphaned sandbox processes.
+   * Automatically make system directories read-only inside the sandbox.
+   * Mirrors systemd's ProtectSystem directive for defense-in-depth.
+   *
+   * "strict" — Mount /usr, /boot, /etc, /lib, /lib64 as read-only.
+   * "full"   — Same as strict plus /.
+   * "off"    — No automatic read-only system paths (default).
+   *
+   * User-declared WritePaths take precedence over ProtectSystem.
    * Linux-only.
    *
+   * @param {'strict'|'full'|'off'} [mode='strict'] - Protection mode
    * @returns {SaferExec} This instance for chaining
    */
-  dieWithParent() {
-    this._dieWithParent = true;
+  protectSystem(mode = 'strict') {
+    this._protectSystem = mode;
+    return this;
+  }
+
+  /**
+   * Isolate the home directory ($HOME) inside the sandbox.
+   *
+   * "read-only" — Bind-mount $HOME as read-only.
+   * "tmpfs"     — Replace $HOME with a blank tmpfs mount.
+   * "off"       — Inherit host home directory (default).
+   *
+   * Linux-only.
+   *
+   * @param {'read-only'|'tmpfs'|'off'} [mode='read-only'] - Isolation mode
+   * @returns {SaferExec} This instance for chaining
+   */
+  protectHome(mode = 'read-only') {
+    this._protectHome = mode;
+    return this;
+  }
+
+  /**
+   * Replace /tmp and /var/tmp with fresh tmpfs mounts inside the sandbox.
+   * Prevents temporary file leakage and cross-sandbox contamination.
+   * Linux-only.
+   *
+   * @param {boolean} [enable=true] - Whether to enable private temp directories
+   * @returns {SaferExec} This instance for chaining
+   */
+  privateTmp(enable = true) {
+    this._privateTmp = enable;
+    return this;
+  }
+
+  /**
+   * Bind-mount pre-opened file descriptors into the sandbox.
+   * Enables privileged parent to sandbox FD handoff for pre-connected
+   * sockets, device nodes, and special files.
+   * Linux-only.
+   *
+   * @param {...{fd: number, target: string, readOnly?: boolean}} specs - FD bind specs
+   * @returns {SaferExec} This instance for chaining
+   */
+  bindFds(...specs) {
+    for (const s of specs) {
+      if (s && typeof s.fd === 'number' && s.target) {
+        this._bindFds.push({ fd: s.fd, target: s.target, readOnly: s.readOnly || false });
+      }
+    }
+    return this;
+  }
+
+  /**
+   * Map UID 0 inside the user namespace to the caller's real UID.
+   * This makes the sandboxed process run as the caller's UID (not root),
+   * reducing the surface for kernel bugs triggered by root-in-namespace processes.
+   * Linux-only. Requires newuidmap/newgidmap helpers.
+   *
+   * @param {boolean} [enable=true] - Whether to enable UID remapping
+   * @returns {SaferExec} This instance for chaining
+   */
+  mapToTargetUid(enable = true) {
+    this._mapToTargetUid = enable;
+    return this;
+  }
+
+  /**
+   * Kill the sandboxed process with SIGKILL when its parent process dies.
+   * Uses PR_SET_PDEATHSIG to prevent orphaned sandbox processes.
+   * Linux-only. Enabled by default.
+   *
+   * @param {boolean} [enable=true] - Pass false to disable
+   * @returns {SaferExec} This instance for chaining
+   */
+  dieWithParent(enable = true) {
+    this._dieWithParent = enable;
     return this;
   }
 
   /**
    * Disconnect the sandboxed process from the controlling terminal via setsid().
    * Prevents terminal-based signal injection (SIGHUP, SIGINT).
-   * Linux-only.
+   * Linux-only. Enabled by default.
    *
+   * @param {boolean} [enable=true] - Pass false to disable
    * @returns {SaferExec} This instance for chaining
    */
-  newSession() {
-    this._newSession = true;
+  newSession(enable = true) {
+    this._newSession = enable;
     return this;
   }
 
@@ -1296,14 +1412,41 @@ export class SaferExec extends EventEmitter {
   }
 
   /**
-   * Acquire shared advisory locks on the given files for the duration of
-   * the sandbox. Enables concurrent sandbox coordination.
+   * Acquire advisory file locks for the duration of the sandbox.
+   * Accepts plain string paths (shared lock, default) or LockFileSpec objects
+   * with an optional `exclusive` flag.
    *
-   * @param {...string} paths - File paths to lock
+   * @param {...(string|LockFileSpec)} specs - File paths or lock specs {path: string, exclusive?: boolean}
    * @returns {SaferExec} This instance for chaining
+   *
+   * @typedef {{path: string, exclusive?: boolean}} LockFileSpec
    */
-  lockFiles(...paths) {
-    this._lockFiles.push(...paths);
+  lockFiles(...specs) {
+    for (const spec of specs) {
+      if (typeof spec === 'string') {
+        this._lockFiles.push({ path: spec, exclusive: false });
+      } else if (spec && typeof spec === 'object' && spec.path) {
+        this._lockFiles.push({ path: spec.path, exclusive: spec.exclusive || false });
+      }
+    }
+    return this;
+  }
+
+  /**
+   * Acquire exclusive (write) advisory locks on files for the sandbox duration.
+   * Exclusive locks enable serialized coordination patterns
+   * (e.g., hold exclusive lock during npm install, shared during npm test).
+   *
+   * @param {...string} paths - File paths to lock exclusively
+   * @returns {SaferExec} This instance for chaining
+   *
+   * @example
+   * new SaferExec().lockFilesExclusive('/var/lock/npm-install').run('npm', ['install']);
+   */
+  lockFilesExclusive(...paths) {
+    for (const p of paths) {
+      this._lockFiles.push({ path: p, exclusive: true });
+    }
     return this;
   }
 
@@ -1313,10 +1456,10 @@ export class SaferExec extends EventEmitter {
    * /proc/self/fd/N, with a TOCTTOU integrity check after the mount.
    * Linux-only.
    *
-   * @param {boolean} [use=true] - Whether to use fd-based binding
+   * @param {boolean} [use=true] - Pass false to disable
    * @returns {SaferExec} This instance for chaining
    */
-  bindUseFd(use = false) {
+  bindUseFd(use = true) {
     this._bindUseFd = use;
     return this;
   }
@@ -1332,6 +1475,26 @@ export class SaferExec extends EventEmitter {
   seccompFilters(filters) {
     if (Array.isArray(filters)) {
       this._seccompFilters.push(...filters);
+    }
+    return this;
+  }
+
+  /**
+   * Stack a Kafel-style seccomp policy filter using a simple policy language.
+   * Compiles at runtime to BPF bytecode. Linux-only.
+   *
+   * Supported syntax: "ALLOW syscall1, syscall2; DEFAULT KILL"
+   * Valid actions: ALLOW, KILL, ERRNO(n)
+   *
+   * @param {string} policy - Kafel-style policy string
+   * @returns {SaferExec} This instance for chaining
+   *
+   * @example
+   * new SaferExec().seccompPolicy('ALLOW openat, read, write, close; DEFAULT KILL');
+   */
+  seccompPolicy(policy) {
+    if (typeof policy === 'string' && policy.trim()) {
+      this._seccompFilters.push({ policy: policy.trim() });
     }
     return this;
   }
@@ -1813,6 +1976,11 @@ export class SaferExec extends EventEmitter {
       useReaper: this._useReaper,
       procHardening: this._procHardening,
       submountEnforce: this._submountEnforce,
+      protectSystem: this._protectSystem,
+      protectHome: this._protectHome,
+      privateTmp: this._privateTmp,
+      bindFds: this._bindFds,
+      mapToTargetUid: this._mapToTargetUid,
     };
 
     const effectiveTimeout = this._timeoutMs;

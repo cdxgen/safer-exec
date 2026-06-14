@@ -72,23 +72,23 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 ### Linux (Namespaces + Seccomp + Landlock + cgroup v2 + eBPF LSM)
 
-| Mechanism         | What it enforces                         | How                                                                          |
-| ----------------- | ---------------------------------------- | ---------------------------------------------------------------------------- |
-| User namespace    | UID isolation                            | `CLONE_NEWUSER` + `/proc/self` UID/GID mapping                               |
-| Mount namespace   | Filesystem isolation                     | `CLONE_NEWNS` + tmpfs root + bind mounts (fd-based with TOCTTOU check)       |
-| PID namespace     | Process tree isolation                   | `CLONE_NEWPID` + PID 1 reaper process                                        |
-| UTS namespace     | Hostname isolation                       | `CLONE_NEWUTS`                                                               |
-| Network namespace | Network isolation                        | `CLONE_NEWNET` (when `disableNetwork` is true)                               |
-| pivot_root        | Root filesystem swap                     | Mounts tmpfs, bind-mounts paths, pivots with MS_PRIVATE old-root cleanup     |
-| Seccomp-bpf       | Syscall filtering                        | Blocks ptrace, kcmp, unshare, mount, pivot_root + stackable custom filters   |
-| Landlock v2       | Network port filtering                   | Ruleset version 5 (kernel 6.2+) for TCP connect/bind                         |
-| Landlock v3+      | Filesystem confinement                   | `path_beneath` rules for read/write/execute/truncate/refer access            |
-| cgroup v2         | Resource quotas                          | `cpu.max`, `memory.max`, `pids.max`, `io.max`                                |
-| LSM BPF           | Kernel-level audits                      | Attaches BPF hooks to `bprm_check_security` / `file_open`                    |
-| MS_SLAVE          | Mount propagation control                | Prevents sandbox mounts from leaking to host                                 |
-| Submount remount  | Read-only enforcement                    | Parses `/proc/self/mountinfo`, remounts each submount as read-only           |
-| /proc hardening   | Dangerous entry blockage                 | Covers `sys`, `sysrq-trigger`, `irq`, `bus` with read-only bind mounts       |
-| /dev isolation    | Minimal device exposure                  | Fresh tmpfs with only essential device nodes + stdio symlinks                |
+| Mechanism         | What it enforces          | How                                                                        |
+| ----------------- | ------------------------- | -------------------------------------------------------------------------- |
+| User namespace    | UID isolation             | `CLONE_NEWUSER` + `/proc/self` UID/GID mapping                             |
+| Mount namespace   | Filesystem isolation      | `CLONE_NEWNS` + tmpfs root + bind mounts (fd-based with TOCTTOU check)     |
+| PID namespace     | Process tree isolation    | `CLONE_NEWPID` + PID 1 reaper process                                      |
+| UTS namespace     | Hostname isolation        | `CLONE_NEWUTS`                                                             |
+| Network namespace | Network isolation         | `CLONE_NEWNET` (when `disableNetwork` is true)                             |
+| pivot_root        | Root filesystem swap      | Mounts tmpfs, bind-mounts paths, pivots with MS_PRIVATE old-root cleanup   |
+| Seccomp-bpf       | Syscall filtering         | Blocks ptrace, kcmp, unshare, mount, pivot_root + stackable custom filters |
+| Landlock v2       | Network port filtering    | Ruleset version 5 (kernel 6.2+) for TCP connect/bind                       |
+| Landlock v3+      | Filesystem confinement    | `path_beneath` rules for read/write/execute/truncate/refer access          |
+| cgroup v2         | Resource quotas           | `cpu.max`, `memory.max`, `pids.max`, `io.max`                              |
+| LSM BPF           | Kernel-level audits       | Attaches BPF hooks to `bprm_check_security` / `file_open`                  |
+| MS_SLAVE          | Mount propagation control | Prevents sandbox mounts from leaking to host                               |
+| Submount remount  | Read-only enforcement     | Parses `/proc/self/mountinfo`, remounts each submount as read-only         |
+| /proc hardening   | Dangerous entry blockage  | Covers `sys`, `sysrq-trigger`, `irq`, `bus` with read-only bind mounts     |
+| /dev isolation    | Minimal device exposure   | Fresh tmpfs with only essential device nodes + stdio symlinks              |
 
 ## 3. Threats and Attack Vectors
 

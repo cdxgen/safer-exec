@@ -56,6 +56,9 @@ safer-exec --seccomp-filter=/etc/safer-exec/custom.bpf -- npm install
 # Disable fd-based bind mounts
 safer-exec --no-bind-fd -- npm install
 
+# Disable default /dev setup
+safer-exec --no-set-up-dev -- npm install
+
 # Validate Seatbelt profile syntax (macOS)
 safer-exec --validate-profile -- cat /etc/hosts
 
@@ -65,6 +68,21 @@ safer-exec --policy-file=custom.json -- npm install
 
 # Diagnostics mode — probe OS capabilities and feature support
 safer-exec diagnostics
+
+# Isolate home directory with tmpfs
+safer-exec --protect-home=tmpfs -- npm test
+
+# Enable private /tmp
+safer-exec --private-tmp --write-path=/tmp -- sh -c "echo test > /tmp/out.txt"
+
+# Use exclusive file locks for serialized installs
+safer-exec --lock-file-exclusive=/var/lock/npm-install -- npm install
+
+# Stack a Kafel seccomp policy (opt-in)
+safer-exec --seccomp-policy="ALLOW openat, read, write; DEFAULT KILL" -- cat /etc/hostname
+
+# Bind a pre-opened FD into the sandbox
+safer-exec --bind-fd=3:/dev/host-tty:ro -- tty
 ```
 
 Full help: `safer-exec --help`.
@@ -143,59 +161,66 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 
 All methods return `this` for chaining except `.run()`.
 
-| Method                   | Description                                                                                                          |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| `.applyPolicy(name)`     | Apply a pre-defined policy. Throws if unknown.                                                                       |
-| `.allowHosts(...hosts)`  | Add hostnames to the network allow list                                                                              |
-| `.allowUrls(...urls)`    | Add fine-grained URL rules — strings or `{host,protocol,path,methods,port}` objects (Linux only)                     |
-| `.readPaths(...paths)`   | Add filesystem read paths                                                                                            |
-| `.writePaths(...paths)`  | Add filesystem write paths                                                                                           |
-| `.env(key, value)`       | Set an environment variable                                                                                          |
-| `.disableNetwork()`      | Disable all network access                                                                                           |
-| `.maxMemory(mb)`         | Set memory limit in megabytes                                                                                        |
-| `.maxCPUCores(cores)`    | Set CPU limit as fractional cores (e.g. 0.5)                                                                         |
-| `.maxProcesses(count)`   | Set maximum child process count                                                                                      |
-| `.maxReadIOPS(iops)`     | Set max read IO operations per second (Linux only)                                                                   |
-| `.maxWriteIOPS(iops)`    | Set max write IO operations per second (Linux only)                                                                  |
-| `.maxReadBps(bps)`       | Set max read bytes per second (Linux only)                                                                           |
-| `.maxWriteBps(bps)`      | Set max write bytes per second (Linux only)                                                                          |
-| `.timeout(ms)`           | Set hard kill timeout in milliseconds                                                                                |
-| `.binaryPath(path)`      | Override the Go binary path                                                                                          |
-| `.workingDir(dir)`       | Set the working directory                                                                                            |
-| `.enableAudit()`         | Enable sandbox violation auditing                                                                                    |
-| `.allowPorts(...ports)`  | Set allowed TCP ports                                                                                                |
-| `.enableDiff()`          | Enable filesystem mutation diffing                                                                                   |
-| `.enableLearn()`         | Enable behavioral auto-profiling                                                                                     |
-| `.validateProfile()`     | Validate Seatbelt profile syntax without executing (macOS)                                                           |
-| `.allowExec(...cmds)`    | Restrict which executables can run                                                                                   |
-| `.blockExec(...cmds)`    | Block specific executables from running                                                                              |
-| `.blockFork()`           | Prevent the command from forking new processes                                                                       |
-| `.traceExec()`           | Log every child process spawned                                                                                      |
-| `.strict()`              | Treat sandbox setup warnings as hard errors                                                                          |
-| `.resolveSymlinks()`     | Resolve target command symlink in PATH                                                                               |
-| `.allowCrypto(allow)`    | Allow/disallow cryptographic operations                                                                              |
-| `.blockCrypto()`         | Restrict system cryptographic libraries                                                                              |
-| `.blockCryptoEntropy()`  | Restrict entropy devices (/dev/random)                                                                               |
-| `.detectFIPS()`          | Log and watch for FIPS lookups                                                                                       |
-| `.strictFIPS()`          | Restrict runtime to strict FIPS compliant mode                                                                       |
-| `.allowGPU(allow)`       | Allow/disallow access to host GPU nodes                                                                              |
-| `.blockTPM()`            | Restrict hardware access to TPM device                                                                               |
-| `.spoofAntiVM()`         | Intercept debugger & virtualization checks                                                                           |
-| `.traceLibraries()`      | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS)                                             |
-| `.traceHTTPURLs()`       | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)                                                 |
-| `.allowEnvs(...keys)`    | Allow specific host environment variables to pass through from the host process                                      |
-| `.allowHidden(allow)`    | Allow/disallow access to hidden files and directories (dotfiles)                                                     |
-| `.allowListen(list)`     | Allow listening/binding on specific IP addresses or ip:port strings (blocked by default, even loopback)              |
-| `.traceCrypto()`         | Enable TLS cipher suite and crypto library detection via eBPF uprobes (Linux only). Auto-enables `.traceHTTPURLs()`. |
-| `.cbom(path)`            | Set the output path for the CycloneDX CBOM JSON document (requires `.traceCrypto()`)                                 |
-| `.cryptoProbeMode(mode)` | Set crypto probe depth: `"tls-only"` (default) or `"operations"` (also captures digest/sign ops)                     |
-| `.setUpDev(enable)`      | Enable/disable minimal `/dev` setup inside sandbox (Linux only, default true)                                          |
-| `.dieWithParent()`       | Kill sandboxed process with SIGKILL when parent dies (PR_SET_PDEATHSIG, Linux only)                                   |
-| `.newSession()`          | Disconnect from controlling terminal via setsid() (Linux only)                                                        |
-| `.tmpOverlayPaths(...)`  | Create ephemeral writable overlays at paths (overlayfs, Linux only)                                                   |
-| `.lockFiles(...)`        | Hold shared advisory locks on files for sandbox duration                                                              |
-| `.bindUseFd(use)`        | Enable/disable fd-based bind mounting for TOCTTOU safety (default true, Linux only)                                   |
-| `.seccompFilters(filters)`| Stack additional seccomp-bpf filters (base64 encoded or file path, Linux only)                                       |
+| Method                     | Description                                                                                                                            |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `.applyPolicy(name)`       | Apply a pre-defined policy. Throws if unknown.                                                                                         |
+| `.allowHosts(...hosts)`    | Add hostnames to the network allow list                                                                                                |
+| `.allowUrls(...urls)`      | Add fine-grained URL rules — strings or `{host,protocol,path,methods,port}` objects (Linux only)                                       |
+| `.readPaths(...paths)`     | Add filesystem read paths                                                                                                              |
+| `.writePaths(...paths)`    | Add filesystem write paths                                                                                                             |
+| `.env(key, value)`         | Set an environment variable                                                                                                            |
+| `.disableNetwork()`        | Disable all network access                                                                                                             |
+| `.maxMemory(mb)`           | Set memory limit in megabytes                                                                                                          |
+| `.maxCPUCores(cores)`      | Set CPU limit as fractional cores (e.g. 0.5)                                                                                           |
+| `.maxProcesses(count)`     | Set maximum child process count                                                                                                        |
+| `.maxReadIOPS(iops)`       | Set max read IO operations per second (Linux only)                                                                                     |
+| `.maxWriteIOPS(iops)`      | Set max write IO operations per second (Linux only)                                                                                    |
+| `.maxReadBps(bps)`         | Set max read bytes per second (Linux only)                                                                                             |
+| `.maxWriteBps(bps)`        | Set max write bytes per second (Linux only)                                                                                            |
+| `.timeout(ms)`             | Set hard kill timeout in milliseconds                                                                                                  |
+| `.binaryPath(path)`        | Override the Go binary path                                                                                                            |
+| `.workingDir(dir)`         | Set the working directory                                                                                                              |
+| `.enableAudit()`           | Enable sandbox violation auditing                                                                                                      |
+| `.allowPorts(...ports)`    | Set allowed TCP ports                                                                                                                  |
+| `.enableDiff()`            | Enable filesystem mutation diffing                                                                                                     |
+| `.enableLearn()`           | Enable behavioral auto-profiling                                                                                                       |
+| `.validateProfile()`       | Validate Seatbelt profile syntax without executing (macOS)                                                                             |
+| `.allowExec(...cmds)`      | Restrict which executables can run                                                                                                     |
+| `.blockExec(...cmds)`      | Block specific executables from running                                                                                                |
+| `.blockFork()`             | Prevent the command from forking new processes                                                                                         |
+| `.traceExec()`             | Log every child process spawned                                                                                                        |
+| `.strict()`                | Treat sandbox setup warnings as hard errors                                                                                            |
+| `.resolveSymlinks()`       | Resolve target command symlink in PATH                                                                                                 |
+| `.allowCrypto(allow)`      | Allow/disallow cryptographic operations                                                                                                |
+| `.blockCrypto()`           | Restrict system cryptographic libraries                                                                                                |
+| `.blockCryptoEntropy()`    | Restrict entropy devices (/dev/random)                                                                                                 |
+| `.detectFIPS()`            | Log and watch for FIPS lookups                                                                                                         |
+| `.strictFIPS()`            | Restrict runtime to strict FIPS compliant mode                                                                                         |
+| `.allowGPU(allow)`         | Allow/disallow access to host GPU nodes                                                                                                |
+| `.blockTPM()`              | Restrict hardware access to TPM device                                                                                                 |
+| `.spoofAntiVM()`           | Intercept debugger & virtualization checks                                                                                             |
+| `.traceLibraries()`        | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS)                                                               |
+| `.traceHTTPURLs()`         | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)                                                                   |
+| `.allowEnvs(...keys)`      | Allow specific host environment variables to pass through from the host process                                                        |
+| `.allowHidden(allow)`      | Allow/disallow access to hidden files and directories (dotfiles)                                                                       |
+| `.allowListen(list)`       | Allow listening/binding on specific IP addresses or ip:port strings (blocked by default, even loopback)                                |
+| `.traceCrypto()`           | Enable TLS cipher suite and crypto library detection via eBPF uprobes (Linux only). Auto-enables `.traceHTTPURLs()`.                   |
+| `.cbom(path)`              | Set the output path for the CycloneDX CBOM JSON document (requires `.traceCrypto()`)                                                   |
+| `.cryptoProbeMode(mode)`   | Set crypto probe depth: `"tls-only"` (default) or `"operations"` (also captures digest/sign ops)                                       |
+| `.setUpDev(enable)`        | Enabled by default. Pass `false` to disable minimal `/dev` setup inside sandbox. Linux-only.                                           |
+| `.dieWithParent()`         | Enabled by default. Kill sandboxed process with SIGKILL when parent dies (PR_SET_PDEATHSIG). Linux-only. Pass `false` to disable.      |
+| `.newSession()`            | Enabled by default. Disconnect from controlling terminal via setsid(). Linux-only. Pass `false` to disable.                            |
+| `.tmpOverlayPaths(...)`    | Create ephemeral writable overlays at paths (overlayfs, Linux only)                                                                    |
+| `.bindUseFd(use)`          | Opt-in. Use fd-based bind mounting for TOCTTOU safety. Linux-only.                                                                     |
+| `.seccompFilters(filters)` | Stack additional seccomp-bpf filters (base64 encoded or file path, Linux only)                                                         |
+| `.protectSystem(mode)`     | Opt-in (default `"off"`). Make system directories read-only automatically. Modes: `"strict"`, `"full"`, `"off"`. Linux-only.           |
+| `.protectHome(mode)`       | Opt-in. Isolate the user's home directory. Modes: `"read-only"`, `"tmpfs"`, `"off"` (default). Linux-only.                             |
+| `.privateTmp(enable)`      | Replace `/tmp` and `/var/tmp` with fresh tmpfs. Linux-only.                                                                            |
+| `.bindFds(...specs)`       | Bind-mount pre-opened file descriptors into the sandbox. Each spec: `{ fd: number, target: string, readOnly?: boolean }` — Linux-only. |
+| `.lockFilesExclusive(...)` | Acquire exclusive (write) advisory locks. Convenience for serialized coordination.                                                     |
+| `.seccompPolicy(policy)`   | Stack a Kafel-style seccomp policy using simple syntax. Example: `"ALLOW openat, read, write; DEFAULT KILL"`                           |
+| `.mapToTargetUid(enable)`  | Map UID 0 inside namespace to the caller's real UID. Linux-only.                                                                       |
+| `.lockFiles(...specs)`     | accepts `{ path: string, exclusive?: boolean }` objects in addition to plain strings.                                                  |
 
 ### OS & Capability Support Matrix
 
@@ -1072,6 +1097,22 @@ safer-exec: warning: sensitive environment variables detected: GITHUB_TOKEN, MY_
 - **Linux**: When `detectFIPS` or `strictFIPS` is enabled, the sandbox checks the host state `/proc/sys/crypto/fips_enabled` and mirrors this virtualized file inside the container. If `strictFIPS` is configured and the host lacks FIPS compliance, execution is blocked and a `fips-violation` is audited.
 - **macOS**: On macOS, FIPS state is verified by reading Apple's security preference plist (`FIPSMode`). If `strictFIPS` is active and FIPSMode is disabled on the host, a validation failure is triggered.
 - **Auto-Discovery**: During learn mode, if a process attempts to query the FIPS status or dynamic FIPS module providers (e.g. `fips.so` or `fips.dylib`), the generated policy automatically sets `fipsDetected: true`.
+
+### New since v0.12.0: Hardened Defaults
+
+Three defense-in-depth features are now **enabled by default** (Linux-only, fall back gracefully):
+
+- **Minimal /dev** — Essential device nodes from a fresh tmpfs (safer than inheriting host /dev)
+- **Die-with-parent** — Sandbox killed when parent exits (PR_SET_PDEATHSIG, prevents orphaned processes)
+- **New session** — Terminal disconnected via setsid() to block SIGHUP/SIGINT injection
+
+Additional opt-in hardening features:
+
+- **ProtectSystem** — `--protect-system=strict|full` auto-makes system dirs read-only
+- **ProtectHome** — `--protect-home=read-only|tmpfs` isolates $HOME
+- **PrivateTmp** — `--private-tmp` replaces /tmp and /var/tmp with fresh tmpfs
+- **Bind-use-fd** — `--bind-use-fd` enables TOCTTOU-safe fd-based bind mounting
+- **Protect system** — Simply use `--protect-system=strict` to proactively harden further
 
 ## Linux-Specific Features
 

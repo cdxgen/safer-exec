@@ -106,12 +106,21 @@ Options:
       --allow-envs=<vars>     Comma-separated host env vars to pass through (always sanitized by default)
       --allow-hidden          Allow access to hidden files and directories (blocked by default)
       --allow-listen=<list>   Comma-separated list of IP addresses or ip:port strings to allow listening on (blocked by default)
-      --no-bind-fd            Disable fd-based bind mounting (use raw path bind mounts)
-      --die-with-parent       Kill sandboxed process when parent dies (PR_SET_PDEATHSIG, Linux only)
-      --new-session           Disconnect from controlling terminal (setsid, Linux only)
+      --no-set-up-dev         Disable minimal /dev setup (default: enabled, Linux only)
+      --no-die-with-parent    Disable PR_SET_PDEATHSIG orphan prevention (default: enabled, Linux only)
+      --no-new-session        Disable setsid() terminal disconnect (default: enabled, Linux only)
+      --bind-use-fd           Enable fd-based bind mounting for TOCTTOU safety (Linux only)
       --tmp-overlay=<path>    Create an ephemeral writable overlay at path (repeatable, Linux only)
+      --protect-system=<mode>   Auto-make system dirs read-only: strict, full, or off (Linux only)
+      --protect-home=<mode>     Home dir isolation: read-only, tmpfs, or off (Linux only)
+      --private-tmp             Replace /tmp and /var/tmp with fresh tmpfs (Linux only)
       --lock-file=<path>      Acquire shared advisory lock on file for sandbox duration (repeatable)
       --seccomp-filter=<spec> Stack additional seccomp-bpf filter (base64 encoded program or file path, repeatable, Linux only)
+      --seccomp-policy=<policy> Kafel-style seccomp policy string (e.g. "ALLOW openat; DEFAULT KILL", Linux only)
+      --bind-fd=<FD:DEST[:ro]>  Bind-mount pre-opened FD to destination path (repeatable, Linux only)
+                                 Use ':ro' suffix for read-only mount
+      --lock-file-exclusive=<p> Acquire exclusive (write) advisory lock on file (repeatable)
+      --map-to-target-uid       Map UID 0 in namespace to caller's real UID (Linux only)
 
   -j, --json                 Output results as JSON
   -h, --help                 Show this help message
@@ -330,13 +339,16 @@ function parseCliArgs() {
         type: 'string',
         multiple: true,
       },
-      'no-bind-fd': {
+      'no-set-up-dev': {
         type: 'boolean',
       },
-      'die-with-parent': {
+      'no-die-with-parent': {
         type: 'boolean',
       },
-      'new-session': {
+      'no-new-session': {
+        type: 'boolean',
+      },
+      'bind-use-fd': {
         type: 'boolean',
       },
       'tmp-overlay': {
@@ -350,6 +362,29 @@ function parseCliArgs() {
       'seccomp-filter': {
         type: 'string',
         multiple: true,
+      },
+      'protect-system': {
+        type: 'string',
+      },
+      'protect-home': {
+        type: 'string',
+      },
+      'private-tmp': {
+        type: 'boolean',
+      },
+      'bind-fd': {
+        type: 'string',
+        multiple: true,
+      },
+      'seccomp-policy': {
+        type: 'string',
+      },
+      'lock-file-exclusive': {
+        type: 'string',
+        multiple: true,
+      },
+      'map-to-target-uid': {
+        type: 'boolean',
       },
       json: {
         type: 'boolean',
@@ -389,6 +424,11 @@ function parseCliArgs() {
       'tmp-overlay',
       'lock-file',
       'seccomp-filter',
+      'bind-fd',
+      'lock-file-exclusive',
+      'protect-system',
+      'protect-home',
+      'seccomp-policy',
     ],
     allowPositionals: true,
   });
@@ -541,14 +581,17 @@ function buildExec(values, cmd, args) {
     }
     exec.allowListen(list);
   }
-  if (values['no-bind-fd']) {
-    exec.bindUseFd(false);
+  if (values['no-set-up-dev']) {
+    exec.setUpDev(false);
   }
-  if (values['die-with-parent']) {
-    exec.dieWithParent();
+  if (values['no-die-with-parent']) {
+    exec.dieWithParent(false);
   }
-  if (values['new-session']) {
-    exec.newSession();
+  if (values['no-new-session']) {
+    exec.newSession(false);
+  }
+  if (values['bind-use-fd']) {
+    exec.bindUseFd(true);
   }
   if (values['tmp-overlay'] && values['tmp-overlay'].length > 0) {
     exec.tmpOverlayPaths(...values['tmp-overlay']);
@@ -566,6 +609,42 @@ function buildExec(values, cmd, args) {
       }
     }
     exec.seccompFilters(specs);
+  }
+
+  if (values['protect-system']) {
+    exec.protectSystem(values['protect-system']);
+  }
+  if (values['protect-home']) {
+    exec.protectHome(values['protect-home']);
+  }
+  if (values['private-tmp']) {
+    exec.privateTmp();
+  }
+  if (values['bind-fd'] && values['bind-fd'].length > 0) {
+    const specs = [];
+    for (const item of values['bind-fd']) {
+      const parts = item.split(':');
+      if (parts.length >= 2) {
+        const fd = parseInt(parts[0], 10);
+        if (!isNaN(fd)) {
+          const target = parts[1];
+          const readOnly = parts.length >= 3 && parts[2] === 'ro';
+          specs.push({ fd, target, readOnly });
+        }
+      }
+    }
+    if (specs.length > 0) {
+      exec.bindFds(...specs);
+    }
+  }
+  if (values['seccomp-policy']) {
+    exec.seccompPolicy(values['seccomp-policy']);
+  }
+  if (values['lock-file-exclusive'] && values['lock-file-exclusive'].length > 0) {
+    exec.lockFilesExclusive(...values['lock-file-exclusive']);
+  }
+  if (values['map-to-target-uid']) {
+    exec.mapToTargetUid();
   }
 
   // Features
@@ -726,6 +805,17 @@ async function runDiagnosticsAndPrint() {
     submount_readonly_enforcement: 'Submount Read-Only Enforcement',
     proc_hardening: 'Proc Hardening',
     extra_fd_cleanup: 'Extra FD Cleanup',
+    cgroup_v1_fallback: 'Cgroup v1 Fallback',
+    protect_system: 'ProtectSystem',
+    protect_home: 'ProtectHome',
+    private_tmp: 'Private Tmp',
+    cross_ns_fd_binding: 'Cross-NS FD Binding',
+    exclusive_file_locks: 'Exclusive File Locks',
+    map_to_target_uid: 'Map to Target UID',
+    kafel_seccomp_policy: 'Kafel Seccomp Policy',
+    landlock_ioctl_control: 'Landlock IOCTL Control',
+    landlock_udp_control: 'Landlock UDP Control',
+    landlock_scoped_rules: 'Landlock Scoped Rules',
   };
   for (const [key, label] of Object.entries(featureLabels)) {
     const available = data.features && data.features[key] === true;

@@ -834,7 +834,7 @@ func TestAcquireFileLocks_Empty(t *testing.T) {
 	}
 }
 
-// TestAcquireFileLocks_SingleFile acquires and releases a lock.
+// TestAcquireFileLocks_Shared acquires and releases a shared lock.
 func TestAcquireFileLocks_SingleFile(t *testing.T) {
 	f, err := os.CreateTemp("", "lockfile-test-*")
 	if err != nil {
@@ -843,16 +843,32 @@ func TestAcquireFileLocks_SingleFile(t *testing.T) {
 	defer os.Remove(f.Name())
 	f.Close()
 
-	files, err := acquireFileLocks([]string{f.Name()})
+	files, err := acquireFileLocks([]config.LockFileSpec{{Path: f.Name()}})
 	if err != nil {
 		t.Fatalf("acquireFileLocks: %v", err)
 	}
 	releaseFileLocks(files)
 }
 
+// TestAcquireFileLocks_Exclusive acquires and releases an exclusive lock.
+func TestAcquireFileLocks_Exclusive(t *testing.T) {
+	f, err := os.CreateTemp("", "lockfile-excl-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	f.Close()
+
+	files, err := acquireFileLocks([]config.LockFileSpec{{Path: f.Name(), Exclusive: true}})
+	if err != nil {
+		t.Fatalf("acquireFileLocks exclusive: %v", err)
+	}
+	releaseFileLocks(files)
+}
+
 // TestAcquireFileLocks_NonexistentFile returns error.
 func TestAcquireFileLocks_NonexistentFile(t *testing.T) {
-	_, err := acquireFileLocks([]string{"/nonexistent_zzz/lockfile"})
+	_, err := acquireFileLocks([]config.LockFileSpec{{Path: "/nonexistent_zzz/lockfile"}})
 	if err == nil {
 		t.Error("expected error for nonexistent file")
 	}
@@ -972,7 +988,7 @@ func TestRun_FileLocksInSandbox(t *testing.T) {
 	_, stderr, err := runSandbox(t, config.ExecConfig{
 		Cmd: "true", Args: nil,
 		ReadPaths: baseReadPaths(),
-		LockFiles: []string{lockFile.Name()},
+		LockFiles: []config.LockFileSpec{{Path: lockFile.Name()}},
 	})
 	if err != nil {
 		t.Logf("file lock sandbox: stderr=%q err=%v", stderr, err)
