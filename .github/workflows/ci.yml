@@ -95,14 +95,35 @@ jobs:
           go-version: "1.26"
           cache: false
 
-      - name: Allow unprivileged user namespaces (ubuntu-24.04)
-        if: startsWith(matrix.os, 'ubuntu-24')
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Build Go binary (Linux)
+        if: contains(matrix.os, 'ubuntu')
+        run: |
+          cd go
+          go build -trimpath -ldflags="-s -w" -o bin/safer-exec-rt ./cmd/safer-exec/
+
+      - name: Load AppArmor profile for user namespaces (Linux)
+        if: contains(matrix.os, 'ubuntu-24.04')
+        run: |
+          sudo tee /etc/apparmor.d/safer-exec-test <<EOF
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile safer-exec-rt ${{ github.workspace }}/go/bin/safer-exec-rt flags=(unconfined) {
+            userns,
+          }
+          
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/safer-exec-test
+
+      - name: setcap
+        if: contains(matrix.os, 'ubuntu')
+        run: |
+          sudo setcap 'cap_sys_resource,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_sys_admin+eip' ${{ github.workspace }}/go/bin/safer-exec-rt
 
       - name: Run Go tests
         run: |
           cd go
-          go test -v -race ./...
+          go test ./...
 
       - name: Verify --trace-http-urls graceful degradation (no CAP_BPF on runner)
         if: contains(matrix.os, 'ubuntu')
@@ -140,14 +161,29 @@ jobs:
           go-version: "1.26"
           cache: false
 
-      - name: Allow unprivileged user namespaces (ubuntu-24.04)
-        if: startsWith(matrix.os, 'ubuntu-24')
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
       - name: Build Go binary
         run: |
           cd go
           go build -trimpath -ldflags="-s -w" -o bin/safer-exec-rt ./cmd/safer-exec/
+
+      - name: Load AppArmor profile for user namespaces (Linux)
+        if: contains(matrix.os, 'ubuntu-24.04')
+        run: |
+          sudo tee /etc/apparmor.d/safer-exec-test <<EOF
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile safer-exec-rt ${{ github.workspace }}/go/bin/safer-exec-rt flags=(unconfined) {
+            userns,
+          }
+          
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/safer-exec-test
+
+      - name: setcap
+        if: contains(matrix.os, 'ubuntu')
+        run: |
+          sudo setcap 'cap_sys_resource,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_sys_admin+eip' ${{ github.workspace }}/go/bin/safer-exec-rt
 
       - name: Set up Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
@@ -158,36 +194,31 @@ jobs:
         run: |
           cd npm
           npm install
-
+      - name: Run diagnostics
+        run: |
+          cd npm
+          node src/cli.js diagnostics
       - name: Run unit tests
         run: |
           cd npm
           npm run test:unit
-
       - name: Run integration tests
         run: |
           cd npm
           npm run test:integration
-
       - name: Run HTTP tracing diagnostics
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo env "PATH=$PATH" node tests/debug_httptrace.js
-
       - name: Run HTTP tracing integration tests
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           cd npm
           sudo env "PATH=$PATH" node --test ../tests/httptrace.test.js
-
-      - name: Run security tests
+      - name: Run security and exhaustion tests
         run: |
           cd npm
-          npm run test:security
-      - name: Run diagnostics
-        run: |
-          cd npm
-          node src/cli.js diagnostics
+          npm run test:security test:exhaustion
 
   publish:
     needs: [build-go, check-bpf-objects, test-go, test-node]

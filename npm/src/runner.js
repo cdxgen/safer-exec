@@ -23,7 +23,7 @@
 import { spawn, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { basename, dirname, join } from 'node:path';
-import { readFileSync, existsSync, mkdtempSync, rmSync, copyFileSync, chmodSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, rmSync, copyFileSync, chmodSync, realpathSync } from 'node:fs';
 import { tmpdir, platform, arch } from 'node:os';
 import { createRequire } from 'node:module';
 
@@ -143,7 +143,6 @@ export function resolveBinaryPath() {
       err.message,
     );
   }
-
   // Try PATH
   const defaultGlobalPath = '/usr/local/bin/safer-exec-rt';
   try {
@@ -151,47 +150,6 @@ export function resolveBinaryPath() {
       return defaultGlobalPath;
     }
   } catch {}
-
-  // If missing and we are root (UID 0), automatically copy/install the runtime binary to /usr/local/bin/safer-exec-rt
-  // to ensure capability-sensitive features work out of the box in CI environments.
-  if (process.getuid?.() === 0) {
-    // Locate the packaged runtime binary that we resolved under node_modules
-    let packagedBinaryPath = '';
-    try {
-      const require = createRequire(import.meta.url);
-      const mainPkgPath = require.resolve("@cdxgen/safer-exec");
-      const searchDirs = [];
-      let curDir = dirname(mainPkgPath);
-      while (curDir && curDir !== dirname(curDir)) {
-        if (basename(curDir) === "node_modules") searchDirs.push(curDir);
-        const nodeModulesSub = join(curDir, "node_modules");
-        if (existsSync(nodeModulesSub)) searchDirs.push(nodeModulesSub);
-        curDir = dirname(curDir);
-      }
-      for (const modulesDir of searchDirs) {
-        const directPath = join(modulesDir, pkgName, "bin", "safer-exec-rt");
-        if (existsSync(directPath)) {
-          packagedBinaryPath = directPath;
-          break;
-        }
-      }
-    } catch {}
-
-    if (packagedBinaryPath) {
-      try {
-        console.warn(`safer-exec: warning: system runtime binary missing at ${defaultGlobalPath}. Copying from ${packagedBinaryPath}...`);
-        copyFileSync(packagedBinaryPath, defaultGlobalPath);
-        chmodSync(defaultGlobalPath, 0o755);
-        try {
-          execSync(`setcap 'cap_sys_resource,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_sys_admin+eip' ${defaultGlobalPath} 2>/dev/null`);
-        } catch {}
-        return defaultGlobalPath;
-      } catch (e) {
-        console.warn(`safer-exec: warning: failed to auto-bootstrap runtime binary to ${defaultGlobalPath}: ${e.message}`);
-      }
-    }
-  }
-
   return 'safer-exec-rt';
 }
 

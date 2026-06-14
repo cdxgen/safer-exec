@@ -284,6 +284,88 @@ type ExecConfig struct {
 
 	// AllowListen is a list of IP addresses or ip:port strings allowed to bind/listen to.
 	AllowListen []string `json:"allowListen"`
+
+	// SetUpDev, when true (default for full isolation), creates a minimal /dev
+	// inside the sandbox with essential device nodes (null, zero, full, random,
+	// urandom, tty), /dev/pts, /dev/shm, and stdio symlinks. When false, the
+	// sandbox inherits whatever /dev exists in the mount namespace.
+	// Linux-only. Defaults to true when using full isolation.
+	SetUpDev bool `json:"setUpDev,omitempty"`
+
+	// UseReaper, when true, enables the PID 1 reaper process for correct
+	// zombie reaping and exit code propagation within PID namespaces.
+	// When false (default), the target command runs as PID 1 directly.
+	// The reaper is incompatible with blockFork — when blockFork is
+	// active, seccomp kills the reaper's own fork syscall. Enable this
+	// only when you need correct zombie handling and are not using
+	// blockFork.
+	UseReaper bool `json:"useReaper,omitempty"`
+
+	// ProcHardening, when true, covers dangerous /proc entries (sys,
+	// sysrq-trigger, irq, bus) with read-only bind mounts after the
+	// fresh proc mount. Linux-only.
+	ProcHardening bool `json:"procHardening,omitempty"`
+
+	// SubmountEnforce, when true, parses /proc/self/mountinfo after all
+	// bind mounts to individually remount submounts as read-only. Closes
+	// the MS_REC loophole. Linux-only.
+	SubmountEnforce bool `json:"submountEnforce,omitempty"`
+
+	// DieWithParent, when true, ensures the sandboxed process receives SIGKILL
+	// when its parent process dies (PR_SET_PDEATHSIG). Prevents orphaned sandbox
+	// processes in CI/CD environments. Linux-only.
+	DieWithParent bool `json:"dieWithParent,omitempty"`
+
+	// NewSession, when true, calls setsid() to disconnect the sandboxed process
+	// from the controlling terminal. Prevents terminal-based signal injection
+	// (SIGHUP, SIGINT) and TTY-based attacks. Linux-only.
+	NewSession bool `json:"newSession,omitempty"`
+
+	// TmpOverlayPaths lists directories that should appear writable inside the
+	// sandbox but whose writes are ephemeral. Each path gets an overlay mount
+	// with a tmpfs upper layer that is discarded when the sandbox exits.
+	// Useful for cache directories (e.g., ~/.npm/_cacache) or scratch dirs.
+	// Linux-only. Requires kernel overlay + userxattr support.
+	TmpOverlayPaths []string `json:"tmpOverlayPaths,omitempty"`
+
+	// LockFiles lists file paths on which a shared flock is acquired for the
+	// duration of the sandbox. Enables concurrent sandbox coordination —
+	// exclusive locks can be used externally to serialize operations on
+	// shared directories. Linux+macoS.
+	LockFiles []string `json:"lockFiles,omitempty"`
+
+	// JsonStatusFd is a writable file descriptor number for lifecycle
+	// notifications. The engine writes JSON-lines on sandbox start
+	// ({"child-pid":N,"type":"sandbox-start"}) and exit
+	// ({"exit-code":N,"type":"sandbox-exit"}). Set by the Node.js runner.
+	// 0 means disabled. Linux-only in the reaper process.
+	JsonStatusFd int `json:"jsonStatusFd,omitempty"`
+
+	// BindUseFd, when true (default), uses fd-based bind mounting to protect
+	// against TOCTTOU races between path resolution and the mount call.
+	// The source is opened first, mounted via /proc/self/fd/N, and then
+	// stat(fd) is compared against lstat(target) to detect swaps.
+	// Linux-only. Disable if /proc/self/fd is not available.
+	BindUseFd bool `json:"bindUseFd,omitempty"`
+
+	// SeccompFilters lists additional seccomp-bpf programs to stack after
+	// the base filter. Each entry specifies either a base64-encoded BPF
+	// program or a path to a pre-compiled BPF file. Filters are loaded
+	// in LIFO order (last in list = evaluated first by kernel).
+	// This enables policy composition across organizational boundaries.
+	// Linux-only.
+	SeccompFilters []SeccompFilterSpec `json:"seccompFilters,omitempty"`
+}
+
+// SeccompFilterSpec describes an additional seccomp-bpf filter to stack.
+type SeccompFilterSpec struct {
+	// Program is a base64-encoded BPF program (SockFilter array).
+	// Mutually exclusive with Path.
+	Program string `json:"program,omitempty"`
+
+	// Path is a filesystem path to a file containing raw BPF bytecode
+	// (struct sock_filter array). Mutually exclusive with Program.
+	Path string `json:"path,omitempty"`
 }
 
 // HTTPAccessEntry records a single HTTP request observed during eBPF tracing.

@@ -389,6 +389,36 @@ export class SaferExec extends EventEmitter {
      * @type {Array<{protocol?: string, host: string, port?: number, pathPrefix?: string, methods?: string[]}>}
      */
     this._allowURLRules = options.allowURLRules || [];
+
+    /** @type {boolean} Set up minimal /dev inside sandbox (Linux only, default false, opt-in) */
+    this._setUpDev = options.setUpDev || false;
+
+    /** @type {boolean} Kill sandboxed process when parent dies (PR_SET_PDEATHSIG) */
+    this._dieWithParent = options.dieWithParent || false;
+
+    /** @type {boolean} Disconnect from controlling terminal (setsid) */
+    this._newSession = options.newSession || false;
+
+    /** @type {string[]} Create ephemeral writable overlay at paths (Linux only) */
+    this._tmpOverlayPaths = Array.isArray(options.tmpOverlayPaths) ? options.tmpOverlayPaths : [];
+
+    /** @type {string[]} Advisory file locks during sandbox execution */
+    this._lockFiles = Array.isArray(options.lockFiles) ? options.lockFiles : [];
+
+    /** @type {boolean} Use fd-based bind mounting for TOCTTOU safety (default false, opt-in) */
+    this._bindUseFd = options.bindUseFd || false;
+
+    /** @type {Array<{program?: string, path?: string}>} Stackable seccomp-bpf filters */
+    this._seccompFilters = Array.isArray(options.seccompFilters) ? options.seccompFilters : [];
+
+    /** @type {boolean} Use PID 1 reaper for zombie cleanup (default false, opt-in) */
+    this._useReaper = options.useReaper || false;
+
+    /** @type {boolean} Harden /proc with read-only bind mounts (default false, opt-in) */
+    this._procHardening = options.procHardening || false;
+
+    /** @type {boolean} Enforce submount read-only (default false, opt-in) */
+    this._submountEnforce = options.submountEnforce || false;
   }
 
   /**
@@ -640,6 +670,27 @@ export class SaferExec extends EventEmitter {
     // AllowURLRules (Linux-only URL-level filtering)
     if (Array.isArray(raw.allowURLRules) && raw.allowURLRules.length > 0) {
       this.allowUrls(...raw.allowURLRules);
+    }
+    if (Array.isArray(raw.tmpOverlayPaths) && raw.tmpOverlayPaths.length > 0) {
+      this.tmpOverlayPaths(...raw.tmpOverlayPaths);
+    }
+    if (Array.isArray(raw.lockFiles) && raw.lockFiles.length > 0) {
+      this.lockFiles(...raw.lockFiles);
+    }
+    if (raw.setUpDev !== undefined) {
+      this.setUpDev(raw.setUpDev);
+    }
+    if (raw.dieWithParent) {
+      this.dieWithParent();
+    }
+    if (raw.newSession) {
+      this.newSession();
+    }
+    if (raw.bindUseFd !== undefined) {
+      this.bindUseFd(raw.bindUseFd);
+    }
+    if (Array.isArray(raw.seccompFilters) && raw.seccompFilters.length > 0) {
+      this.seccompFilters(raw.seccompFilters);
     }
 
     return this;
@@ -1157,6 +1208,135 @@ export class SaferExec extends EventEmitter {
   }
 
   /**
+   * Enable or disable minimal /dev setup inside the sandbox.
+   * When enabled (default), essential device nodes like /dev/null, /dev/zero,
+   * /dev/random, /dev/urandom, /dev/tty are created from a fresh tmpfs.
+   *
+   * @param {boolean} [enable=true] - Whether to set up /dev
+   * @returns {SaferExec} This instance for chaining
+   */
+  setUpDev(enable = false) {
+    this._setUpDev = enable;
+    return this;
+  }
+
+  /**
+   * Use the PID 1 reaper for zombie reaping and exit code propagation.
+   * Incompatible with blockFork. Linux-only, opt-in.
+   *
+   * @param {boolean} [enable=true] - Whether to use the reaper
+   * @returns {SaferExec} This instance for chaining
+   */
+  useReaper(enable = true) {
+    this._useReaper = enable;
+    return this;
+  }
+
+  /**
+   * Harden /proc by covering dangerous writable entries (sys, sysrq-trigger,
+   * irq, bus) with read-only bind mounts. Linux-only, opt-in.
+   *
+   * @param {boolean} [enable=true] - Whether to harden /proc
+   * @returns {SaferExec} This instance for chaining
+   */
+  procHardening(enable = true) {
+    this._procHardening = enable;
+    return this;
+  }
+
+  /**
+   * Enforce that submounts under read-only bind mounts are also read-only.
+   * Scans /proc/self/mountinfo and remounts matching submounts.
+   * Linux-only, opt-in.
+   *
+   * @param {boolean} [enable=true] - Whether to enforce submounts
+   * @returns {SaferExec} This instance for chaining
+   */
+  submountEnforce(enable = true) {
+    this._submountEnforce = enable;
+    return this;
+  }
+
+  /**
+   * Kill the sandboxed process with SIGKILL when its parent process dies.
+   * Uses PR_SET_PDEATHSIG to prevent orphaned sandbox processes.
+   * Linux-only.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  dieWithParent() {
+    this._dieWithParent = true;
+    return this;
+  }
+
+  /**
+   * Disconnect the sandboxed process from the controlling terminal via setsid().
+   * Prevents terminal-based signal injection (SIGHUP, SIGINT).
+   * Linux-only.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  newSession() {
+    this._newSession = true;
+    return this;
+  }
+
+  /**
+   * Create ephemeral writable overlays at the given paths.
+   * Writes to these paths are stored in a tmpfs upper layer that is discarded
+   * when the sandbox exits. Uses overlayfs with userxattr (unprivileged).
+   * Linux-only.
+   *
+   * @param {...string} paths - Directory paths to overlay
+   * @returns {SaferExec} This instance for chaining
+   */
+  tmpOverlayPaths(...paths) {
+    this._tmpOverlayPaths.push(...paths);
+    return this;
+  }
+
+  /**
+   * Acquire shared advisory locks on the given files for the duration of
+   * the sandbox. Enables concurrent sandbox coordination.
+   *
+   * @param {...string} paths - File paths to lock
+   * @returns {SaferExec} This instance for chaining
+   */
+  lockFiles(...paths) {
+    this._lockFiles.push(...paths);
+    return this;
+  }
+
+  /**
+   * Enable or disable fd-based bind mounting (default: enabled).
+   * When enabled, source paths are opened before mounting and mounted via
+   * /proc/self/fd/N, with a TOCTTOU integrity check after the mount.
+   * Linux-only.
+   *
+   * @param {boolean} [use=true] - Whether to use fd-based binding
+   * @returns {SaferExec} This instance for chaining
+   */
+  bindUseFd(use = false) {
+    this._bindUseFd = use;
+    return this;
+  }
+
+  /**
+   * Stack additional seccomp-bpf filters to compose policies.
+   * Each filter is evaluated before the base filter (LIFO kernel order).
+   * Linux-only.
+   *
+   * @param {Array<{program?: string, path?: string}>} filters - Filter specs
+   * @returns {SaferExec} This instance for chaining
+   */
+  seccompFilters(filters) {
+    if (Array.isArray(filters)) {
+      this._seccompFilters.push(...filters);
+    }
+    return this;
+  }
+
+  /**
    * Allow cryptographic library and entropy device access (default).
    *
    * @param {boolean} [allow=true] - Whether to allow crypto operations
@@ -1623,6 +1803,16 @@ export class SaferExec extends EventEmitter {
       allowEnvs: this._allowEnvs,
       allowHidden: this._allowHidden,
       allowListen: this._allowListen,
+      setUpDev: this._setUpDev,
+      dieWithParent: this._dieWithParent,
+      newSession: this._newSession,
+      tmpOverlayPaths: this._tmpOverlayPaths,
+      lockFiles: this._lockFiles,
+      bindUseFd: this._bindUseFd,
+      seccompFilters: this._seccompFilters,
+      useReaper: this._useReaper,
+      procHardening: this._procHardening,
+      submountEnforce: this._submountEnforce,
     };
 
     const effectiveTimeout = this._timeoutMs;

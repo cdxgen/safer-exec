@@ -72,18 +72,23 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 ### Linux (Namespaces + Seccomp + Landlock + cgroup v2 + eBPF LSM)
 
-| Mechanism         | What it enforces       | How                                                       |
-| ----------------- | ---------------------- | --------------------------------------------------------- |
-| User namespace    | UID isolation          | `CLONE_NEWUSER` + `/proc/self` UID/GID mapping            |
-| Mount namespace   | Filesystem isolation   | `CLONE_NEWNS` + tmpfs root + bind mounts                  |
-| PID namespace     | Process tree isolation | `CLONE_NEWPID`                                            |
-| UTS namespace     | Hostname isolation     | `CLONE_NEWUTS`                                            |
-| Network namespace | Network isolation      | `CLONE_NEWNET` (when `disableNetwork` is true)            |
-| pivot_root        | Root filesystem swap   | Mounts tmpfs, bind-mounts paths, pivots                   |
-| Seccomp-bpf       | Syscall filtering      | Blocks ptrace, kcmp, unshare, mount, pivot_root           |
-| Landlock v2       | Network port filtering | Ruleset version 5 (kernel 6.2+) for TCP connect/bind      |
-| cgroup v2         | Resource quotas        | `cpu.max`, `memory.max`, `pids.max`                       |
-| LSM BPF           | Kernel-level audits    | Attaches BPF hooks to `bprm_check_security` / `file_open` |
+| Mechanism         | What it enforces                         | How                                                                          |
+| ----------------- | ---------------------------------------- | ---------------------------------------------------------------------------- |
+| User namespace    | UID isolation                            | `CLONE_NEWUSER` + `/proc/self` UID/GID mapping                               |
+| Mount namespace   | Filesystem isolation                     | `CLONE_NEWNS` + tmpfs root + bind mounts (fd-based with TOCTTOU check)       |
+| PID namespace     | Process tree isolation                   | `CLONE_NEWPID` + PID 1 reaper process                                        |
+| UTS namespace     | Hostname isolation                       | `CLONE_NEWUTS`                                                               |
+| Network namespace | Network isolation                        | `CLONE_NEWNET` (when `disableNetwork` is true)                               |
+| pivot_root        | Root filesystem swap                     | Mounts tmpfs, bind-mounts paths, pivots with MS_PRIVATE old-root cleanup     |
+| Seccomp-bpf       | Syscall filtering                        | Blocks ptrace, kcmp, unshare, mount, pivot_root + stackable custom filters   |
+| Landlock v2       | Network port filtering                   | Ruleset version 5 (kernel 6.2+) for TCP connect/bind                         |
+| Landlock v3+      | Filesystem confinement                   | `path_beneath` rules for read/write/execute/truncate/refer access            |
+| cgroup v2         | Resource quotas                          | `cpu.max`, `memory.max`, `pids.max`, `io.max`                                |
+| LSM BPF           | Kernel-level audits                      | Attaches BPF hooks to `bprm_check_security` / `file_open`                    |
+| MS_SLAVE          | Mount propagation control                | Prevents sandbox mounts from leaking to host                                 |
+| Submount remount  | Read-only enforcement                    | Parses `/proc/self/mountinfo`, remounts each submount as read-only           |
+| /proc hardening   | Dangerous entry blockage                 | Covers `sys`, `sysrq-trigger`, `irq`, `bus` with read-only bind mounts       |
+| /dev isolation    | Minimal device exposure                  | Fresh tmpfs with only essential device nodes + stdio symlinks                |
 
 ## 3. Threats and Attack Vectors
 
@@ -257,6 +262,56 @@ By default, the sandboxed process is prevented from listening on any network por
 
 1. Fork child processes that read files (allowed, children inherit the Seatbelt profile).
 2. Read environment variables from parent processes (allowed through system.sb).
+
+### 3.12 Submount Read-Only Bypass
+
+**Threat:** A bind-mounted directory tree is remounted read-only, but existing submounts within it remain writable because the kernel's `MS_REC` remount does not propagate flags to all submounts reliably (known kernel behavior especially on systemd hosts with layered mounts).
+
+**Impact:** Writable submounts leak through apparently read-only bind mounts. For example, bind-mounting `/usr` as read-only but `/usr/local` (a separate mount) remaining writable.
+
+**How isolation works:** After each read-only bind mount, the engine parses `/proc/self/mountinfo` to discover all submounts under the target, then individually remounts each with `MS_REMOUNT | MS_BIND | MS_RDONLY`. This closes the `MS_REC` propagation loophole regardless of kernel version or host configuration.
+
+**Residual risk:** Race condition between the initial mount and the submount scan. A process could rapidly create new submounts during this window.
+
+### 3.13 PID Namespace Zombie Accumulation
+
+**Threat:** In a PID namespace, orphaned child processes are reparented to PID 1. If PID 1 does not call `waitpid()`, zombies accumulate indefinitely, consuming process table slots and preventing correct exit code propagation.
+
+**Impact:** Resource exhaustion (zombie processes), incorrect exit codes reported to the parent, and potential sandbox leaks (processes that outlive the sandbox).
+
+**How isolation works:** The engine forks a dedicated PID 1 reaper process that runs a `wait4()` loop, reaping orphaned zombies and propagating the target command's exit code. The reaper exits with the target's exit code, ensuring the parent process receives the correct status.
+
+**Residual risk:** If the reaper process is killed (e.g., by `SIGKILL`), remaining children become zombies in the namespace. The kernel cleans up when the PID namespace is destroyed.
+
+### 3.14 File Descriptor Leak
+
+**Threat:** File descriptors opened during sandbox setup (config file, audit pipe, cgroup fds) are inherited by the target command, exposing internal state and enabling sandbox escapes via `/proc/self/fd/N`.
+
+**Impact:** The target command can read sandbox configuration, write to audit channels, or access files through leaked fds that bypass filesystem isolation.
+
+**How isolation works:** Before exec, the engine iterates `/proc/self/fd` and closes every fd above stderr (fd 2). This is done in the post-fork child process using raw syscalls for fork-safety.
+
+**Residual risk:** Fds created between the close loop and the execve may still leak. The close-loop-exec window is minimized to a few instructions.
+
+### 3.15 Mount Propagation Leakage
+
+**Threat:** On hosts with shared mount propagation (default on systemd), mounts created inside the sandbox namespace propagate back to the host mount namespace, allowing bidirectional mount visibility.
+
+**Impact:** The sandboxed process can observe host mount events or create mounts visible outside the sandbox.
+
+**How isolation works:** `MS_SLAVE | MS_REC` is set on the root mount immediately after entering the mount namespace, ensuring sandbox mounts do not propagate to the host. Before unmounting the old root, `MS_PRIVATE | MS_REC` is set to break the propagation tree and ensure clean unmount.
+
+**Residual risk:** Host mount events still propagate into the sandbox (slave receives, does not send). This is intentional for compatibility.
+
+### 3.16 TOCTTOU Race in Bind Mounts
+
+**Threat:** Between symlink resolution and the `mount()` syscall, a concurrent process replaces the resolved path with a symlink to a sensitive location, bypassing path-based restrictions.
+
+**Impact:** The mount operation binds an unintended target path, potentially exposing host files inside the sandbox.
+
+**How isolation works:** When `bindUseFd` is enabled (default), the source path is opened via `O_PATH` before mounting, mounted through `/proc/self/fd/N`, and then `fstat(fd)` is compared against `lstat(target)` to detect swaps. If the inode or device number differ, the mount is rolled back with `MNT_DETACH` and an error is returned.
+
+**Residual risk:** The race window is reduced to the interval between `fstat` and `mount` (microseconds). A TOCTTOU attack in this window requires precise timing.
 
 ## 4. Platform-Aware Policies
 

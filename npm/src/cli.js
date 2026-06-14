@@ -106,6 +106,12 @@ Options:
       --allow-envs=<vars>     Comma-separated host env vars to pass through (always sanitized by default)
       --allow-hidden          Allow access to hidden files and directories (blocked by default)
       --allow-listen=<list>   Comma-separated list of IP addresses or ip:port strings to allow listening on (blocked by default)
+      --no-bind-fd            Disable fd-based bind mounting (use raw path bind mounts)
+      --die-with-parent       Kill sandboxed process when parent dies (PR_SET_PDEATHSIG, Linux only)
+      --new-session           Disconnect from controlling terminal (setsid, Linux only)
+      --tmp-overlay=<path>    Create an ephemeral writable overlay at path (repeatable, Linux only)
+      --lock-file=<path>      Acquire shared advisory lock on file for sandbox duration (repeatable)
+      --seccomp-filter=<spec> Stack additional seccomp-bpf filter (base64 encoded program or file path, repeatable, Linux only)
 
   -j, --json                 Output results as JSON
   -h, --help                 Show this help message
@@ -324,6 +330,27 @@ function parseCliArgs() {
         type: 'string',
         multiple: true,
       },
+      'no-bind-fd': {
+        type: 'boolean',
+      },
+      'die-with-parent': {
+        type: 'boolean',
+      },
+      'new-session': {
+        type: 'boolean',
+      },
+      'tmp-overlay': {
+        type: 'string',
+        multiple: true,
+      },
+      'lock-file': {
+        type: 'string',
+        multiple: true,
+      },
+      'seccomp-filter': {
+        type: 'string',
+        multiple: true,
+      },
       json: {
         type: 'boolean',
         short: 'j',
@@ -359,6 +386,9 @@ function parseCliArgs() {
       'trace-temp-dir',
       'allow-exec',
       'block-exec',
+      'tmp-overlay',
+      'lock-file',
+      'seccomp-filter',
     ],
     allowPositionals: true,
   });
@@ -511,6 +541,32 @@ function buildExec(values, cmd, args) {
     }
     exec.allowListen(list);
   }
+  if (values['no-bind-fd']) {
+    exec.bindUseFd(false);
+  }
+  if (values['die-with-parent']) {
+    exec.dieWithParent();
+  }
+  if (values['new-session']) {
+    exec.newSession();
+  }
+  if (values['tmp-overlay'] && values['tmp-overlay'].length > 0) {
+    exec.tmpOverlayPaths(...values['tmp-overlay']);
+  }
+  if (values['lock-file'] && values['lock-file'].length > 0) {
+    exec.lockFiles(...values['lock-file']);
+  }
+  if (values['seccomp-filter'] && values['seccomp-filter'].length > 0) {
+    const specs = [];
+    for (const item of values['seccomp-filter']) {
+      if (item.startsWith('/') || item.startsWith('./') || item.startsWith('../')) {
+        specs.push({ path: item });
+      } else {
+        specs.push({ program: item });
+      }
+    }
+    exec.seccompFilters(specs);
+  }
 
   // Features
   if (values.audit || values['audit-output-file']) {
@@ -657,6 +713,19 @@ async function runDiagnosticsAndPrint() {
     apparmor_safer_exec: 'AppArmor Profile',
     proc_hidepid: 'Proc Hidepid',
     profile_validation: 'Profile Validation',
+    dev_setup: 'Dev Setup',
+    die_with_parent: 'Die With Parent',
+    new_session: 'New Session',
+    tmp_overlay: 'Tmp Overlay',
+    file_locks: 'File Locks',
+    json_status: 'JSON Status',
+    bind_use_fd: 'Bind Use FD',
+    seccomp_stacking: 'Seccomp Stacking',
+    pid_reaper: 'PID Reaper',
+    mount_propagation_control: 'Mount Propagation Control',
+    submount_readonly_enforcement: 'Submount Read-Only Enforcement',
+    proc_hardening: 'Proc Hardening',
+    extra_fd_cleanup: 'Extra FD Cleanup',
   };
   for (const [key, label] of Object.entries(featureLabels)) {
     const available = data.features && data.features[key] === true;

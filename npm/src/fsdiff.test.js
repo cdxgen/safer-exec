@@ -11,12 +11,9 @@
 import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { SaferExec } from './index.js';
-import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { mkdirSync, writeFileSync, rmSync, existsSync, realpathSync } from 'node:fs';
+import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Create a temporary test directory with known files.

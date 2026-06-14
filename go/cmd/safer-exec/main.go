@@ -93,7 +93,7 @@ func main() {
 
 	// Handle version flag
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
-		fmt.Println("safer-exec 0.11.0")
+		fmt.Println("safer-exec 0.12.0")
 		return
 	}
 
@@ -200,6 +200,9 @@ func initMain() {
 
 	if err := runInit(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "safer-exec: init: %v\n", err)
+		if exitErr, ok := err.(*ExitError); ok {
+			os.Exit(exitErr.Code)
+		}
 		os.Exit(1)
 	}
 }
@@ -234,6 +237,9 @@ func initReducedMain() {
 
 	if err := runInitReduced(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "safer-exec: init-reduced: %v\n", err)
+		if exitErr, ok := err.(*ExitError); ok {
+			os.Exit(exitErr.Code)
+		}
 		os.Exit(1)
 	}
 }

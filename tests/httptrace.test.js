@@ -944,7 +944,7 @@ describe('allowUrls — Combination & Block Tests', { skip: !isLinux || !isRoot 
     await withTempFile(p, nodeScript('https://registry.npmjs.org/'), async () => {
       const exec = base()
         .allowHosts('registry.npmjs.org');
-        // Deliberately no .allowUrls() call — empty rules → permissive
+      // Deliberately no .allowUrls() call — empty rules → permissive
       const { violations } = collectAudit(exec);
       const result = await exec.run(process.execPath, [p]);
       await new Promise(r => setTimeout(r, 300));
@@ -1370,7 +1370,7 @@ describe('SaferExec Cryptographic Tracing Integration', { skip: !isLinux || !isR
   it('[Node] traceCrypto + cbom should generate a valid CycloneDX CBOM JSON file', async () => {
     const scriptPath = '/tmp/tmp_test_cbom.js';
     try { unlinkSync(cbomPath); } catch {}
-    
+
     await withTempFile(scriptPath, nodeScript('https://registry.npmjs.org/'), async () => {
       const exec = new SaferExec()
         .binaryPath('/usr/local/bin/safer-exec-rt')
@@ -1384,17 +1384,17 @@ describe('SaferExec Cryptographic Tracing Integration', { skip: !isLinux || !isR
       await new Promise(r => setTimeout(r, 500));
 
       strict.equal(result.exitCode, 0, `exit code: ${result.exitCode}\nstderr: ${result.stderr}`);
-      
+
       // Verify the CBOM file exists and parses as valid CycloneDX JSON
       strict.ok(existsSync(cbomPath), 'CycloneDX CBOM file should have been created');
       const cbomContent = JSON.parse(readFileSync(cbomPath, 'utf8'));
-      
+
       strict.equal(cbomContent.bomFormat, 'CycloneDX');
       strict.ok(cbomContent.specVersion, 'should contain CycloneDX specVersion');
       strict.ok(Array.isArray(cbomContent.components), 'should contain components array');
-      
+
       // Look for a cryptographic asset component
-      const cryptoAsset = cbomContent.components.find(c => 
+      const cryptoAsset = cbomContent.components.find(c =>
         c.type === 'cryptographic-asset' || c.name === 'OpenSSL'
       );
       strict.ok(cryptoAsset, 'CBOM components should list cryptographic assets');
@@ -1423,13 +1423,13 @@ describe('SaferExec Cryptographic Tracing Integration', { skip: !isLinux || !isR
       strict.ok(protocolComponent.cryptoProperties.protocolProperties.cipherSuites.length > 0, 'Protocol cipherSuites should not be empty');
       strict.ok(protocolComponent.cryptoProperties.protocolProperties.cipherSuites[0].name, 'Cipher suite name should be present');
     });
-    
+
     try { unlinkSync(cbomPath); } catch {}
   });
 
   it('[Node] traceCrypto should emit crypto-related audit events', async () => {
     const scriptPath = '/tmp/tmp_test_crypto_audit.js';
-    
+
     await withTempFile(scriptPath, nodeScript('https://registry.npmjs.org/'), async () => {
       const exec = new SaferExec()
         .binaryPath('/usr/local/bin/safer-exec-rt')
@@ -1447,7 +1447,7 @@ describe('SaferExec Cryptographic Tracing Integration', { skip: !isLinux || !isR
       await new Promise(r => setTimeout(r, 500));
 
       strict.equal(result.exitCode, 0, `exit code: ${result.exitCode}\nstderr: ${result.stderr}`);
-      
+
       // Verify that http-request has crypto fields
       const httpRequest = events.find(e => e.type === 'http-request');
       strict.ok(httpRequest, 'should capture http-request event');

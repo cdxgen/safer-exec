@@ -17,9 +17,11 @@ Node.js (policy + DNS) --[JSON on stdin]--> Go binary --[sandbox]--> target comm
                                                     stdout/stderr back to Node.js
 ```
 
+The Go engine binary is named **`safer-exec-rt`** (runtime). The name `safer-exec` (without `-rt`) is reserved for the standalone caxa-bundled executable distributed on GitHub Releases.
+
 **macOS**: Generates Seatbelt profiles → applies RLIMIT quotas → runs via `sandbox-exec`
 
-**Linux**: Forks self with `--init` → unshares namespaces → creates cgroup v2 → mounts tmpfs + bind mounts → applies Landlock network rules → applies seccomp-bpf → `pivot_root` → `execve`
+**Linux**: Forks self with `--init` → unshares namespaces → sets MS_SLAVE on root → mounts tmpfs → creates cgroup v2 → bind-mounts paths (fd-based with TOCTTOU check) → enforces submount read-only flags → double pivot_root → sets up /proc (hidepid=2 + dangerous entry hardening) → sets up minimal /dev → applies Landlock network rules → applies Landlock filesystem rules → applies seccomp-bpf (base + stackable filters) → acquires file locks → forks PID 1 reaper → child closes leaked fds → child sets PR_SET_PDEATHSIG / setsid → child execves target
 
 ---
 
@@ -79,14 +81,14 @@ tests/
 
 ```bash
 cd go
-go build -trimpath -ldflags="-s -w" -o bin/safer-exec ./cmd/safer-exec/
+go build -trimpath -ldflags="-s -w" -o bin/safer-exec-rt ./cmd/safer-exec/
 ```
 
 Cross-compile for other platforms:
 
 ```bash
-GOOS=darwin GOARCH=arm64 go build -o bin/safer-exec-darwin-arm64 ./cmd/safer-exec/
-GOOS=linux GOARCH=amd64 go build -o bin/safer-exec-linux-amd64 ./cmd/safer-exec/
+GOOS=darwin GOARCH=arm64 go build -o bin/safer-exec-rt-darwin-arm64 ./cmd/safer-exec/
+GOOS=linux GOARCH=amd64 go build -o bin/safer-exec-rt-linux-amd64 ./cmd/safer-exec/
 ```
 
 ### Run Tests
@@ -130,6 +132,7 @@ The `ExecConfig` struct is the canonical JSON contract between Node.js and Go. A
 3. Update both platform engines (`engine_darwin.go` and `engine_linux.go`)
 4. Update the CLI argument parser in `cli.js`
 5. Add tests for both platforms
+6. **Update documentation** (update README.md to describe the new configuration settings, CLI flags, and API methods)
 
 ### Platform-Specific Engines
 
@@ -138,6 +141,18 @@ The `ExecConfig` struct is the canonical JSON contract between Node.js and Go. A
 - **OpenBSD** uses Go build tags (`//go:build openbsd`) — unveil(2) + pledge(2)
 - Architecture-specific syscall numbers use build tags (`linux && amd64`, `linux && arm64`)
 - The `run()` function signature is the same across platforms — the implementation differs
+
+### Linux Engine: Enhanced Isolation Flow
+
+The Linux engine has been hardened with multiple layered defenses:
+
+1. **Mount propagation control**: `MS_SLAVE` is set on root to prevent sandbox mounts from propagating to the host.
+2. **FD-based bind mounting**: Source paths are opened via `O_PATH` and mounted through `/proc/self/fd/N`. Post-mount, `fstat(fd)` is compared against `lstat(target)` to detect TOCTTOU races.
+3. **Submount read-only enforcement**: After each read-only bind mount, `/proc/self/mountinfo` is parsed to discover submounts, which are individually remounted read-only. Closes the kernel `MS_REC` loophole.
+4. **`/proc` hardening**: Dangerous writable entries (`/proc/sys`, `/proc/sysrq-trigger`, `/proc/irq`, `/proc/bus`) are covered with read-only bind mounts.
+5. **Minimal `/dev` setup**: A fresh tmpfs is mounted on `/dev` with only essential device nodes (`null`, `zero`, `full`, `random`, `urandom`, `tty`), stdio symlinks, and `/dev/shm`.
+6. **PID 1 reaper**: A guardian process runs as PID 1 in the PID namespace, reaping orphaned zombies and correctly propagating exit codes.
+7. **Exit code propagation**: `initMain()` and `initReducedMain()` now check for `ExitError` and use its code instead of always exiting with `1`.
 
 ### Structured Output Protocol
 
@@ -149,6 +164,15 @@ The Go binary communicates structured data back to Node.js via marker-prefixed J
 - Audit entries — JSON lines on stderr
 
 The Node.js `runner.js` parses these markers and separates them from regular stdout.
+
+### JSON Status Protocol
+
+A JSON-lines status protocol is available for external lifecycle monitoring. When `JsonStatusFd` is configured (set by the Node.js runner via an O_CLOEXEC pipe fd), the engine writes:
+
+```json
+{"child-pid": 12345, "type": "sandbox-start"}
+{"exit-code": 0, "type": "sandbox-exit"}
+```
 
 ### Policy System
 
@@ -170,6 +194,7 @@ Policies are plain JavaScript functions that return config objects. They are pla
 - Syscall numbers should be defined in architecture-specific files, not in the main engine
 - Use `fmt.Fprintf(os.Stderr, "safer-exec: ...")` for error messages
 - Tests use Go's `testing` package with `t.TempDir()` for temp directories
+- Post-fork child processes must only use raw syscalls — no Go runtime functions
 
 ### JavaScript Code
 
@@ -178,6 +203,15 @@ Policies are plain JavaScript functions that return config objects. They are pla
 - Use `node:test` and `node:assert/strict` for testing (no external test frameworks)
 - Fluent API: all config methods return `this` for chaining (except `.run()` which returns `Promise<ExecResult>`)
 - Error messages prefixed with `safer-exec:` for identification
+
+### Binary Resolution
+
+The `resolveBinaryPath()` function in `runner.js` locates the Go engine binary. It searches in this priority order:
+1. `go/bin/safer-exec-rt-{platform}-{arch}` (platform-specific local build)
+2. `go/bin/safer-exec-rt` (generic local build)
+3. Platform-specific npm optional dependencies in `node_modules`
+4. `/usr/local/bin/safer-exec-rt` (system-wide install; auto-bootstraps from node_modules if running as root)
+5. Bare string `'safer-exec-rt'` (PATH resolution fallback)
 
 ### Testing
 
@@ -198,9 +232,10 @@ Policies are plain JavaScript functions that return config objects. They are pla
 2. Implement in `engine_darwin.go` (Seatbelt rule or RLIMIT)
 3. Implement in `engine_linux.go` (namespace, seccomp, Landlock, or cgroup)
 4. Add method to `SaferExec` class in `npm/src/index.js`
-5. Add CLI flag in `npm/src/cli.js`
-6. Add tests to both platform test files and Node.js tests
-7. **Update documentation** (update README.md to describe the new configuration settings, CLI flags, and API methods)
+5. If the feature has user-facing config, add the field to `PolicyFile` in `config.go` and the `applyPolicyFile` method in `index.js`
+6. Add CLI flag in `npm/src/cli.js`
+7. Add tests to both platform test files and Node.js tests
+8. **Update documentation** (update README.md to describe the new configuration settings, CLI flags, and API methods)
 
 ### Adding a New Ecosystem Policy
 
@@ -253,6 +288,7 @@ identities using eBPF uretprobes on OpenSSL/GnuTLS cipher negotiation functions.
 - On macOS, inspect generated Seatbelt profiles (temp `.sb` files)
 - On Linux, check `/proc/self/ns/` for namespace state
 - Run `safer-exec diagnostics` or `SaferExec.diagnostics()` to verify platform readiness and detect sandbox configuration issues
+- On Ubuntu 24.04+, the binary at `/usr/local/bin/safer-exec-rt` may need an AppArmor profile to create user namespaces; use `safer-exec bootstrap-apparmor`
 
 ### Policy Files in Agentic Workflows
 
@@ -272,5 +308,5 @@ See `THREAT-MODEL.md` for the complete threat model covering sandbox guarantees,
 Key guarantees:
 
 - **macOS**: Seatbelt `(deny default)` + `system.sb` import
-- **Linux**: User namespace + mount namespace + seccomp-bpf blocking escape syscalls
-- Both platforms enforce resource quotas (memory, CPU, process count)
+- **Linux**: User namespace + mount namespace (MS_SLAVE propagation control) + seccomp-bpf blocking escape syscalls + Landlock network/filesystem confinement + submount read-only enforcement + `/proc` dangerous entry hardening + minimal `/dev` setup + fd-based TOCTTOU-safe bind mounts + PID 1 reaper with zombie reaping
+- Both platforms enforce resource quotas (memory, CPU, process count, I/O)

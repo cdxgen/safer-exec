@@ -40,6 +40,22 @@ safer-exec --trace-exec -- npm install
 # Pass through specific environment variables from the host (environment is sanitized by default)
 safer-exec --allow-envs=VAR1,VAR2 -- npm install
 
+# Process lifecycle control (Linux only)
+safer-exec --die-with-parent -- npm install
+safer-exec --new-session -- npm install
+
+# Ephemeral writable overlays (Linux only)
+safer-exec --tmp-overlay=/tmp/cache -- npm install
+
+# Concurrent sandbox coordination
+safer-exec --lock-file=/var/run/build.lock -- npm run build
+
+# Stack additional seccomp filters (Linux only)
+safer-exec --seccomp-filter=/etc/safer-exec/custom.bpf -- npm install
+
+# Disable fd-based bind mounts
+safer-exec --no-bind-fd -- npm install
+
 # Validate Seatbelt profile syntax (macOS)
 safer-exec --validate-profile -- cat /etc/hosts
 
@@ -173,6 +189,13 @@ All methods return `this` for chaining except `.run()`.
 | `.traceCrypto()`         | Enable TLS cipher suite and crypto library detection via eBPF uprobes (Linux only). Auto-enables `.traceHTTPURLs()`. |
 | `.cbom(path)`            | Set the output path for the CycloneDX CBOM JSON document (requires `.traceCrypto()`)                                 |
 | `.cryptoProbeMode(mode)` | Set crypto probe depth: `"tls-only"` (default) or `"operations"` (also captures digest/sign ops)                     |
+| `.setUpDev(enable)`      | Enable/disable minimal `/dev` setup inside sandbox (Linux only, default true)                                          |
+| `.dieWithParent()`       | Kill sandboxed process with SIGKILL when parent dies (PR_SET_PDEATHSIG, Linux only)                                   |
+| `.newSession()`          | Disconnect from controlling terminal via setsid() (Linux only)                                                        |
+| `.tmpOverlayPaths(...)`  | Create ephemeral writable overlays at paths (overlayfs, Linux only)                                                   |
+| `.lockFiles(...)`        | Hold shared advisory locks on files for sandbox duration                                                              |
+| `.bindUseFd(use)`        | Enable/disable fd-based bind mounting for TOCTTOU safety (default true, Linux only)                                   |
+| `.seccompFilters(filters)`| Stack additional seccomp-bpf filters (base64 encoded or file path, Linux only)                                       |
 
 ### OS & Capability Support Matrix
 

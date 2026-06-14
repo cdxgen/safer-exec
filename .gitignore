@@ -41,3 +41,4 @@ go/safer-exec
 !go/cmd/safer-exec/c/*.so
 
 /.claude/
+tests/fixtures/**/.pnpm-store/
