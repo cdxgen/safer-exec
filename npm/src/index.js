@@ -803,8 +803,9 @@ export class SaferExec extends EventEmitter {
    * @returns {SaferExec} This instance for chaining
    */
   readPaths(...paths) {
-    for (const path of paths) {
-      if (!this._readPaths.includes(path)) {
+    const flatPaths = paths.flat(Infinity);
+    for (const path of flatPaths) {
+      if (typeof path === 'string' && !this._readPaths.includes(path)) {
         this._readPaths.push(path);
       }
     }
@@ -818,8 +819,9 @@ export class SaferExec extends EventEmitter {
    * @returns {SaferExec} This instance for chaining
    */
   writePaths(...paths) {
-    for (const path of paths) {
-      if (!this._writePaths.includes(path)) {
+    const flatPaths = paths.flat(Infinity);
+    for (const path of flatPaths) {
+      if (typeof path === 'string' && !this._writePaths.includes(path)) {
         this._writePaths.push(path);
       }
     }
@@ -1792,7 +1794,7 @@ export class SaferExec extends EventEmitter {
         '/bin', '/sbin', '/usr', '/lib', '/lib64'
       ];
 
-      // Instead of mounting the entire '/etc' and '/dev', specify only 
+      // Instead of mounting the entire '/etc' and '/dev', specify only
       // safe, non-sensitive system files and standard device nodes.
       const essentialLinuxFiles = [
         // Linker dynamic library configurations (required for binary execution)
@@ -1823,13 +1825,13 @@ export class SaferExec extends EventEmitter {
       }
 
       for (const p of essentialLinuxPaths) {
-        if (!effectiveReadPaths.includes(p) && existsSync(p)) {
+        if (!effectiveReadPaths.includes(p)) {
           effectiveReadPaths.push(p);
         }
       }
 
       for (const f of essentialLinuxFiles) {
-        if (!effectiveReadPaths.includes(f) && existsSync(f)) {
+        if (!effectiveReadPaths.includes(f)) {
           effectiveReadPaths.push(f);
         }
       }
@@ -1860,8 +1862,8 @@ export class SaferExec extends EventEmitter {
     } catch {}
 
     // Filter non-existent paths to prevent Go bind mount warnings/errors
-    effectiveReadPaths = effectiveReadPaths.filter(p => existsSync(p));
-    let effectiveWritePaths = [...this._writePaths].filter(p => existsSync(p));
+    effectiveReadPaths = effectiveReadPaths.filter(p => p && existsSync(p));
+    let effectiveWritePaths = [...this._writePaths].filter(p => p && existsSync(p));
 
     if (!this._allowHidden) {
       const hiddenRegex = /(^|\/)\.[^\/]+/;
