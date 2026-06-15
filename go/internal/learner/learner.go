@@ -78,6 +78,7 @@ func (l *Learner) learnWithStrace(cfg config.ExecConfig, stracePath, cmd string,
 	tmpFile.Close()
 
 	straceArgs := []string{
+		"-f",
 		"-e", "trace=openat,open,readlink,connect,bind,sendto,recvfrom,stat,stat64,fstat,fstat64,lstat,lstat64,access",
 		"-o", tmpFile.Name(),
 		cmd,

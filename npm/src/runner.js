@@ -322,37 +322,53 @@ export function parseStructuredOutput(stdout) {
   const cleanLines = [];
 
   for (const line of lines) {
-    if (line.startsWith('FSDIFF:')) {
-      try {
-        fsDiff = JSON.parse(line.slice(7));
-      } catch {
+    let foundMarker = false;
+    for (const marker of ['FSDIFF:', 'LEARNED:', 'CRYPTO:', 'DRYRUN:', 'PROFILE:']) {
+      const idx = line.indexOf(marker);
+      if (idx !== -1) {
+        foundMarker = true;
+        const prefix = line.slice(0, idx);
+        if (prefix) {
+          cleanLines.push(prefix);
+        }
+        const value = line.slice(idx + marker.length);
+        if (marker === 'FSDIFF:') {
+          try {
+            fsDiff = JSON.parse(value);
+          } catch {
+            cleanLines.push(line);
+          }
+        } else if (marker === 'LEARNED:') {
+          try {
+            learnedPolicy = JSON.parse(value);
+          } catch {
+            cleanLines.push(line);
+          }
+        } else if (marker === 'CRYPTO:') {
+          try {
+            crypto = JSON.parse(value);
+          } catch {
+            cleanLines.push(line);
+          }
+        } else if (marker === 'DRYRUN:') {
+          try {
+            dryRun = JSON.parse(value);
+          } catch {
+            cleanLines.push(line);
+          }
+        } else if (marker === 'PROFILE:') {
+          profile = value;
+        }
+        break;
+      }
+    }
+    if (!foundMarker) {
+      if (profile !== null) {
+        // Continue collecting profile lines after PROFILE: prefix
+        profile = profile + '\n' + line;
+      } else {
         cleanLines.push(line);
       }
-    } else if (line.startsWith('LEARNED:')) {
-      try {
-        learnedPolicy = JSON.parse(line.slice(8));
-      } catch {
-        cleanLines.push(line);
-      }
-    } else if (line.startsWith('CRYPTO:')) {
-      try {
-        crypto = JSON.parse(line.slice(7));
-      } catch {
-        cleanLines.push(line);
-      }
-    } else if (line.startsWith('DRYRUN:')) {
-      try {
-        dryRun = JSON.parse(line.slice(7));
-      } catch {
-        cleanLines.push(line);
-      }
-    } else if (line.startsWith('PROFILE:')) {
-      profile = line.slice(8);
-    } else if (profile !== null) {
-      // Continue collecting profile lines after PROFILE: prefix
-      profile = profile + '\n' + line;
-    } else {
-      cleanLines.push(line);
     }
   }
 
