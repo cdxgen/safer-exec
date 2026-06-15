@@ -103,6 +103,11 @@ func (p *TraceParser) parseLine(line string) {
 	}
 }
 
+// learnGroupDepth is the max directory segments to keep when grouping paths.
+// 4 means paths like /Users/u/project/node_modules/react/index.js get
+// truncated to /Users/u/project/node_modules and deduplicated.
+const learnGroupDepth = 4
+
 // BuildPolicy converts the parsed trace into a PolicyFile.
 func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.PolicyFile {
 	// Initialize all slices to empty arrays (not nil) so JSON serializes as [] not null
@@ -148,7 +153,6 @@ func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.PolicyFile 
 
 	// Determine Crypto and FIPS controls based on observed paths
 	hasCryptoRead := false
-	hasEntropyRead := false
 	hasFIPSRead := false
 	hasGPURead := false
 	hasTPMRead := false
@@ -157,9 +161,6 @@ func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.PolicyFile 
 		up := strings.ToLower(path)
 		if strings.Contains(up, "libcrypto") || strings.Contains(up, "libssl") || strings.Contains(up, "/ssl") || strings.Contains(up, "security") {
 			hasCryptoRead = true
-		}
-		if strings.Contains(up, "/dev/random") || strings.Contains(up, "/dev/urandom") {
-			hasEntropyRead = true
 		}
 		if strings.Contains(up, "fips_enabled") || strings.Contains(up, "fips.so") || strings.Contains(up, "fips.dylib") {
 			hasFIPSRead = true
@@ -174,14 +175,17 @@ func (p *TraceParser) BuildPolicy(cmd string, args []string) *config.PolicyFile 
 			hasVMRead = true
 		}
 	}
+
+	// Control directives: only enable when the feature was actually observed.
+	// A learned policy should not block things that were never detected.
 	policy.AllowCrypto = hasCryptoRead
-	policy.BlockCrypto = !hasCryptoRead
-	policy.BlockCryptoEntropy = !hasEntropyRead
 	policy.FIPSDetected = hasFIPSRead
 
-	policy.AllowGPU = !hasGPURead
+	policy.AllowGPU = hasGPURead
 	policy.BlockTPM = hasTPMRead
 	policy.SpoofAntiVM = hasVMRead
+
+	// Informational: record what was detected
 	policy.GPUUsed = hasGPURead
 	policy.TPMUsed = hasTPMRead
 	policy.AntiVMActive = hasVMRead
@@ -241,33 +245,39 @@ func extractNetworkTarget(line string) (string, int) {
 	return target, 0
 }
 
-// dedupPaths returns the minimal set of parent directories covering all paths.
+// dedupPaths groups paths by truncating each to learnGroupDepth segments
+// then deduplicating the results. This collapses individual file paths into
+// common parent directories (e.g. many files under node_modules/ become one
+// entry at the project/node_modules level).
 func dedupPaths(paths map[string]bool) []string {
-	pathList := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
 	for p := range paths {
-		pathList = append(pathList, p)
-	}
-	sort.Strings(pathList)
-
-	var result []string
-	for _, p := range pathList {
-		covered := false
-		for _, parent := range result {
-			if strings.HasPrefix(p, parent+"/") || p == parent {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			result = append(result, p)
-		}
+		grouped := truncatePathDepth(p, learnGroupDepth)
+		seen[grouped] = true
 	}
 
-	if result == nil {
-		result = []string{}
+	result := make([]string, 0, len(seen))
+	for p := range seen {
+		result = append(result, p)
 	}
-
+	sort.Strings(result)
 	return result
+}
+
+// truncatePathDepth truncates an absolute path to at most maxDepth segments.
+// For example, with maxDepth=4: "/Users/u/project/node_modules/react/pkg.json"
+// becomes "/Users/u/project/node_modules".
+// Segments counted include the empty root segment ("" for "/").
+func truncatePathDepth(path string, maxDepth int) string {
+	parts := strings.Split(path, "/")
+	if len(parts) <= maxDepth {
+		return path
+	}
+	truncated := strings.Join(parts[:maxDepth], "/")
+	if truncated == "" {
+		return "/"
+	}
+	return truncated
 }
 
 // extractListenTarget parses IP and port from a network-bind or network-inbound trace line.

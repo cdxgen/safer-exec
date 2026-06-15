@@ -318,6 +318,9 @@ function parseCliArgs() {
         type: 'boolean',
         short: 'l',
       },
+      'dry-run': {
+        type: 'boolean',
+      },
       'learn-output': {
         type: 'string',
       },
@@ -417,6 +420,7 @@ function parseCliArgs() {
       'env',
       'cwd',
       'learn-output',
+      'dry-run',
       'trace-output-file',
       'trace-temp-dir',
       'allow-exec',
@@ -659,6 +663,9 @@ function buildExec(values, cmd, args) {
   }
   if (values.learn) {
     exec.enableLearn();
+  }
+  if (values['dry-run']) {
+    exec.enableDryRun();
   }
   if (values['validate-profile']) {
     exec.validateProfile();
@@ -978,6 +985,12 @@ profile safer-exec /usr/local/bin/safer-exec-rt flags=(unconfined) {
       }
     }
 
+    // Output dry-run report
+    if (result.dryRun) {
+      process.stderr.write('\n');
+      formatDryRunReport(result.dryRun);
+    }
+
     // Print success/failure message
     if (result.exitCode === 124 || result.timedOut) {
       process.stderr.write('[safer-exec] Command timed out\n');
@@ -997,6 +1010,60 @@ profile safer-exec /usr/local/bin/safer-exec-rt flags=(unconfined) {
     }
     process.exit(1);
   }
+}
+
+/**
+ * Format and write a dry-run report to stderr as a human-readable table.
+ *
+ * @param {object} dryRun - The dry-run result from the runner
+ */
+function formatDryRunReport(dryRun) {
+  const { events = [], summary = {} } = dryRun;
+  const out = process.stderr;
+
+  out.write('\n╔══════════════════════════════════════════╗\n');
+  out.write('║         DRY-RUN AUDIT REPORT             ║\n');
+  out.write('╠══════════════════════════════════════════╣\n');
+
+  const groups = {};
+  for (const e of events) {
+    if (!groups[e.type]) groups[e.type] = [];
+    groups[e.type].push(e);
+  }
+
+  const groupConfig = {
+    'file-read':      { label: 'FILE READS',        key: 'path' },
+    'file-write':     { label: 'FILE WRITES',       key: 'path' },
+    'file-metadata':  { label: 'FILE METADATA',     key: 'path' },
+    'network-outbound': { label: 'NETWORK OUTBOUND',  key: 'target', fmt: (e) => e.port ? `${e.target}:${e.port}` : e.target },
+    'network-bind':   { label: 'NETWORK BIND',      key: 'target', fmt: (e) => e.port ? `${e.target}:${e.port}` : e.target },
+    'process-exec':   { label: 'PROCESS EXEC',      key: 'path' },
+    'process-fork':   { label: 'PROCESS FORK',      key: 'path' },
+    'signal':         { label: 'SIGNAL',            key: 'path' },
+  };
+
+  for (const [type, cfg] of Object.entries(groupConfig)) {
+    const items = groups[type];
+    if (!items || items.length === 0) continue;
+    out.write(`║                                          ║\n`);
+    out.write(`║  ${cfg.label} (${items.length} attempted)${' '.repeat(Math.max(0, 22 - cfg.label.length - String(items.length).length))}║\n`);
+    out.write(`║──────────────────────────────────────────║\n`);
+
+    const shown = items.slice(0, 25);
+    for (const e of shown) {
+      const val = cfg.fmt ? cfg.fmt(e) : (e[cfg.key] || '(unknown)');
+      const truncated = val.length > 36 ? val.slice(0, 33) + '...' : val;
+      out.write(`║  ${truncated}${' '.repeat(Math.max(0, 38 - truncated.length))}║\n`);
+    }
+    if (items.length > 25) {
+      out.write(`║  ... and ${items.length - 25} more${' '.repeat(Math.max(0, 22 - String(items.length - 25).length))}║\n`);
+    }
+  }
+
+  out.write('╠══════════════════════════════════════════╣\n');
+  out.write(`║  Exit code: ${dryRun.exitCode} (synthetic)${' '.repeat(Math.max(0, 12 - String(dryRun.exitCode).length))}            ║\n`);
+  out.write(`║  Total events: ${summary.totalEvents || events.length}${' '.repeat(Math.max(0, 20 - String(summary.totalEvents || events.length).length))}                     ║\n`);
+  out.write('╚══════════════════════════════════════════╝\n\n');
 }
 
 main();

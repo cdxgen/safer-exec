@@ -37,6 +37,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
 )
@@ -62,6 +63,9 @@ func init() {
 		case "--init-reduced":
 			initReducedMain()
 			os.Exit(0)
+		case "--init-dryrun":
+			initDryRunMain()
+			os.Exit(0)
 		}
 	}
 }
@@ -75,6 +79,9 @@ func main() {
 			return
 		case "--init-reduced":
 			initReducedMain()
+			return
+		case "--init-dryrun":
+			initDryRunMain()
 			return
 		}
 	}
@@ -242,4 +249,42 @@ func initReducedMain() {
 		}
 		os.Exit(1)
 	}
+}
+
+// initDryRunMain is called when the binary re-executes itself with --init-dryrun.
+func initDryRunMain() {
+	configData := os.Getenv("SAFER_EXEC_CONFIG")
+	if configData == "" {
+		data, _ := io.ReadAll(os.Stdin)
+		configData = string(data)
+	}
+	var cfg config.ExecConfig
+	if err := json.Unmarshal([]byte(configData), &cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: init-dryrun config parse: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Set no_new_privs before Landlock (required for unprivileged use).
+	// PR_SET_NO_NEW_PRIVS=38, SYS_PRCTL=157 on amd64, 167 on arm64.
+	syscall.Syscall6(157, 38, 1, 0, 0, 0, 0)
+
+	// Dry-run: deny all filesystem and network access via Landlock.
+	// Clear read/write paths and ports so Landlock rulesets are empty (deny-all).
+	// Allow read+exec on system paths so programs can bootstrap.
+	cfg.ReadPaths = []string{"/usr", "/bin", "/sbin", "/lib", "/lib64"}
+	cfg.WritePaths = nil
+	cfg.AllowHosts = nil
+	cfg.AllowIPs = nil
+	cfg.AllowPorts = nil
+	cfg.AllowLoopback = false
+	cfg.DisableNetwork = true
+	cfg.StructuredOutputPath = ""
+	cfg.EnableAudit = true
+
+	// Run with reduced isolation (seccomp + Landlock deny-all)
+	if err := runInitReduced(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: init-dryrun: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
 }

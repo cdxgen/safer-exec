@@ -31,12 +31,13 @@ export function cargoPolicy() {
       'crates.io',
       'static.crates.io',
       'index.crates.io',
-      'github.com', // Required if fetching git dependencies via libgit2
+      'github.com',
     ],
 
     readPaths: [
-      rustupHome,
-      cargoHome,
+      join(cargoHome, 'registry'),
+      join(cargoHome, 'bin'),
+      join(rustupHome, 'toolchains'),
       ...getSslPaths(),
       join(cwd, 'Cargo.toml'),
       join(cwd, 'Cargo.lock'),
@@ -51,14 +52,9 @@ export function cargoPolicy() {
     env: {
       CARGO_TERM_COLOR: 'auto',
       RUSTUP_TOOLCHAIN: 'stable',
-      // CRITICAL: Force cargo to use internal libgit2 rather than spawning shell 'git' commands
       CARGO_NET_GIT_FETCH_WITH_CLI: 'false',
     },
 
-    /**
-     * Block all execution to prevent arbitrary code execution via build.rs
-     * Ensures this policy is safely used for metadata/lockfile fetching.
-     */
     blockFork: true,
     blockExec: ['*'],
   };

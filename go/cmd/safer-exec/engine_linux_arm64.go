@@ -2,19 +2,13 @@
 
 package main
 
-// Unified Landlock syscall numbers (arm64).
-// These are referenced by engine_linux.go to populate the generic constants.
+// Landlock syscall numbers for arm64.
+// arm64 uses the asm-generic unistd.h table.
+// Correct numbers from /usr/include/asm-generic/unistd.h (Linux 5.13+).
 const (
-	landlockCreateRuleset_unified = 441
-	landlockRestrictSelf_unified  = 445
-	landlockAddRules_unified      = 442
-)
-
-// Landlock syscall numbers for arm64 (used directly in RawSyscall).
-const (
-	sysLandlockCreateRuleset = 441
-	sysLandlockRestrictSelf  = 445
-	sysLandlockAddRules      = 442
+	sysLandlockCreateRuleset = 444
+	sysLandlockAddRules      = 445
+	sysLandlockRestrictSelf  = 446
 )
 
 // Seccomp syscall number (arm64).

@@ -8,7 +8,6 @@
  */
 
 import { dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { statSync, realpathSync } from 'node:fs';
 import { getSslPaths } from './sslhelper.js';
 
@@ -18,14 +17,17 @@ function getNodeDir() {
 
 function getNodeLibDir() {
   const nodeDir = getNodeDir();
-  return nodeDir.replace(/bin$/, 'lib');
+  const libDir = nodeDir.replace(/bin$/, 'lib');
+  return join(libDir, 'node_modules');
 }
 
 export function getPnpmPaths() {
+  const home = process.env.HOME || process.env.USERPROFILE || '';
   const extraPaths = [];
   const paths = (process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':');
 
   let pnpmPath = null;
+
   for (const p of paths) {
     const fullPath = join(p, 'pnpm');
     try {
@@ -47,6 +49,17 @@ export function getPnpmPaths() {
     }
   }
 
+  // Also check common PNPM_HOME or well-known locations
+  if (!pnpmPath) {
+    const pnpmHome = process.env.PNPM_HOME || join(home, 'Library', 'pnpm');
+    const altPath = join(pnpmHome, 'pnpm');
+    try {
+      if (statSync(altPath).isFile()) {
+        pnpmPath = altPath;
+      }
+    } catch {}
+  }
+
   if (pnpmPath) {
     try {
       const realPath = realpathSync(pnpmPath);
@@ -57,7 +70,6 @@ export function getPnpmPaths() {
         extraPaths.push(realPath);
       }
 
-      // Whitelist the parent package root if pnpm is installed in a local node_modules layout (e.g. on CI)
       const nmIdx = pnpmPath.indexOf('node_modules');
       if (nmIdx !== -1) {
         const rootDir = pnpmPath.substring(0, nmIdx);
@@ -85,7 +97,7 @@ export function getPnpmPaths() {
 export function pnpmPolicy() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
-  const temp = tmpdir();
+  const temp = join(home, '.pnpm-store', 'tmp');
 
   return {
     resolveSymlinks: true,
@@ -100,11 +112,12 @@ export function pnpmPolicy() {
       getNodeDir(),
       getNodeLibDir(),
       ...getSslPaths(),
-      cwd,
-      join(home, '.npmrc'),             // Added: PNPM often requires global auth tokens
-      join(home, '.config', 'pnpm'),    // Added: Global PNPM config path
+      join(cwd, 'package.json'),
+      join(cwd, 'pnpm-lock.yaml'),
+      join(cwd, '.npmrc'),
+      join(home, '.npmrc'),
+      join(home, '.config', 'pnpm'),
       ...(process.platform === 'darwin' ? [join(home, 'Library', 'Preferences', 'pnpm')] : []),
-      temp,                             // Added: Temp dir is required for staging tarballs
       ...getPnpmPaths(),
     ],
 
@@ -115,17 +128,16 @@ export function pnpmPolicy() {
       join(home, '.pnpm-store'),
 
       // Cross-platform PNPM global state directories
-      join(home, '.local', 'share', 'pnpm'),                                   // Linux
-      ...(process.platform === 'darwin' ? [join(home, 'Library', 'pnpm')] : []), // macOS
-      ...(process.env.LOCALAPPDATA ? [join(process.env.LOCALAPPDATA, 'pnpm')] : []), // Windows
+      join(home, '.local', 'share', 'pnpm'),
+      ...(process.platform === 'darwin' ? [join(home, 'Library', 'pnpm')] : []),
+      ...(process.env.LOCALAPPDATA ? [join(process.env.LOCALAPPDATA, 'pnpm')] : []),
 
-      temp, // Added: PNPM must write to OS temp to extract downloaded packages safely
+      temp,
     ],
 
     // 4. ENVIRONMENT CONTROLS
     env: {
       npm_config_loglevel: 'warn',
-      // Added defense-in-depth: Tells PNPM natively not to attempt running lifecycle scripts
       npm_config_ignore_scripts: 'true',
     },
 

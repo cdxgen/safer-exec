@@ -46,7 +46,7 @@ describe('Security Tests', () => {
       const etc = realpathSync('/etc');
       const result = await new SaferExec()
         .readPaths(etc)
-        .run('sh', ['-c', `cat ${etc}/hosts ${etc}/protocols 2>/dev/null`]);
+        .run('sh', ['-c', `cat ${etc}/hosts ${etc}/protocols`]);
 
       strict.equal(result.exitCode, 0, 'should exit with code 0');
     });
@@ -58,7 +58,7 @@ describe('Security Tests', () => {
       const result = await new SaferExec()
         .readPaths(etc)
         .writePaths(tmpdir())
-        .run('sh', ['-c', 'cat /usr/share/dict/words 2>/dev/null | head -1']);
+        .run('sh', ['-c', 'cat /usr/share/dict/words | head -1']);
 
       if (process.platform === 'linux') {
         strict.equal(result.exitCode, 0, 'should exit with code 0');

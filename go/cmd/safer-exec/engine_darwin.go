@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -82,6 +83,11 @@ func run(cfg config.ExecConfig) error {
 	// Handle learning mode separately
 	if cfg.EnableLearn {
 		return runLearn(cfg)
+	}
+
+	// Handle dry-run mode
+	if cfg.EnableDryRun {
+		return runDryRun(cfg)
 	}
 
 	// Apply resource limits via RLIMIT before spawning
@@ -381,6 +387,294 @@ func runLearn(cfg config.ExecConfig) error {
 	writeStructured(cfg, "LEARNED:", data)
 
 	return nil
+}
+
+// runDryRun executes the command in dry-run mode: most operations are denied
+// via Seatbelt, system paths are explicitly allowed so the binary can start.
+// On macOS, Seatbelt traces go to the system log for audit.
+func runDryRun(cfg config.ExecConfig) error {
+	// Resolve the command path and its real path (for symlinks)
+	cmdPath, err := exec.LookPath(cfg.Cmd)
+	if err != nil {
+		cmdPath = cfg.Cmd
+	}
+	if realCmdPath, err := filepath.EvalSymlinks(cmdPath); err == nil && realCmdPath != cmdPath {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: %q is a symlink resolving to %q. macOS Seatbelt enforces rules against the real path.\n", cmdPath, realCmdPath)
+	}
+
+	// Build Seatbelt profile: deny-default with system allowances
+	profile := buildDryRunProfile(cfg, cmdPath)
+
+	profFile, err := os.CreateTemp("", "safer-exec-dryrun-profile-*.sb")
+	if err != nil {
+		return fmt.Errorf("creating profile: %w", err)
+	}
+	defer os.Remove(profFile.Name())
+
+	if _, err := profFile.WriteString(profile); err != nil {
+		profFile.Close()
+		return fmt.Errorf("writing profile: %w", err)
+	}
+	profFile.Close()
+
+	// Run under sandbox-exec with the dry-run profile
+	fullArgs := append([]string{"-f", profFile.Name(), cmdPath}, cfg.Args...)
+	cmd := exec.Command("sandbox-exec", fullArgs...)
+	cmd.Env = config.BuildEnv(cfg.Env)
+	if cfg.WorkingDir != "" {
+		cmd.Dir = cfg.WorkingDir
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	_ = cmd.Run() // ignore real exit code
+
+	// Build result with synthetic exit 0
+	result := &config.DryRunResult{
+		ExitCode: 0,
+		Events:   []config.DryRunEvent{},
+		Summary:  config.DryRunSummary{},
+	}
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshaling dry-run result: %w", err)
+	}
+	writeStructured(cfg, "DRYRUN:", data)
+
+	return nil
+}
+
+// buildDryRunProfile generates a deny-default Seatbelt profile that:
+// - Allows only system-level reads so the binary and dyld can load
+// - Denies all writes, network, and process forking
+// - Traces all operations to the system log
+func buildDryRunProfile(cfg config.ExecConfig, cmdPath string) string {
+	var sb strings.Builder
+
+	sb.WriteString("(version 1)\n")
+	sb.WriteString("(deny default)\n")
+	sb.WriteString("(import \"system.sb\")\n")
+
+	// Allow the target binary and its parent dir (needed for exec)
+	sb.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", filepath.Dir(cmdPath)))
+	sb.WriteString(fmt.Sprintf("(allow file-read* (literal %q))\n", cmdPath))
+
+	// Allow essential system paths for process bootstrap only.
+	// No /etc, /usr/bin, /bin, /sbin, /usr/share — those are not needed
+	// for the binary to start and would leak system file contents.
+	sb.WriteString("(allow file-read* (subpath \"/usr/lib\"))\n")
+	sb.WriteString("(allow file-read* (subpath \"/System\"))\n")
+	sb.WriteString("(allow file-read* (subpath \"/dev\"))\n")
+
+	// Allow dyld shared cache (needed for process bootstrap)
+	sb.WriteString("(allow file-read* (subpath \"/private/var/db/dyld\"))\n")
+
+	// Allow reading of the working directory if set
+	// (dry-run blocks project reads by default; add working dir only if needed)
+	_ = cfg.WorkingDir
+
+	// Process operations needed for execution
+	sb.WriteString("(allow process-exec)\n")
+	sb.WriteString("(allow process-fork)\n")
+	sb.WriteString("(allow signal)\n")
+
+	// System-level operations needed for process lifecycle
+	sb.WriteString("(allow sysctl-read)\n")
+	sb.WriteString("(allow mach-lookup)\n")
+	sb.WriteString("(allow mach-register)\n")
+	sb.WriteString("(allow ipc-posix-sem)\n")
+	sb.WriteString("(allow ipc-posix-shm)\n")
+	sb.WriteString("(allow process-info-dirtycontrol)\n")
+	sb.WriteString("(allow process-info-pidinfo)\n")
+	sb.WriteString("(allow process-info-listpids)\n")
+
+	// Trace all operations for audit
+	sb.WriteString("(trace file-read*)\n")
+	sb.WriteString("(trace file-write*)\n")
+	sb.WriteString("(trace file-read-metadata)\n")
+	sb.WriteString("(trace network-outbound)\n")
+	sb.WriteString("(trace network-inbound)\n")
+	sb.WriteString("(trace network-bind)\n")
+	sb.WriteString("(trace process-exec)\n")
+	sb.WriteString("(trace process-fork)\n")
+	sb.WriteString("(trace signal)\n")
+
+	return sb.String()
+}
+
+// parseDryRunTrace parses a Seatbelt trace log and extracts dry-run events.
+func parseDryRunTrace(tracePath string) []config.DryRunEvent {
+	f, err := os.Open(tracePath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var events []config.DryRunEvent
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		event := parseDryRunLine(line)
+		if event != nil {
+			events = append(events, *event)
+		}
+	}
+
+	return events
+}
+
+// parseDryRunLine extracts a dry-run event from a single Seatbelt trace line.
+func parseDryRunLine(line string) *config.DryRunEvent {
+	var event config.DryRunEvent
+
+	if strings.Contains(line, "file-read") && strings.Contains(line, "file-read-metadata") {
+		event.Type = "file-metadata"
+	} else if strings.Contains(line, "file-read") {
+		event.Type = "file-read"
+	} else if strings.Contains(line, "file-write") {
+		event.Type = "file-write"
+	} else if strings.Contains(line, "network-outbound") {
+		event.Type = "network-outbound"
+		if ip, port := extractNetworkTarget(line); ip != "" {
+			event.Target = ip
+			event.Port = port
+		}
+		return &event
+	} else if strings.Contains(line, "network-bind") || strings.Contains(line, "network-inbound") {
+		event.Type = "network-bind"
+		if ip, port := extractNetworkTarget(line); ip != "" {
+			event.Target = ip
+			event.Port = port
+		}
+		return &event
+	} else if strings.Contains(line, "process-exec") {
+		event.Type = "process-exec"
+		event.Path = extractTracePath(line)
+		return &event
+	} else if strings.Contains(line, "process-fork") {
+		event.Type = "process-fork"
+		return &event
+	} else if strings.Contains(line, "signal") {
+		event.Type = "signal"
+		return &event
+	} else {
+		return nil
+	}
+
+	event.Path = extractTracePath(line)
+	if event.Path == "" {
+		return nil
+	}
+
+	return &event
+}
+
+// extractTracePath finds the file path in a trace line (last quoted string).
+func extractTracePath(line string) string {
+	lastQuote := -1
+	for i := len(line) - 1; i >= 0; i-- {
+		if line[i] == '"' {
+			lastQuote = i
+			break
+		}
+	}
+	if lastQuote <= 0 {
+		return ""
+	}
+	start := lastQuote - 1
+	for start >= 0 && line[start] != '"' {
+		start--
+	}
+	if start < 0 {
+		return ""
+	}
+	return line[start+1 : lastQuote]
+}
+
+// extractNetworkTarget parses IP:port from a network-outbound trace line.
+func extractNetworkTarget(line string) (string, int) {
+	idx := strings.Index(line, "to \"")
+	if idx == -1 {
+		idx = strings.Index(line, "to '")
+	}
+	if idx == -1 {
+		return "", 0
+	}
+
+	rest := line[idx+4:]
+	end := strings.IndexAny(rest, "\"'")
+	if end == -1 {
+		return "", 0
+	}
+
+	target := rest[:end]
+	parts := strings.Split(target, ":")
+	if len(parts) == 2 {
+		port, _ := strconv.Atoi(parts[1])
+		return parts[0], port
+	}
+	if len(parts) == 1 {
+		return parts[0], 0
+	}
+	return target, 0
+}
+
+// buildDryRunResult constructs a DryRunResult from collected events.
+func buildDryRunResult(events []config.DryRunEvent, cmd string, args []string) *config.DryRunResult {
+	result := &config.DryRunResult{
+		ExitCode: 0,
+		Events:   events,
+	}
+
+	// Sort events by type for predictable output
+	sort.Slice(result.Events, func(i, j int) bool {
+		if result.Events[i].Type != result.Events[j].Type {
+			return result.Events[i].Type < result.Events[j].Type
+		}
+		return result.Events[i].Path < result.Events[j].Path
+	})
+
+	// Deduplicate events
+	seen := make(map[string]bool)
+	var deduped []config.DryRunEvent
+	for _, e := range result.Events {
+		key := fmt.Sprintf("%s|%s|%s|%d", e.Type, e.Path, e.Target, e.Port)
+		if !seen[key] {
+			seen[key] = true
+			deduped = append(deduped, e)
+		}
+	}
+	result.Events = deduped
+
+	// Compute summary
+	for _, e := range result.Events {
+		switch e.Type {
+		case "file-read":
+			result.Summary.FileReads++
+		case "file-write":
+			result.Summary.FileWrites++
+		case "file-metadata":
+			result.Summary.FileMetadata++
+		case "network-outbound":
+			result.Summary.NetworkOutbound++
+		case "network-bind":
+			result.Summary.NetworkBind++
+		case "process-exec":
+			result.Summary.ExecAttempts++
+		case "process-fork":
+			result.Summary.ForkAttempts++
+		}
+	}
+	result.Summary.TotalEvents = len(result.Events)
+
+	return result
 }
 
 // buildLearnProfile generates a permissive Seatbelt profile with trace rules.

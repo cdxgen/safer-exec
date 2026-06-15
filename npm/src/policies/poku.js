@@ -9,7 +9,6 @@
  */
 
 import { dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { getSslPaths } from './sslhelper.js';
 import { getPnpmPaths } from './pnpm.js';
 
@@ -19,7 +18,8 @@ function getNodeDir() {
 
 function getNodeLibDir() {
   const nodeDir = getNodeDir();
-  return nodeDir.replace(/bin$/, 'lib');
+  const libDir = nodeDir.replace(/bin$/, 'lib');
+  return join(libDir, 'node_modules');
 }
 
 /**
@@ -30,34 +30,35 @@ function getNodeLibDir() {
 export function pokuPolicy() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
-  const temp = tmpdir();
+  const temp = join(home, '.npm', '_cacache', 'tmp');
 
   return {
     // 1. NETWORK RESTRICTIONS
-    allowHosts: [],           // No external network
-    allowLoopback: true,      // Allow loopback for mock HTTP servers (Bug #5)
+    allowHosts: [],
+    allowLoopback: true,
 
     // 2. READ PATHS
     readPaths: [
       getNodeDir(),
       getNodeLibDir(),
       ...getSslPaths(),
-      cwd,
+      join(cwd, 'package.json'),
+      join(cwd, 'pnpm-lock.yaml'),
       join(home, '.npmrc'),
-      join(home, 'go', 'pkg', 'mod'),  // Go module cache (Obs #3)
-      join(home, '.m2'),               // Maven local repo
-      join(home, '.gradle'),           // Gradle home
-      join(home, '.cargo'),            // Cargo cache
+      join(home, 'go', 'pkg', 'mod'),
+      join(home, '.m2'),
+      join(home, '.gradle'),
+      join(home, '.cargo'),
       ...(process.platform === 'darwin' ? [join(home, 'Library', 'Preferences', 'pnpm')] : []),
       ...getPnpmPaths(),
     ],
 
     // 3. WRITE PATHS
     writePaths: [
-      cwd,
+      join(cwd, 'node_modules'),
       temp,
-      join(home, '.npm'),              // npm cache (Obs #5)
-      join(home, '.gradle'),           // Gradle build cache
+      join(home, '.npm'),
+      join(home, '.gradle'),
     ],
 
     // 4. ENVIRONMENT CONTROLS
@@ -67,8 +68,8 @@ export function pokuPolicy() {
     },
 
     // 5. EXECUTION CONTROLS
-    blockFork: false,          // Test runners must spawn subprocesses
-    blockExec: [],             // Allow test runners to execute node/etc.
+    blockFork: false,
+    blockExec: [],
   };
 }
 

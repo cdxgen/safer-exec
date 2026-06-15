@@ -277,7 +277,7 @@ func TestRun_ReadOnlyFilesystem(t *testing.T) {
 	roDir := t.TempDir()
 	cfg := config.ExecConfig{
 		Cmd:        "/bin/sh",
-		Args:       []string{"sh", "-c", "echo write-attempt > " + roDir + "/should-fail.txt 2>/dev/null; echo $?"},
+		Args:       []string{"sh", "-c", "echo write-attempt > " + roDir + "/should-fail.txt; echo $?"},
 		ReadPaths:  []string{"/usr", "/etc", "/bin", "/bin/sh", roDir},
 		WritePaths: []string{"/tmp"},
 	}

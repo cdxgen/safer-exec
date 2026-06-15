@@ -222,7 +222,7 @@ func TestRun_ReadFile(t *testing.T) {
 func TestRun_ReadMultipleFiles(t *testing.T) {
 	cfg := config.ExecConfig{
 		Cmd:  "sh",
-		Args: []string{"-c", "cat /etc/hosts /etc/protocols 2>/dev/null | wc -l"},
+		Args: []string{"-c", "cat /etc/hosts /etc/protocols | wc -l"},
 	}
 	out := captureRun(t, cfg)
 	if strings.TrimSpace(out) == "0" || strings.TrimSpace(out) == "" {

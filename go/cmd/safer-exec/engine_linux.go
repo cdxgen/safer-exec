@@ -131,6 +131,10 @@ func run(cfg config.ExecConfig) error {
 	if cfg.EnableLearn {
 		return runLearn(cfg)
 	}
+	// Handle dry-run mode
+	if cfg.EnableDryRun {
+		return runDryRun(cfg)
+	}
 	// Take pre-execution snapshot for filesystem diffing
 	var beforeSnap fsdiff.Snapshot
 	if cfg.EnableDiff && len(cfg.WritePaths) > 0 {
@@ -884,6 +888,42 @@ func runLearn(cfg config.ExecConfig) error {
 	return nil
 }
 
+// runDryRun executes the command in dry-run mode on Linux: clears allow lists
+// so Landlock denies all filesystem and network operations, applies seccomp-bpf,
+// and returns synthetic exit 0. The --init-dryrun flag handles the child side.
+func runDryRun(cfg config.ExecConfig) error {
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+
+	selfPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("finding self: %w", err)
+	}
+
+	// Run self with --init-dryrun (applies Landlock deny-all + seccomp)
+	cmd := exec.Command(selfPath, "--init-dryrun")
+	cmd.Env = append(config.BuildEnv(cfg.Env), "SAFER_EXEC_CONFIG="+string(cfgJSON))
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if cfg.WorkingDir != "" {
+		cmd.Dir = cfg.WorkingDir
+	}
+
+	_ = cmd.Run() // ignore real exit code
+
+	result := &config.DryRunResult{
+		ExitCode: 0,
+		Events:   []config.DryRunEvent{},
+		Summary:  config.DryRunSummary{},
+	}
+	data, _ := json.Marshal(result)
+	writeStructured(cfg, "DRYRUN:", data)
+	return nil
+}
+
 // deduplicateHTTPAccess removes duplicate (method, host, path) tuples,
 // keeping the first occurrence.
 func deduplicateHTTPAccess(entries []config.HTTPAccessEntry) []config.HTTPAccessEntry {
@@ -1159,6 +1199,31 @@ func runInit(cfg config.ExecConfig) error {
 		}
 		if err := os.WriteFile("/proc/self/gid_map", []byte(gidMapping), 0); err != nil {
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: gid_map: %v\n", err)
+		}
+	}
+
+	// When TraceLibraries is active and a precompiled .so helper exists, mount a
+	// dedicated exec-capable tmpfs for the LD_AUDIT helper before Landlock locks
+	// in. The sandbox root tmpfs is mounted MS_NOEXEC, so the dynamic linker
+	// cannot mmap(PROT_EXEC) a .so placed directly in /tmp. We mount a fresh
+	// tmpfs (without MS_NOEXEC) on a well-known path, add it to WritePaths so
+	// Landlock explicitly permits it, and unmount+remove it on exit.
+	const auditMountPath = "/tmp/safer-exec-ld-audit"
+	if cfg.TraceLibraries && hasPrecompiledSo && len(auditHelperSo) > 0 && cfg.TraceTempDir == "" {
+		if err := os.MkdirAll(auditMountPath, 0o700); err == nil {
+			mountErr := syscall.Mount("tmpfs", auditMountPath, "tmpfs",
+				syscall.MS_NODEV|syscall.MS_NOSUID, "size=4m,mode=0700")
+			if mountErr == nil {
+				cfg.TraceTempDir = auditMountPath
+				cfg.WritePaths = append(cfg.WritePaths, auditMountPath)
+				defer func() {
+					syscall.Unmount(auditMountPath, syscall.MNT_DETACH)
+					os.Remove(auditMountPath)
+				}()
+			} else {
+				os.Remove(auditMountPath)
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: could not mount audit helper tmpfs: %v\n", mountErr)
+			}
 		}
 	}
 
@@ -2090,7 +2155,7 @@ func setupDev(cfg config.ExecConfig) error {
 	return nil
 }
 
-type landlockRulesetAttr struct{ HandledAccessFS, HandledAccessNet uint64 }
+type landlockRulesetAttr struct{ HandledAccessFS, HandledAccessNet, Scoped uint64 }
 type landlockNetPortAttr struct{ AllowedAccess, Port uint64 }
 type landlockPathBeneathAttr struct {
 	AllowedAccess uint64
@@ -2124,14 +2189,12 @@ const (
 	landlockAccessFSTruncate   = 1 << 14
 )
 
-// Landlock ABI v4+ IOCTL device control (Linux 6.7+).
+// Landlock ABI v5+ IOCTL device control (Linux 6.12+).
 const landlockAccessFSIoctlDev = 1 << 15
 
-// Landlock ABI v5+ network access rights (Linux 6.12+).
-const (
-	landlockAccessNetBindUDP    = 1 << 2
-	landlockAccessNetConnectUDP = 1 << 3
-)
+// UDP network flags removed: LANDLOCK_ACCESS_NET_BIND_UDP and
+// LANDLOCK_ACCESS_NET_CONNECT_UDP do not exist in any released kernel.
+// When they land, add them here gated behind the appropriate ABI version.
 
 func getBindPortsAndWildcard(allowListen []string) ([]int, bool) {
 	var ports []int
@@ -2200,19 +2263,10 @@ func applyLandlockNetwork(cfg config.ExecConfig) error {
 		return nil
 	}
 
-	if abi >= 5 {
-		if restrictBind {
-			handledAccess |= landlockAccessNetBindUDP
-		}
-		if restrictConnect {
-			handledAccess |= landlockAccessNetConnectUDP
-		}
-	}
-
 	attr := landlockRulesetAttr{HandledAccessNet: handledAccess}
 	rid, _, errno := syscall.RawSyscall(sysLandlockCreateRuleset, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr), 0)
 	if errno != 0 {
-		return nil
+		return fmt.Errorf("create landlock net ruleset: %v", errno)
 	}
 	defer syscall.Close(int(rid))
 
@@ -2240,9 +2294,16 @@ func applyLandlockNetwork(cfg config.ExecConfig) error {
 		for _, p := range connectPorts {
 			portAccess[p] |= landlockAccessNetConnectTCP
 		}
-		for p := 1; p <= 1024; p++ {
-			portAccess[p] |= landlockAccessNetConnectTCP
-		}
+	}
+
+	// When URL rules are present, always permit ports 80 and 443 at the Landlock
+	// layer so the eBPF tracer can capture HTTP(S) requests for URL-rule matching.
+	// Landlock is coarse (port-level); URL rules are fine-grained (host/path/port).
+	// Without this, a rule like {port:8443} would block Landlock port 443 before
+	// the tracer can see the request, preventing url-violation from firing.
+	if restrictConnect && len(cfg.AllowURLRules) > 0 && !cfg.DisableNetwork {
+		portAccess[80] |= landlockAccessNetConnectTCP
+		portAccess[443] |= landlockAccessNetConnectTCP
 	}
 
 	if restrictBind {
@@ -2259,7 +2320,9 @@ func applyLandlockNetwork(cfg config.ExecConfig) error {
 		}
 	}
 
-	syscall.RawSyscall(sysLandlockRestrictSelf, rid, 0, 0)
+	if _, _, errno := syscall.RawSyscall(sysLandlockRestrictSelf, rid, 0, 0); errno != 0 {
+		return fmt.Errorf("landlock restrict self (net): %v", errno)
+	}
 	return nil
 }
 
@@ -2282,13 +2345,13 @@ func applyLandlockScoped(cfg config.ExecConfig) error {
 			abiVer = v
 		}
 	}
-	if abiVer < 5 {
+	if abiVer < 6 {
 		return nil
 	}
 
 	const (
-		landlockScopeSignal             = 1 << 0
-		landlockScopeAbstractUnixSocket = 1 << 1
+		landlockScopeAbstractUnixSocket = 1 << 0
+		landlockScopeSignal             = 1 << 1
 	)
 
 	_ = landlockScopeSignal
@@ -2368,7 +2431,7 @@ func applyLandlockFilesystem(cfg config.ExecConfig) error {
 	if abi >= 3 {
 		handledFS |= landlockAccessFSTruncate
 	}
-	if abi >= 4 {
+	if abi >= 5 {
 		handledFS |= landlockAccessFSIoctlDev
 	}
 
@@ -2379,22 +2442,57 @@ func applyLandlockFilesystem(cfg config.ExecConfig) error {
 	}
 	defer syscall.Close(int(rid))
 
-	// Add path_beneath rules for read paths (read-only access)
-	readOnlyAccess := uint64(
+	// Access masks split by inode type: Landlock rejects rights that don't apply
+	// to the inode kind (e.g. READ_DIR on a regular file returns EINVAL and
+	// silently drops the rule, leaving the file inaccessible).
+	readOnlyDirAccess := uint64(
 		landlockAccessFSExecute |
 			landlockAccessFSReadFile |
 			landlockAccessFSReadDir |
 			landlockAccessFSRefer)
+	readOnlyFileAccess := uint64(
+		landlockAccessFSExecute |
+			landlockAccessFSReadFile)
+
 	for _, path := range cfg.ReadPaths {
-		_ = addLandlockPathBeneath(int(rid), readOnlyAccess, path)
-		// If the path no longer exists (e.g. it was inside the old root before pivot_root),
-		// we silently skip it — Landlock rules for nonexistent paths are harmless.
+		fi, err := os.Lstat(path)
+		if err != nil {
+			continue
+		}
+		if fi.IsDir() {
+			_ = addLandlockPathBeneath(int(rid), readOnlyDirAccess, path)
+		} else {
+			_ = addLandlockPathBeneath(int(rid), readOnlyFileAccess, path)
+		}
 	}
 
-	// Add path_beneath rules for write paths (read-write access)
-	writeAccess := handledFS // all handled access rights
+	// /dev/null is a universal write sink (2>/dev/null, shell redirects).
+	// Grant write access unconditionally without opening the whole /dev tree.
+	devNullAccess := uint64(landlockAccessFSReadFile | landlockAccessFSWriteFile)
+	_ = addLandlockPathBeneath(int(rid), devNullAccess, "/dev/null")
+
+	// Write paths: strip directory-only rights when the target is a regular file.
+	writeDirAccess := handledFS
+	writeFileAccess := handledFS &^ uint64(
+		landlockAccessFSReadDir|
+			landlockAccessFSRemoveDir|
+			landlockAccessFSMakeChar|
+			landlockAccessFSMakeDir|
+			landlockAccessFSMakeReg|
+			landlockAccessFSMakeSock|
+			landlockAccessFSMakeFIFO|
+			landlockAccessFSMakeBlock|
+			landlockAccessFSMakeSym)
 	for _, path := range cfg.WritePaths {
-		_ = addLandlockPathBeneath(int(rid), writeAccess, path)
+		fi, err := os.Lstat(path)
+		if err != nil {
+			continue
+		}
+		if fi.IsDir() {
+			_ = addLandlockPathBeneath(int(rid), writeDirAccess, path)
+		} else {
+			_ = addLandlockPathBeneath(int(rid), writeFileAccess, path)
+		}
 	}
 
 	// Apply the ruleset
@@ -3323,21 +3421,19 @@ func runDiagnostics() config.DiagnosticsResult {
 		result.Capabilities["landlock_layers_remaining"] = config.CapabilityInfo{Available: available, Detail: detail}
 	}
 
-	// Landlock ABI v4+ features (IOCTL device control, Linux 6.7+)
+	// Landlock ABI v5+ features (IOCTL device control, Linux 6.10+)
 	if data, err := os.ReadFile("/sys/kernel/security/landlock/abi"); err == nil {
 		abi := strings.TrimSpace(string(data))
 		if abiVer, convErr := strconv.Atoi(abi); convErr == nil {
-			if abiVer >= 4 {
-				result.Capabilities["landlock_ioctl"] = config.CapabilityInfo{Available: true, Detail: "IOCTL device control (ABI v4+)"}
-			} else {
-				result.Capabilities["landlock_ioctl"] = config.CapabilityInfo{Available: false, Detail: fmt.Sprintf("requires ABI v4, current: v%d", abiVer)}
-			}
 			if abiVer >= 5 {
-				result.Capabilities["landlock_udp"] = config.CapabilityInfo{Available: true, Detail: "UDP bind/connect control (ABI v5+)"}
-				result.Capabilities["landlock_scoped"] = config.CapabilityInfo{Available: true, Detail: "IPC scoped rules (ABI v5+)"}
+				result.Capabilities["landlock_ioctl"] = config.CapabilityInfo{Available: true, Detail: "IOCTL device control (ABI v5+)"}
 			} else {
-				result.Capabilities["landlock_udp"] = config.CapabilityInfo{Available: false, Detail: fmt.Sprintf("requires ABI v5, current: v%d", abiVer)}
-				result.Capabilities["landlock_scoped"] = config.CapabilityInfo{Available: false, Detail: fmt.Sprintf("requires ABI v5, current: v%d", abiVer)}
+				result.Capabilities["landlock_ioctl"] = config.CapabilityInfo{Available: false, Detail: fmt.Sprintf("requires ABI v5, current: v%d", abiVer)}
+			}
+			if abiVer >= 6 {
+				result.Capabilities["landlock_scoped"] = config.CapabilityInfo{Available: true, Detail: "IPC scoped rules (ABI v6+)"}
+			} else {
+				result.Capabilities["landlock_scoped"] = config.CapabilityInfo{Available: false, Detail: fmt.Sprintf("requires ABI v6, current: v%d", abiVer)}
 			}
 		}
 	}
@@ -3510,7 +3606,6 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["proc_hardening"] = fullIsolation
 	result.Features["extra_fd_cleanup"] = true
 	result.Features["landlock_ioctl_control"] = result.Capabilities["landlock_ioctl"].Available
-	result.Features["landlock_udp_control"] = result.Capabilities["landlock_udp"].Available
 	result.Features["landlock_scoped_rules"] = result.Capabilities["landlock_scoped"].Available
 	result.Features["protect_system"] = true
 	result.Features["protect_home"] = fullIsolation

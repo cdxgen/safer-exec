@@ -12,14 +12,14 @@ import (
 // are accidentally changed or copied from the amd64 file.
 func TestArm64SyscallConstants(t *testing.T) {
 	// Verify Landlock syscalls match arm64 ABI
-	if sysLandlockCreateRuleset != 441 {
-		t.Errorf("sysLandlockCreateRuleset = %d, want 441", sysLandlockCreateRuleset)
+	if sysLandlockCreateRuleset != 444 {
+		t.Errorf("sysLandlockCreateRuleset = %d, want 444", sysLandlockCreateRuleset)
 	}
-	if sysLandlockAddRules != 442 {
-		t.Errorf("sysLandlockAddRules = %d, want 442", sysLandlockAddRules)
+	if sysLandlockAddRules != 445 {
+		t.Errorf("sysLandlockAddRules = %d, want 445", sysLandlockAddRules)
 	}
-	if sysLandlockRestrictSelf != 445 {
-		t.Errorf("sysLandlockRestrictSelf = %d, want 445", sysLandlockRestrictSelf)
+	if sysLandlockRestrictSelf != 446 {
+		t.Errorf("sysLandlockRestrictSelf = %d, want 446", sysLandlockRestrictSelf)
 	}
 
 	// Verify Seccomp syscall

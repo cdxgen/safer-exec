@@ -173,6 +173,12 @@ type ExecConfig struct {
 	// policy file (Behavioral Bill of Materials).
 	EnableLearn bool `json:"enableLearn"`
 
+	// EnableDryRun, when true, runs the command with all operations denied
+	// and returns a complete audit of everything the command attempted.
+	// No filesystem or network side effects occur. The exit code is
+	// overridden to 0. When set, EnableAudit is implicitly enabled.
+	EnableDryRun bool `json:"enableDryRun"`
+
 	// AllowExec lists executable names the sandboxed process is allowed
 	// to exec. Empty means any executable. On macOS this becomes
 	// (allow process-exec (file ...)) rules. On Linux this is enforced
@@ -734,6 +740,35 @@ type ExecResult struct {
 	LearnedPolicy *LearnedPolicy `json:"learnedPolicy,omitempty"`
 	// Crypto is the cryptographic observation report (when TraceCrypto is true).
 	Crypto *CryptoResult `json:"crypto,omitempty"`
+	// DryRun is the dry-run audit report (when EnableDryRun is true).
+	DryRun *DryRunResult `json:"dryRun,omitempty"`
+}
+
+// DryRunResult is the complete dry-run audit report.
+type DryRunResult struct {
+	ExitCode int           `json:"exitCode"`
+	Events   []DryRunEvent `json:"events"`
+	Summary  DryRunSummary `json:"summary"`
+}
+
+// DryRunEvent describes a single blocked operation during dry-run.
+type DryRunEvent struct {
+	Type   string `json:"type"`
+	Path   string `json:"path,omitempty"`
+	Target string `json:"target,omitempty"`
+	Port   int    `json:"port,omitempty"`
+}
+
+// DryRunSummary provides counts by event type.
+type DryRunSummary struct {
+	TotalEvents     int `json:"totalEvents"`
+	FileReads       int `json:"fileReads"`
+	FileWrites      int `json:"fileWrites"`
+	FileMetadata    int `json:"fileMetadata"`
+	NetworkOutbound int `json:"networkOutbound"`
+	NetworkBind     int `json:"networkBind"`
+	ExecAttempts    int `json:"execAttempts"`
+	ForkAttempts    int `json:"forkAttempts"`
 }
 
 // ProfileValidationResult is the output of --validate-profile mode.

@@ -72,6 +72,7 @@ import { bunPolicy } from './policies/bun.js';
 import { pokuPolicy } from './policies/poku.js';
 import { cdxgenPolicy } from './policies/cdxgen.js';
 import { pnpmInstallPolicy } from './policies/pnpmInstall.js';
+import { uvPolicy } from './policies/uv.js';
 function findInPath(cmd) {
   if (cmd.includes('/') || cmd.includes('\\')) {
     return cmd;
@@ -109,6 +110,7 @@ const POLICIES = {
   poku: pokuPolicy,
   cdxgen: cdxgenPolicy,
   pnpmInstall: pnpmInstallPolicy,
+  uv: uvPolicy,
 };
 
 /**
@@ -297,6 +299,9 @@ export class SaferExec extends EventEmitter {
     /** @type {boolean} */
     this._enableLearn = options.enableLearn || false;
 
+    /** @type {boolean} Enable dry-run mode */
+    this._enableDryRun = options.enableDryRun || false;
+
     /** @type {string[]} Executables the command is allowed to exec */
     this._allowExec = options.allowExec || [];
 
@@ -442,7 +447,7 @@ export class SaferExec extends EventEmitter {
    * Merges the policy's configuration with any existing user-defined
    * settings. User-defined settings take precedence over policy defaults.
    *
-   * @param {'npm'|'pypi'|'maven'|'cargo'|'rubygems'|'composer'|'deno'|'gomod'|'bun'} name - The policy name
+   * @param {'npm'|'pypi'|'maven'|'cargo'|'rubygems'|'composer'|'deno'|'gomod'|'bun'|'uv'} name - The policy name
    * @returns {SaferExec} This instance for chaining
    * @throws {Error} If the policy name is not recognized
    *
@@ -1061,6 +1066,23 @@ export class SaferExec extends EventEmitter {
    */
   enableLearn() {
     this._enableLearn = true;
+    return this;
+  }
+
+  /**
+   * Enable dry-run mode for supply chain audit and malware analysis.
+   *
+   * In dry-run mode, ALL filesystem and network operations are denied
+   * (no side effects). Every attempted read/write/exec/network connection
+   * is captured and returned as a structured audit report. The command
+   * receives a synthetic exit code of 0.
+   *
+   * Dry-run mode implicitly enables audit logging.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  enableDryRun() {
+    this._enableDryRun = true;
     return this;
   }
 
@@ -1939,6 +1961,7 @@ export class SaferExec extends EventEmitter {
       enableAudit: this._enableAudit || this._traceLibraries || this._traceHTTPURLs,
       enableDiff: this._enableDiff,
       enableLearn: this._enableLearn,
+      enableDryRun: this._enableDryRun,
       allowExec: this._allowExec,
       blockExec: effectiveBlockExec,
       blockFork: this._blockFork,

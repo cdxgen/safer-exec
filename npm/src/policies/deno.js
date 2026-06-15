@@ -11,42 +11,42 @@
  */
 
 import { join } from 'node:path';
-import { getSslPaths, isMac } from './sslhelper.js';
-
+import { getSslPaths } from './sslhelper.js';
 import { execSync } from 'node:child_process';
 
-function resolveDenoPaths() {
-  let denoBin = isMac ? '/usr/local/bin/deno' : '/usr/bin/deno';
-  let denoLib = isMac ? '/usr/local/lib' : '/usr/lib';
+function resolveDenoPaths(home) {
+  let denoBin = '/usr/local/bin/deno';
+  let denoInstall = join(home, '.deno');
 
   try {
     const bin = execSync('which deno', { encoding: 'utf-8' }).trim();
     if (bin) {
       denoBin = bin;
     }
-  } catch (e) {
-    // Fall back to defaults if lookup fails
+  } catch {}
+
+  if (process.env.DENO_INSTALL_ROOT) {
+    denoInstall = process.env.DENO_INSTALL_ROOT;
   }
 
-  return { denoBin, denoLib };
+  return { denoBin, denoInstall };
 }
 
 export function denoPolicy() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
-  const { denoBin, denoLib } = resolveDenoPaths();
+  const { denoBin, denoInstall } = resolveDenoPaths(home);
 
   return {
     allowHosts: [
       'jsr.io',
-      'cdn.jsdelivr.net',
       'deno.land',
       'registry.npmjs.org',
     ],
 
     readPaths: [
       denoBin,
-      denoLib,
+      denoInstall,
       ...getSslPaths(),
       join(cwd, 'deno.json'),
       join(cwd, 'deno.jsonc'),
@@ -58,16 +58,12 @@ export function denoPolicy() {
     ],
 
     env: {
-      DENO_INSTALL_ROOT: join(home, '.deno'),
+      DENO_INSTALL_ROOT: denoInstall,
       DENO_DIR: join(home, '.cache', 'deno'),
-      // CRITICAL: Prevent Deno from hanging on interactive prompts when it
-      // requests ungranted permissions (e.g., net/read/write) at runtime
       DENO_NO_PROMPT: '1',
-      // Disable update checks
       DENO_NO_UPDATE_CHECK: '1',
     },
 
-    /** Block all execution to prevent runtime escapes via Deno.Command / Deno.run */
     blockFork: true,
     blockExec: ['*'],
   };

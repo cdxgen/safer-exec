@@ -245,6 +245,9 @@ func (l *Learner) mergeAndWrite(cfg config.ExecConfig, observed *config.PolicyFi
 	return merged
 }
 
+// learnGroupDepth is the max directory segments to keep when grouping paths.
+const learnGroupDepth = 4
+
 // buildPolicy converts collected observations into a PolicyFile.
 func (l *Learner) buildPolicy(cmd string, args []string) *config.PolicyFile {
 	// Initialize all slices to empty arrays (not nil) so JSON serializes as [] not null
@@ -300,9 +303,7 @@ func (l *Learner) buildPolicy(cmd string, args []string) *config.PolicyFile {
 	sort.Strings(policy.EnvVars)
 
 	// Determine AllowCrypto based on observed reads
-	// Default to allowCrypto: true if any crypto-related path was read.
 	hasCryptoRead := false
-	hasEntropyRead := false
 	hasFIPSRead := false
 	hasGPURead := false
 	hasTPMRead := false
@@ -311,9 +312,6 @@ func (l *Learner) buildPolicy(cmd string, args []string) *config.PolicyFile {
 		up := strings.ToLower(p)
 		if strings.Contains(up, "libcrypto") || strings.Contains(up, "libssl") || strings.Contains(up, "/ssl") || strings.Contains(up, "security") {
 			hasCryptoRead = true
-		}
-		if strings.Contains(up, "/dev/random") || strings.Contains(up, "/dev/urandom") {
-			hasEntropyRead = true
 		}
 		if strings.Contains(up, "fips_enabled") || strings.Contains(up, "fips.so") || strings.Contains(up, "fips.dylib") {
 			hasFIPSRead = true
@@ -328,14 +326,16 @@ func (l *Learner) buildPolicy(cmd string, args []string) *config.PolicyFile {
 			hasVMRead = true
 		}
 	}
+
+	// Control directives: only enable when the feature was actually observed.
 	policy.AllowCrypto = hasCryptoRead
-	policy.BlockCrypto = !hasCryptoRead
-	policy.BlockCryptoEntropy = !hasEntropyRead
 	policy.FIPSDetected = hasFIPSRead
 
-	policy.AllowGPU = !hasGPURead
+	policy.AllowGPU = hasGPURead
 	policy.BlockTPM = hasTPMRead
 	policy.SpoofAntiVM = hasVMRead
+
+	// Informational: record what was detected
 	policy.GPUUsed = hasGPURead
 	policy.TPMUsed = hasTPMRead
 	policy.AntiVMActive = hasVMRead
@@ -343,39 +343,37 @@ func (l *Learner) buildPolicy(cmd string, args []string) *config.PolicyFile {
 	return policy
 }
 
-// dedupPaths takes a set of file paths and returns the minimal set of
-// parent directories that cover all paths.
+// dedupPaths groups paths by truncating each to learnGroupDepth segments
+// then deduplicating the results.
 func (l *Learner) dedupPaths(paths map[string]bool) []string {
-	// Sort paths by depth (shallowest first)
-	pathList := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
 	for p := range paths {
-		pathList = append(pathList, p)
+		grouped := truncatePathDepth(p, learnGroupDepth)
+		seen[grouped] = true
 	}
-	sort.Slice(pathList, func(i, j int) bool {
-		return strings.Count(pathList[i], string(filepath.Separator)) <
-			strings.Count(pathList[j], string(filepath.Separator))
+
+	result := make([]string, 0, len(seen))
+	for p := range seen {
+		result = append(result, p)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return strings.Count(result[i], string(filepath.Separator)) <
+			strings.Count(result[j], string(filepath.Separator))
 	})
-
-	// Keep only paths that aren't covered by an ancestor
-	var result []string
-	for _, p := range pathList {
-		covered := false
-		for _, parent := range result {
-			if strings.HasPrefix(p, parent+string(filepath.Separator)) || p == parent {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			result = append(result, p)
-		}
-	}
-
-	if result == nil {
-		result = []string{}
-	}
-
 	return result
+}
+
+// truncatePathDepth truncates an absolute path to at most maxDepth segments.
+func truncatePathDepth(path string, maxDepth int) string {
+	parts := strings.Split(path, string(filepath.Separator))
+	if len(parts) <= maxDepth {
+		return path
+	}
+	truncated := strings.Join(parts[:maxDepth], string(filepath.Separator))
+	if truncated == "" {
+		return string(filepath.Separator)
+	}
+	return truncated
 }
 
 // --- Helper functions ---

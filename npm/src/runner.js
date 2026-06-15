@@ -278,7 +278,7 @@ export async function run(config, options = {}) {
   });
 
   // Parse structured output from stdout
-  const { fsDiff, learnedPolicy, crypto, profile, cleanStdout } = parseStructuredOutput(stdout);
+  const { fsDiff, learnedPolicy, crypto, dryRun, profile, cleanStdout } = parseStructuredOutput(stdout);
 
   // Parse audit log entries from stderr when enabled
   let auditLog = null;
@@ -295,6 +295,7 @@ export async function run(config, options = {}) {
     ...(fsDiff !== null && { fsDiff }),
     ...(learnedPolicy !== null && { learnedPolicy }),
     ...(crypto !== null && { crypto }),
+    ...(dryRun !== null && { dryRun }),
     ...(profile !== null && { profile }),
   };
 }
@@ -309,12 +310,13 @@ export async function run(config, options = {}) {
  * - "PROFILE:" followed by the generated Seatbelt profile text
  *
  * @param {string} stdout - Raw stdout from the Go binary
- * @returns {{ fsDiff: object|null, learnedPolicy: object|null, crypto: object|null, profile: string|null, cleanStdout: string }}
+ * @returns {{ fsDiff: object|null, learnedPolicy: object|null, crypto: object|null, dryRun: object|null, profile: string|null, cleanStdout: string }}
  */
 export function parseStructuredOutput(stdout) {
   let fsDiff = null;
   let learnedPolicy = null;
   let crypto = null;
+  let dryRun = null;
   let profile = null;
   const lines = stdout.split('\n');
   const cleanLines = [];
@@ -338,6 +340,12 @@ export function parseStructuredOutput(stdout) {
       } catch {
         cleanLines.push(line);
       }
+    } else if (line.startsWith('DRYRUN:')) {
+      try {
+        dryRun = JSON.parse(line.slice(7));
+      } catch {
+        cleanLines.push(line);
+      }
     } else if (line.startsWith('PROFILE:')) {
       profile = line.slice(8);
     } else if (profile !== null) {
@@ -352,6 +360,7 @@ export function parseStructuredOutput(stdout) {
     fsDiff,
     learnedPolicy,
     crypto,
+    dryRun,
     profile,
     cleanStdout: cleanLines.join('\n'),
   };
@@ -421,10 +430,11 @@ export function readStructuredFile(filePath) {
   let fsDiff = null;
   let learnedPolicy = null;
   let crypto = null;
+  let dryRun = null;
   let profile = null;
 
   if (!existsSync(filePath)) {
-    return { fsDiff, learnedPolicy, crypto, profile };
+    return { fsDiff, learnedPolicy, crypto, dryRun, profile };
   }
 
   try {
@@ -444,6 +454,10 @@ export function readStructuredFile(filePath) {
         try {
           crypto = JSON.parse(line.slice(7));
         } catch {}
+      } else if (line.startsWith('DRYRUN:')) {
+        try {
+          dryRun = JSON.parse(line.slice(7));
+        } catch {}
       } else if (line.startsWith('PROFILE:')) {
         profile = line.slice(8);
       } else if (profile !== null && line) {
@@ -454,7 +468,7 @@ export function readStructuredFile(filePath) {
     // Silently ignore file read errors, return whatever we parsed
   }
 
-  return { fsDiff, learnedPolicy, crypto, profile };
+  return { fsDiff, learnedPolicy, crypto, dryRun, profile };
 }
 
 /**
@@ -615,6 +629,7 @@ export async function runPipe(config, options = {}) {
       let fsDiff = null;
       let learnedPolicy = null;
       let crypto = null;
+      let dryRun = null;
       let profile = null;
 
       // Parse structured output from the temporary file if it was created
@@ -623,6 +638,7 @@ export async function runPipe(config, options = {}) {
         fsDiff = parsed.fsDiff;
         learnedPolicy = parsed.learnedPolicy;
         crypto = parsed.crypto;
+        dryRun = parsed.dryRun;
         profile = parsed.profile;
       }
 
@@ -644,6 +660,7 @@ export async function runPipe(config, options = {}) {
         fsDiff,
         learnedPolicy,
         crypto,
+        dryRun,
         profile,
         auditLog,
       });

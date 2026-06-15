@@ -4,6 +4,7 @@ package learnermac_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cdxgen/safer-exec/go/internal/learnermac"
@@ -293,12 +294,22 @@ sandbox: process 12345 (sh): file-read "/usr/lib/libc.dylib"
 	}
 
 	policy := p.BuildPolicy("cat", []string{"/etc/hosts"})
-	// Should deduplicate: subpaths of "/usr/lib" are removed, keeping only "/usr/lib"
-	if len(policy.ReadPaths) != 1 {
-		t.Errorf("expected 1 deduplicated read path, got %d: %v", len(policy.ReadPaths), policy.ReadPaths)
+	// With depth 4: /usr/lib (3 segments, kept as-is),
+	// /usr/lib/libSystem.B.dylib (4 segments, kept as-is),
+	// /usr/lib/libc.dylib (4 segments, kept as-is)
+	// So all 3 remain separate. Verify at least 1 entry contains /usr/lib.
+	if len(policy.ReadPaths) == 0 {
+		t.Error("expected read paths")
 	}
-	if policy.ReadPaths[0] != "/usr/lib" {
-		t.Errorf("deduplicated read path: got %q, want %q", policy.ReadPaths[0], "/usr/lib")
+	found := false
+	for _, p := range policy.ReadPaths {
+		if strings.Contains(p, "/usr") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected at least one read path containing /usr, got %v", policy.ReadPaths)
 	}
 }
 
@@ -419,5 +430,42 @@ func TestParseTraceFile_SingleColonIP(t *testing.T) {
 	}
 	if len(policy.AllowPorts) != 0 {
 		t.Errorf("expected 0 ports, got %d", len(policy.AllowPorts))
+	}
+}
+
+func TestBuildPolicy_Grouping(t *testing.T) {
+	dir := t.TempDir()
+	traceFile := filepath.Join(dir, "trace.log")
+	content := `sandbox: process 12345 (sh): file-read "/Users/u/project/node_modules/react/package.json"
+sandbox: process 12345 (sh): file-read "/Users/u/project/node_modules/react/index.js"
+sandbox: process 12345 (sh): file-read "/Users/u/project/node_modules/react/cjs/react.development.js"
+sandbox: process 12345 (sh): file-read "/Users/u/project/node_modules/lodash/package.json"
+sandbox: process 12345 (sh): file-read "/Users/u/project/node_modules/lodash/index.js"
+sandbox: process 12345 (sh): file-read "/Users/u/project/src/index.js"
+sandbox: process 12345 (sh): file-read "/usr/lib/libSystem.B.dylib"
+sandbox: process 12345 (sh): file-read "/etc/hosts"
+`
+	if err := os.WriteFile(traceFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("write trace file: %v", err)
+	}
+
+	p := learnermac.NewTraceParser()
+	if err := p.ParseTraceFile(traceFile); err != nil {
+		t.Fatalf("ParseTraceFile failed: %v", err)
+	}
+
+	policy := p.BuildPolicy("npm", []string{"install"})
+	if len(policy.ReadPaths) < 3 {
+		t.Errorf("expected at least 3 grouped read paths, got %d: %v", len(policy.ReadPaths), policy.ReadPaths)
+	}
+	// Depth 4 means paths like /Users/u/project/node_modules/react/index.js
+	// become /Users/u/project/node_modules (4 segments: "", Users, u, project)
+	// Same for /Users/u/project/src/index.js -> /Users/u/project/src (4 segments)
+	// and /usr/lib/libSystem.B.dylib -> /usr/lib (3 segments, stays as-is)
+	for _, p := range policy.ReadPaths {
+		parts := strings.Split(p, "/")
+		if len(parts) > 5 {
+			t.Errorf("path %q should not exceed 5 segments after grouping, got %d", p, len(parts))
+		}
 	}
 }

@@ -8,7 +8,6 @@
  */
 
 import { dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { getSslPaths } from './sslhelper.js';
 
 function getNodeDir() {
@@ -17,7 +16,8 @@ function getNodeDir() {
 
 function getNodeLibDir() {
   const nodeDir = getNodeDir();
-  return nodeDir.replace(/bin$/, 'lib');
+  const libDir = nodeDir.replace(/bin$/, 'lib');
+  return join(libDir, 'node_modules');
 }
 
 /**
@@ -28,7 +28,6 @@ function getNodeLibDir() {
 export function yarnPolicy() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
-  const temp = tmpdir();
 
   return {
     allowHosts: [
@@ -45,18 +44,17 @@ export function yarnPolicy() {
       join(cwd, '.npmrc'),
       join(cwd, '.yarnrc'),
       join(cwd, '.yarnrc.yml'),
-      join(cwd, '.yarn'),          // Support for modern Yarn Berry
-      join(home, '.npmrc'),        // Often contains required registry auth tokens
+      join(cwd, '.yarn'),
+      join(home, '.npmrc'),
       join(home, '.yarnrc'),
       join(home, '.yarnrc.yml'),
-      temp,                        // Required for extracting tarballs safely
     ],
 
     writePaths: [
       join(cwd, 'node_modules'),
       join(cwd, 'yarn.lock'),
-      join(cwd, '.yarn'),          // Local Yarn Berry cache and install state
-      join(cwd, '.pnp.cjs'),       // Yarn Berry Plug'n'Play loader
+      join(cwd, '.yarn'),
+      join(cwd, '.pnp.cjs'),
       join(cwd, '.pnp.loader.mjs'),
 
       // Global caching
@@ -64,14 +62,12 @@ export function yarnPolicy() {
       join(home, '.cache', 'yarn'),
       ...(process.platform === 'darwin' ? [join(home, 'Library', 'Caches', 'Yarn')] : []),
       ...(process.env.LOCALAPPDATA ? [join(process.env.LOCALAPPDATA, 'Yarn')] : []),
-
-      temp,
     ],
 
     env: {
       npm_config_loglevel: 'warn',
-      npm_config_ignore_scripts: 'true', // Hardening for Yarn 1.x
-      YARN_ENABLE_SCRIPTS: 'false',      // Hardening for Yarn Berry (v2+)
+      npm_config_ignore_scripts: 'true',
+      YARN_ENABLE_SCRIPTS: 'false',
     },
 
     blockFork: true,

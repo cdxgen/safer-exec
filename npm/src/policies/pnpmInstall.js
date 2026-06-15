@@ -7,7 +7,9 @@
  * @module policies/pnpmInstall
  */
 
+import { join } from 'node:path';
 import { pnpmPolicy } from './pnpm.js';
+import { getSslPaths } from './sslhelper.js';
 
 /**
  * Return the PNPM install policy configuration.
@@ -18,16 +20,11 @@ export function pnpmInstallPolicy() {
   const base = pnpmPolicy();
   const cwd = process.cwd();
 
-  // Extend readPaths with standard system paths and full project directory read access
   const readPaths = new Set([
     ...base.readPaths,
     cwd,
-    '/usr',
-    '/opt',
-    '/etc',
   ]);
 
-  // Extend writePaths with full project directory write access
   const writePaths = new Set([
     ...base.writePaths,
     cwd,

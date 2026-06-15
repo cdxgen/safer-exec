@@ -13,6 +13,7 @@
  */
 
 import { dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { getSslPaths } from './sslhelper.js';
 
 function getNodeDir() {
@@ -21,7 +22,8 @@ function getNodeDir() {
 
 function getNodeLibDir() {
   const nodeDir = getNodeDir();
-  return nodeDir.replace(/bin$/, 'lib');
+  const libDir = nodeDir.replace(/bin$/, 'lib');
+  return join(libDir, 'node_modules');
 }
 
 export function npmPolicy() {
@@ -32,7 +34,6 @@ export function npmPolicy() {
     allowHosts: [
       'registry.npmjs.org',
       'registry.yarnpkg.com',
-      // 'cdn.jsdelivr.net', // Removed: Reduce surface. Usually not needed for strict dependency resolution.
     ],
 
     readPaths: [
@@ -58,8 +59,6 @@ export function npmPolicy() {
 
     env: {
       npm_config_loglevel: 'warn',
-      // CRITICAL DEFENSE IN DEPTH: Natively instruct package managers to skip execution,
-      // preventing sandbox crash loops or deadlock hangs when fork is blocked.
       npm_config_ignore_scripts: 'true',
       npm_config_audit: 'false',
       npm_config_fund: 'false',
@@ -67,11 +66,7 @@ export function npmPolicy() {
       npm_config_telemetry: 'false',
     },
 
-    /** Block all forking to strictly prevent OS-level shell spawning */
     blockFork: true,
-    // '*' blocks SYS_EXECVE via seccomp for child processes.
-    // Compiler names block the initial command in execCommand (covers reduced-isolation mode
-    // where there is no filesystem namespace to prevent gcc/clang from being invoked directly).
     blockExec: ['*', 'gcc', 'g++', 'clang', 'clang++', 'cc', 'c++', 'ld', 'as', 'make', 'cmake', 'ninja'],
   };
 }

@@ -9,7 +9,6 @@
  */
 
 import { dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { realpathSync } from 'node:fs';
 import { getSslPaths } from './sslhelper.js';
 import { getPnpmPaths } from './pnpm.js';
@@ -24,7 +23,8 @@ function getNodeDir() {
 
 function getNodeLibDir() {
   const nodeDir = getNodeDir();
-  return nodeDir.replace(/bin$/, 'lib');
+  const libDir = nodeDir.replace(/bin$/, 'lib');
+  return join(libDir, 'node_modules');
 }
 
 /**
@@ -35,7 +35,6 @@ function getNodeLibDir() {
 export function cdxgenPolicy() {
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const cwd = process.cwd();
-  const temp = tmpdir();
 
   return {
     // 1. NETWORK RESTRICTIONS
@@ -49,7 +48,7 @@ export function cdxgenPolicy() {
       'proxy.golang.org',
       'goproxy.io',
     ],
-    allowLoopback: true,      // Allow local localhost binding/connecting
+    allowLoopback: true,
 
     // 2. READ PATHS
     readPaths: [
@@ -63,20 +62,17 @@ export function cdxgenPolicy() {
       join(home, '.cargo'),
       join(home, '.npm'),
       join(home, '.config', 'pnpm'),
-      '/usr',
-      '/opt',
-      '/etc',
       ...getPnpmPaths(),
     ],
 
     // 3. WRITE PATHS
     writePaths: [
       cwd,
-      temp,
       join(home, '.npm'),
       join(home, '.gradle'),
       join(home, '.cargo'),
-      join(home, '.cache'),
+      join(home, '.cache', 'pip'),
+      join(home, '.cache', 'ms-playwright'),
     ],
 
     // 4. ENVIRONMENT CONTROLS
@@ -85,8 +81,8 @@ export function cdxgenPolicy() {
     },
 
     // 5. EXECUTION CONTROLS
-    blockFork: false,          // Needs to spawn package managers
-    blockExec: [],             // Allow execution of child processes (mvn, gradle, npm, pip, go, cargo, etc.)
+    blockFork: false,
+    blockExec: [],
   };
 }
 
