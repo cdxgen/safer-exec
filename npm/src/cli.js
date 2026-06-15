@@ -871,6 +871,12 @@ async function main() {
       process.stderr.write('[safer-exec] Error: bootstrap-apparmor command requires root/sudo privileges.\n');
       process.exit(1);
     }
+    const resolvedPath = resolveBinaryPath();
+    const binaryPath = (resolvedPath && resolvedPath !== 'safer-exec-rt') ? resolvedPath : '/usr/local/bin/safer-exec-rt';
+    if (!existsSync(binaryPath)) {
+      process.stderr.write(`[safer-exec] Warning: The binary at ${binaryPath} does not exist. Skipping AppArmor profile creation.\n`);
+      process.exit(0);
+    }
     const profilePath = '/etc/apparmor.d/safer-exec';
     const profileContent = `
 # AppArmor profile for safer-exec — grants permission to create
@@ -878,7 +884,7 @@ async function main() {
 abi <abi/4.0>,
 include <tunables/global>
 
-profile safer-exec /usr/local/bin/safer-exec-rt flags=(unconfined) {
+profile safer-exec ${binaryPath} flags=(unconfined) {
   userns,
 }
 `;
