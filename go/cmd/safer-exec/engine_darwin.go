@@ -705,18 +705,28 @@ func buildLearnProfile(cfg config.ExecConfig, tracePath string) string {
 
 // setResourceLimits applies RLIMIT quotas for memory, CPU, and process count.
 func setResourceLimits(cfg config.ExecConfig) error {
-	// RLIMIT_AS: Memory limit (address space)
+	// RLIMIT_AS: Memory limit (address space).
 	if cfg.MaxMemoryMB > 0 {
-		bytes := uint64(cfg.MaxMemoryMB * 1024 * 1024)
+		const rlimInfinity = ^uint64(0)
+		want := uint64(cfg.MaxMemoryMB) * 1024 * 1024
+		// Clamp the requested cap DOWN to the inherited hard limit when that
+		// hard limit is finite and lower — an unprivileged process cannot raise
+		// it. We must never raise `want` up to the (typically unlimited) current
+		// limit, which would silently disable the cap entirely.
 		var current syscall.Rlimit
-		if err := syscall.Getrlimit(rlimitAS, &current); err == nil && current.Max > 0 {
-			if bytes < current.Cur {
-				bytes = current.Cur
+		if err := syscall.Getrlimit(rlimitAS, &current); err == nil {
+			if current.Max != rlimInfinity && uint64(current.Max) != 0 && want > uint64(current.Max) {
+				want = uint64(current.Max)
 			}
 		}
-		limit := syscall.Rlimit{Cur: bytes, Max: bytes}
+		limit := syscall.Rlimit{Cur: want, Max: want}
 		if err := syscall.Setrlimit(rlimitAS, &limit); err != nil {
-			return fmt.Errorf("RLIMIT_AS: %w", err)
+			// macOS does not reliably enforce RLIMIT_AS and may reject the call
+			// with EINVAL. Treat this as best-effort: warn that the cap could not
+			// be applied rather than silently leaving memory unbounded (the prior
+			// behavior raised the request up to the unlimited soft limit, which
+			// disabled the cap without any indication).
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: could not apply memory limit (RLIMIT_AS): %v — memory will not be capped on this host\n", err)
 		}
 	}
 
@@ -940,11 +950,41 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		sb.WriteString("(deny file-write* (regex #\"/\\.[^/]+\"))\n")
 	}
 
+	// The default system read paths above (/Library, /private/var, /private/etc)
+	// are broad so that ordinary tooling can resolve DNS, load frameworks, and
+	// read CA certificates. Several well-known locations under those trees hold
+	// credentials and are never legitimately needed by a build or package
+	// install, so they are denied here regardless of AllowHidden. Seatbelt uses
+	// last-match-wins semantics, so these denies override the earlier allows.
+	// For stricter confinement, pass explicit readPaths instead of relying on
+	// the defaults.
+	sensitiveReadDenies := []string{
+		"/Library/Keychains",         // system keychain (e.g. System.keychain)
+		"/private/var/db/dslocal",    // local directory service / shadow hashes
+		"/private/etc/master.passwd", // shadow password file
+		"/private/var/db/sudo",       // sudo timestamp store
+		"/private/var/db/ConfigurationProfiles",
+	}
+	if home := os.Getenv("HOME"); home != "" {
+		sensitiveReadDenies = append(sensitiveReadDenies,
+			filepath.Join(home, "Library/Keychains"),                         // login keychain (login.keychain-db)
+			filepath.Join(home, "Library/Cookies"),                           // saved cookies
+			filepath.Join(home, "Library/Application Support/com.apple.TCC"), // TCC consent db
+			filepath.Join(home, "Library/Application Support/Google/Chrome"),
+			filepath.Join(home, "Library/Application Support/Firefox"),
+		)
+	}
+	for _, p := range sensitiveReadDenies {
+		sb.WriteString(fmt.Sprintf("(deny file-read* (subpath %q))\n", p))
+		sb.WriteString(fmt.Sprintf("(deny file-write* (subpath %q))\n", p))
+	}
+
 	// Network rules
 	resolvedIPs := cfg.AllowIPs
 	if len(cfg.AllowHosts) > 0 {
 		resolvedIPs = append(resolvedIPs, resolveIPs(cfg.AllowHosts)...)
 	}
+	resolvedIPs = dedupeStrings(resolvedIPs)
 
 	// Network binding / listening rules (blocked by default, even on loopback)
 	for _, listenStr := range cfg.AllowListen {
@@ -960,29 +1000,49 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		sb.WriteString("(allow network-outbound (remote ip \"localhost:*\"))\n")
 	}
 
+	// macOS Seatbelt cannot express a remote-IP allowlist: its (remote ip ...)
+	// filter only accepts "*" or "localhost" as the host, so egress can be
+	// confined by port but not pinned to specific hosts. When the caller supplies
+	// allowHosts/allowIPs they intend host pinning, which Seatbelt cannot honor.
+	// Rather than silently allowing all hosts, we (a) restrict egress to the
+	// requested ports (defaulting to the standard web ports) instead of falling
+	// through to an unrestricted allow, and (b) emit a clear warning so the
+	// operator knows host pinning is not enforced on this platform. Pin egress by
+	// host on Linux (Landlock/eBPF) or run with disableNetwork on macOS.
+	hostPinningRequested := len(resolvedIPs) > 0
+	if hostPinningRequested {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: macOS Seatbelt cannot restrict egress to specific IPs/hosts; egress is confined to the allowed ports only. Any host is reachable on those ports. Use disableNetwork for stricter isolation on macOS.\n")
+	}
+
+	writeOutboundRules := func() {
+		ports := cfg.AllowPorts
+		if hostPinningRequested && len(ports) == 0 {
+			ports = []int{80, 443}
+		}
+		if len(ports) > 0 {
+			for _, port := range ports {
+				sb.WriteString(fmt.Sprintf("(allow network-outbound (remote ip \"*:%d\"))\n", port))
+			}
+			return
+		}
+		sb.WriteString("(allow network-outbound)\n")
+	}
+
 	if cfg.DisableNetwork {
 		sb.WriteString("(deny network-outbound)\n")
 		// Re-allow loopback outbound specifically if loopback is permitted
 		if cfg.AllowLoopback {
 			sb.WriteString("(allow network-outbound (remote ip \"localhost:*\"))\n")
 		}
-		if len(cfg.AllowPorts) > 0 {
-			for _, port := range cfg.AllowPorts {
-				sb.WriteString(fmt.Sprintf("(allow network-outbound (remote ip \"*:%d\"))\n", port))
-			}
-		} else {
-			if cfg.EnableAudit {
-				sb.WriteString("(trace network-outbound)\n")
-			}
+		// With the network disabled, only the explicitly requested ports are
+		// re-allowed. If nothing is requested there is nothing to re-allow.
+		if hostPinningRequested || len(cfg.AllowPorts) > 0 {
+			writeOutboundRules()
+		} else if cfg.EnableAudit {
+			sb.WriteString("(trace network-outbound)\n")
 		}
 	} else {
-		if len(cfg.AllowPorts) > 0 {
-			for _, port := range cfg.AllowPorts {
-				sb.WriteString(fmt.Sprintf("(allow network-outbound (remote ip \"*:%d\"))\n", port))
-			}
-		} else {
-			sb.WriteString("(allow network-outbound)\n")
-		}
+		writeOutboundRules()
 	}
 
 	if cfg.EnableAudit {
@@ -992,6 +1052,23 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	}
 
 	return sb.String()
+}
+
+// dedupeStrings returns the input with duplicate entries removed, preserving
+// first-seen order.
+func dedupeStrings(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // hasWildcard checks if a slice contains the "*" wildcard.

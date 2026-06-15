@@ -34,3 +34,14 @@ const (
 	sysMEMBARRIER_unified = 283
 	sysOPENAT2_unified    = 437
 )
+
+// seccompAuditArch is the AUDIT_ARCH_* value the seccomp filter pins the
+// process to. On arm64 this is AUDIT_ARCH_AARCH64 (EM_AARCH64 0xB7 |
+// __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE = 0xC00000B7). Any syscall arriving with
+// a different arch (e.g. the 32-bit ARM compat gate, AUDIT_ARCH_ARM 0x40000028)
+// is rejected, closing the compat-ABI seccomp bypass.
+const seccompAuditArch = 0xC00000B7
+
+// seccompX32SyscallBit is zero on arm64: there is no x32-style ABI, so no
+// per-number masking is required (the arch check covers the 32-bit compat gate).
+const seccompX32SyscallBit = 0

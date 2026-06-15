@@ -57,10 +57,24 @@ const (
 )
 
 const (
-	seccompRetKill  = 0x00000000
-	seccompRetTrap  = 0x00030000
-	seccompRetErrno = 0x00050000
-	seccompRetAllow = 0x7fff0000
+	seccompRetKill        = 0x00000000
+	seccompRetKillProcess = 0x80000000 // SECCOMP_RET_KILL_PROCESS: terminate the whole process group
+	seccompRetTrap        = 0x00030000
+	seccompRetErrno       = 0x00050000
+	seccompRetAllow       = 0x7fff0000
+)
+
+// Clone flag constants used by the seccomp clone()/clone3() flag inspection.
+const (
+	cloneNewNSFlag   = 0x00020000 // CLONE_NEWNS: new mount namespace
+	cloneNewUserFlag = 0x10000000 // CLONE_NEWUSER: new user namespace
+)
+
+// seccompData field offsets (struct seccomp_data) used by the BPF program.
+const (
+	seccompDataNROffset   = 0  // int nr
+	seccompDataArchOffset = 4  // __u32 arch
+	seccompDataArg0Offset = 16 // __u64 args[0] (low 32 bits at offset 16 on LE)
 )
 
 const sysSeccomp = sysSeccomp_unified
@@ -102,6 +116,50 @@ func writeStructured(cfg config.ExecConfig, marker string, data []byte) {
 	fmt.Print(line)
 }
 
+// trustedSystemDirs are the standard absolute locations for core system
+// utilities. Helper binaries that safer-exec runs before the sandbox is
+// established (unshare, ip) are resolved only from these directories.
+var trustedSystemDirs = []string{"/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+
+// lookTrustedTool resolves a system helper to an absolute path from a fixed set
+// of standard directories, deliberately ignoring $PATH. These helpers run before
+// the sandbox exists and with the launching user's privileges, so resolving them
+// via the inherited PATH would let a caller that prepends an attacker-controlled
+// directory (e.g. a CI job with "./node_modules/.bin" or "." on PATH) substitute
+// a malicious "unshare"/"ip" and gain pre-sandbox code execution. The candidate
+// must be a regular file (after symlink resolution) that is not group- or
+// world-writable. Returns "" when no suitable binary is found.
+func lookTrustedTool(name string) string {
+	// Reject anything that is not a bare tool name.
+	if name == "" || strings.ContainsRune(name, '/') {
+		return ""
+	}
+	for _, dir := range trustedSystemDirs {
+		p := filepath.Join(dir, name)
+		st, err := os.Stat(p) // follows symlinks
+		if err != nil || !st.Mode().IsRegular() {
+			continue
+		}
+		if st.Mode().Perm()&0o022 != 0 {
+			// Group- or world-writable system binary: do not trust it.
+			continue
+		}
+		return p
+	}
+	return ""
+}
+
+// unshareTool returns the absolute path to a trusted `unshare`, or "unshare" as
+// a last resort on exotic systems where it is not in a standard directory. The
+// fallback preserves functionality without making PATH hijacking any easier than
+// the historical behavior, and the common case is fully pinned.
+func unshareTool() string {
+	if p := lookTrustedTool("unshare"); p != "" {
+		return p
+	}
+	return "unshare"
+}
+
 // isUserNamespaceRestricted returns true when the kernel or security policy
 // prevents unprivileged processes from creating user namespaces. Covers the
 // three common Linux mechanisms:
@@ -109,7 +167,7 @@ func writeStructured(cfg config.ExecConfig, marker string, data []byte) {
 //   - Debian/some-kernel explicit disable (unprivileged_userns_clone)
 //   - Kernel compiled with user namespaces disabled (max_user_namespaces = 0)
 func isUserNamespaceRestricted() bool {
-	cmd := exec.Command("unshare", "-U", "-r", "/bin/true")
+	cmd := exec.Command(unshareTool(), "-U", "-r", "/bin/true")
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	return cmd.Run() != nil
@@ -119,7 +177,7 @@ func isUserNamespaceRestricted() bool {
 // the given flag (e.g., "-t" for time namespace, "-i" for IPC namespace).
 // Returns true if `unshare <flag> /bin/true` succeeds.
 func isUnshareFlagSupported(flag string) bool {
-	cmd := exec.Command("unshare", flag, "/bin/true")
+	cmd := exec.Command(unshareTool(), flag, "/bin/true")
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	return cmd.Run() == nil
@@ -293,7 +351,7 @@ func run(cfg config.ExecConfig) error {
 	} else {
 		envVar = fmt.Sprintf("SAFER_EXEC_CONFIG=%s", string(cfgJSON))
 	}
-	cmd := exec.Command("unshare", unshareArgs...)
+	cmd := exec.Command(unshareTool(), unshareArgs...)
 	cmd.Env = append(config.FilteredEnviron(), envVar)
 	if cfg.EnableAudit {
 		cmd.Env = append(cmd.Env, "SAFER_EXEC_AUDIT_FD=3")
@@ -949,6 +1007,16 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: --diff requires mount namespace isolation; skipped in reduced isolation mode\n")
 	}
 
+	// Provision the library-tracing helper directory here in the parent, which
+	// survives to reap the child. The child execs and therefore cannot run its
+	// own cleanup, so doing it here ensures the extracted helper is removed after
+	// the run instead of leaking. The child sees TraceTempDir via the re-marshaled
+	// config and reuses it rather than creating its own.
+	defer provisionAuditHelperDir(&cfg)()
+	if cj, mErr := json.Marshal(cfg); mErr == nil {
+		cfgJSON = cj
+	}
+
 	var auditR, auditW *os.File
 	if cfg.EnableAudit {
 		var err error
@@ -1104,6 +1172,15 @@ func runInitReduced(cfg config.ExecConfig) error {
 		defer cleanupCgroupV1(v1Paths)
 	}
 
+	// Provision the library-tracing helper directory before Landlock so the
+	// extraction target (used later in prepareExecEnv) is an allowed write path.
+	defer provisionAuditHelperDir(&cfg)()
+
+	// Landlock restrict_self requires no_new_privs when the process is
+	// unprivileged (reduced-isolation mode has no user namespace / CAP_SYS_ADMIN),
+	// so it must be set before any Landlock call rather than later in applySeccomp.
+	setNoNewPrivs()
+
 	if err := applyLandlockNetwork(cfg); err != nil {
 		if cfg.Strict {
 			return fmt.Errorf("landlock network: %w", err)
@@ -1156,10 +1233,14 @@ func runInit(cfg config.ExecConfig) error {
 	// Clear audit FD env var to prevent child processes from discovering it
 	os.Unsetenv("SAFER_EXEC_AUDIT_FD")
 
-	// Bring up loopback interface if network is disabled but loopback is allowed (Bug #7)
+	// Bring up loopback interface if network is disabled but loopback is allowed.
+	// Resolve `ip` from trusted system directories rather than $PATH so a hijacked
+	// PATH cannot substitute a malicious binary; skip silently if unavailable.
 	if cfg.DisableNetwork && cfg.AllowLoopback {
-		cmd := exec.Command("ip", "link", "set", "lo", "up")
-		_ = cmd.Run()
+		if ipPath := lookTrustedTool("ip"); ipPath != "" {
+			cmd := exec.Command(ipPath, "link", "set", "lo", "up")
+			_ = cmd.Run()
+		}
 	}
 
 	cgroupPath, v1Paths, err := setupCgroup(cfg)
@@ -1226,6 +1307,11 @@ func runInit(cfg config.ExecConfig) error {
 			}
 		}
 	}
+
+	// Set no_new_privs before applying Landlock so restrict_self succeeds even on
+	// kernels/configurations where the namespaced root lacks the needed privilege;
+	// it is also a precondition for the seccomp filter applied later.
+	setNoNewPrivs()
 
 	if err := applyLandlockNetwork(cfg); err != nil {
 		if cfg.Strict {
@@ -1361,6 +1447,32 @@ func runWithReaper(cfg config.ExecConfig) int {
 	return exitCode
 }
 
+// provisionAuditHelperDir prepares a writable location for the precompiled
+// LD_AUDIT library-tracing helper in reduced-isolation mode. The helper is
+// extracted at exec time (in prepareExecEnv), which runs AFTER the Landlock
+// filesystem ruleset is installed, so its target directory must be an allowed
+// write path or the extraction is denied. When tracing needs the helper and no
+// explicit TraceTempDir was provided, this creates a bespoke temp directory
+// under the system temp location (guaranteed writable), records it in
+// TraceTempDir so it is used first, and adds it to WritePaths so Landlock
+// permits writing the helper into it. It is the reduced-mode counterpart to the
+// exec-capable tmpfs that runInit mounts in full-isolation mode. Returns a
+// cleanup function (always non-nil).
+func provisionAuditHelperDir(cfg *config.ExecConfig) func() {
+	noop := func() {}
+	if !cfg.TraceLibraries || cfg.TraceTempDir != "" || isMusl() || !hasPrecompiledSo || len(auditHelperSo) == 0 {
+		return noop
+	}
+	dir, err := os.MkdirTemp("", "safer-exec-ld-audit-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: trace-libraries: could not create helper temp dir (continuing without library tracing): %v\n", err)
+		return noop
+	}
+	cfg.TraceTempDir = dir
+	cfg.WritePaths = append(cfg.WritePaths, dir)
+	return func() { os.RemoveAll(dir) }
+}
+
 // prepareExecEnv builds the final execution environment from the config:
 // resolves the command path, checks blockExec, constructs the env (including
 // LD_AUDIT injection for TraceLibraries), and returns a cleanup function.
@@ -1374,8 +1486,12 @@ func prepareExecEnv(cfg config.ExecConfig) (cmdPath string, argv []string, env [
 			return "", nil, nil, noop, fmt.Errorf("command %s is blocked by blockExec policy", cfg.Cmd)
 		}
 	}
-	cmdPath, err = exec.LookPath(cfg.Cmd)
-	if err != nil {
+	// Command resolution is best-effort: an unresolved command falls back to the
+	// raw name (the kernel will report ENOENT at exec time). This is not a setup
+	// failure, so the lookup error must not propagate as a fatal error.
+	if resolved, lookErr := exec.LookPath(cfg.Cmd); lookErr == nil {
+		cmdPath = resolved
+	} else {
 		cmdPath = cfg.Cmd
 	}
 	env = config.BuildEnv(cfg.Env)
@@ -1386,27 +1502,48 @@ func prepareExecEnv(cfg config.ExecConfig) (cmdPath string, argv []string, env [
 			var soPath string
 			if hasPrecompiledSo && len(auditHelperSo) > 0 {
 				var candidates []string
+				// 1. Explicit override. In full-isolation mode the engine mounts a
+				//    dedicated exec-capable tmpfs and points TraceTempDir at it,
+				//    because the sandbox root tmpfs is MS_NOEXEC and the dynamic
+				//    linker must mmap(PROT_EXEC) the helper.
 				if cfg.TraceTempDir != "" {
 					candidates = append(candidates, cfg.TraceTempDir)
 				}
+				// 2. A bespoke temp directory created fresh under the system temp
+				//    location (os.TempDir(), honoring $TMPDIR, default /tmp). Passing
+				//    "" makes os.MkdirTemp create a unique 0700 directory there, which
+				//    is guaranteed writable. This is the primary target in
+				//    reduced-isolation mode, where no dedicated mount exists and the
+				//    working directory / cwd may be read-only (e.g. CI runners).
+				candidates = append(candidates, "")
+				// 3. CI-provided temp locations, used only if the system temp dir is
+				//    somehow unavailable.
 				envVars := []string{"RUNNER_TEMP", "WORKSPACE_TMP", "CI_PROJECT_DIR", "BITBUCKET_CLONE_DIR", "CCI_TEMP_DIR", "TMPDIR", "TEMP", "TMP"}
 				for _, ev := range envVars {
 					if val := os.Getenv(ev); val != "" {
 						candidates = append(candidates, val)
 					}
 				}
+				// 4. Working directory / cwd as last resorts.
 				if cfg.WorkingDir != "" {
 					candidates = append(candidates, cfg.WorkingDir)
 				}
 				candidates = append(candidates, ".")
+				// Library tracing is an observability feature, not a confinement
+				// control. The bespoke temp directory above should always succeed;
+				// if every candidate somehow fails we degrade gracefully and run
+				// without tracing rather than failing the sandboxed command.
+				// extractErr is kept local so it never leaks into the fatal return.
+				var extractErr error
 				for _, dir := range candidates {
-					soPath, err = extractPrecompiledAuditHelper(dir)
-					if err == nil {
+					soPath, extractErr = extractPrecompiledAuditHelper(dir)
+					if extractErr == nil {
 						break
 					}
 				}
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: failed to extract precompiled helper: %v\n", err)
+				if extractErr != nil {
+					fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: failed to extract precompiled helper (continuing without library tracing): %v\n", extractErr)
+					soPath = ""
 				} else {
 					fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: using precompiled helper -> %s\n", soPath)
 				}
@@ -1429,7 +1566,9 @@ func prepareExecEnv(cfg config.ExecConfig) (cmdPath string, argv []string, env [
 		}
 	}
 	argv = append([]string{cfg.Cmd}, cfg.Args...)
-	return
+	// Only genuine setup failures (e.g. a blockExec match, handled above) are
+	// fatal; reaching here means preparation succeeded.
+	return cmdPath, argv, env, cleanup, nil
 }
 
 // closeChildFds closes all file descriptors above stderr (fd 2) using only
@@ -1952,6 +2091,33 @@ func bindMountFd(fd int, target string, readOnly bool) error {
 	return nil
 }
 
+// unescapeMountField decodes the octal escape sequences the kernel uses for
+// whitespace and backslashes in /proc/self/mountinfo fields (space -> \040,
+// tab -> \011, newline -> \012, backslash -> \134). Without decoding, a mount
+// point whose path contains a space is compared in its escaped form against the
+// real configured path and never matches — silently skipping the read-only
+// remount of a submount. Returns the decoded path.
+func unescapeMountField(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) &&
+			s[i+1] >= '0' && s[i+1] <= '7' &&
+			s[i+2] >= '0' && s[i+2] <= '7' &&
+			s[i+3] >= '0' && s[i+3] <= '7' {
+			v := (int(s[i+1]-'0') << 6) | (int(s[i+2]-'0') << 3) | int(s[i+3]-'0')
+			b.WriteByte(byte(v))
+			i += 3
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
 // enforceAllSubmountsReadOnly reads /proc/self/mountinfo once and remounts
 // every submount under any of the given readPaths as read-only. This is a
 // batched replacement for per-path enforceSubmountReadOnly, avoiding quadratic
@@ -1973,7 +2139,7 @@ func enforceAllSubmountsReadOnly(readPaths []string) {
 		if len(fields) < 5 {
 			continue
 		}
-		mp := fields[4]
+		mp := unescapeMountField(fields[4])
 		if seen[mp] {
 			continue
 		}
@@ -2001,7 +2167,7 @@ func enforceSubmountReadOnly(target string) {
 		if len(fields) < 5 {
 			continue
 		}
-		mp := fields[4]
+		mp := unescapeMountField(fields[4])
 		if mp == target || strings.HasPrefix(mp, target+"/") {
 			syscall.Mount("", mp, "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY, "")
 		}
@@ -2045,10 +2211,13 @@ func finalizeFilesystem(newRoot string, cfg config.ExecConfig) error {
 
 	// First pivot_root: make the tmpfs newRoot the new filesystem root.
 	if err := syscall.PivotRoot(newRoot, putOld); err != nil {
-		if cfg.Strict {
-			return fmt.Errorf("pivot_root failed: %w", err)
+		// A chroot-based root is escapable and therefore not a safe substitute
+		// for pivot_root. Fail closed by default; only degrade to chroot when the
+		// caller has explicitly opted in via AllowChrootFallback.
+		if !cfg.AllowChrootFallback {
+			return fmt.Errorf("pivot_root failed: %w (set allowChrootFallback to degrade to escapable chroot, or fix namespace support)", err)
 		}
-		fmt.Fprintf(os.Stderr, "safer-exec: warning: pivot_root failed, falling back to chroot: %v\n", err)
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: pivot_root failed, falling back to ESCAPABLE chroot (allowChrootFallback enabled): %v\n", err)
 		_ = os.Chdir(newRoot)
 		_ = syscall.Chroot(".")
 		_ = os.Chdir("/")
@@ -2541,17 +2710,17 @@ func resolveHosts(hosts []string) []string {
 	return result
 }
 
-func applySeccomp(cfg config.ExecConfig) error {
-	// Prevent unit tests from accidentally applying seccomp filters to the Go test runner process,
-	// which permanently poisons the OS thread and causes other tests to fail with EPERM or SIGSYS.
-	if os.Getenv("SAFER_EXEC_CONFIG_PATH") == "" && os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
-		return nil
-	}
-
-	// Set no_new_privs to allow seccomp filter without CAP_SYS_ADMIN
-	// PR_SET_NO_NEW_PRIVS = 38
-	syscall.Syscall6(syscall.SYS_PRCTL, 38, 1, 0, 0, 0, 0)
-
+// buildSeccompProgram constructs the classic-BPF seccomp filter program for the
+// given config. It is a pure function (no syscalls, no global state) so it can
+// be unit-tested directly. The returned program:
+//
+//   - pins the architecture and rejects x32-ABI syscall numbers, so the filter
+//     cannot be bypassed via the i386 compat gate or the x32 ABI;
+//   - forces clone3 to ENOSYS and inspects clone() flags to block nested
+//     user/mount namespaces (unless AllowUserns) and process forks (BlockFork);
+//   - restricts socket families and applies the default syscall hardening
+//     blocklist, returning EPERM so runtimes can degrade gracefully.
+func buildSeccompProgram(cfg config.ExecConfig) []syscall.SockFilter {
 	blockCalls := []int{
 		syscall.SYS_PTRACE, sysKCMP, syscall.SYS_UNSHARE, syscall.SYS_MOUNT, syscall.SYS_PIVOT_ROOT, sysSYSCALL,
 		// Block execution domain changes and kernel profiling
@@ -2590,7 +2759,9 @@ func applySeccomp(cfg config.ExecConfig) error {
 		syscall.SYS_ACCT, syscall.SYS_REBOOT, syscall.SYS_KEXEC_LOAD, syscall.SYS_CHROOT,
 	}
 	if cfg.BlockFork {
-		// SYS_CLONE is handled separately below with a flag check to allow thread creation.
+		// SYS_CLONE and SYS_CLONE3 are handled separately below with a flag check
+		// to allow thread creation; clone3 is forced to ENOSYS so libc falls back
+		// to the inspectable clone() path.
 		blockCalls = append(blockCalls, sysFORK, sysVFORK)
 	}
 	hasBlockExecWildcard := false
@@ -2600,8 +2771,28 @@ func applySeccomp(cfg config.ExecConfig) error {
 			break
 		}
 	}
-	if cfg.TraceExec || hasBlockExecWildcard {
-		blockCalls = append(blockCalls, syscall.SYS_EXECVE)
+	// Exec control. Stateless seccomp cannot allow the target's own launch
+	// while blocking every descendant: the launcher and any child share the same
+	// two exec syscalls (execve/execveat), so exactly one must stay open and a
+	// child can use whichever that is. We therefore make the guarantee precise:
+	//
+	//   - blockExec='*' WITH blockFork: no child process can be created at all,
+	//     so the only exec is the target's own launch (in-place self-replacement
+	//     stays inside the same sandbox and cannot escalate). We block the
+	//     execveat evasion vector; execve remains open purely for the launcher.
+	//   - blockExec='*' WITHOUT blockFork: children can exist and inherit this
+	//     filter. We block execve (the libc exec path used by sh/system/posix_spawn)
+	//     and warn that a child calling the execveat syscall directly is an
+	//     irreducible residual — blockFork closes it.
+	//   - traceExec: tracing must OBSERVE, not block, so we add no exec syscall
+	//     here; exec events are captured by the eBPF/audit layer.
+	if hasBlockExecWildcard {
+		if cfg.BlockFork {
+			blockCalls = append(blockCalls, sysEXECVEAT)
+		} else {
+			blockCalls = append(blockCalls, syscall.SYS_EXECVE)
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: blockExec='*' without blockFork: a child can still exec via the execveat syscall directly. Enable blockFork (recommended) to fully prevent subprocess execution.\n")
+		}
 	}
 
 	// Filter out the dummy arm64 syscall numbers to avoid trapping unused kernel paths
@@ -2613,32 +2804,74 @@ func applySeccomp(cfg config.ExecConfig) error {
 	}
 
 	var insts []syscall.SockFilter
-	insts = append(insts, syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0})
 
-	if cfg.BlockFork {
-		// For SYS_CLONE, only block process forks (CLONE_THREAD flag absent).
-		// Thread creation (CLONE_THREAD set) must be allowed so the sandboxed binary's
-		// internal threads (glibc, Node.js libuv, etc.) can start on arm64 where
-		// clone() is used for threads instead of clone3().
-		//
-		// BPF layout (A = syscall nr at entry):
-		//   JEQ SYS_CLONE, Jt=0, Jf=3   → if NOT clone: skip 3, jump to reload
-		//   LOAD args[0] (offset 16)      → A = clone flags
-		//   JSET CLONE_THREAD, Jt=1, Jf=0 → if thread: skip 1 (jump to reload)
-		//   RET KILL                       → process fork: kill
-		//   LOAD syscall nr (offset 0)    → reload for subsequent checks
-		retKillOrTrap := uint32(seccompRetKill)
-		if cfg.EnableAudit {
-			trapVal := uint16(6 | (syscall.SYS_CLONE&0xFF)<<8)
-			retKillOrTrap = uint32(seccompRetTrap) | uint32(trapVal)
-		}
+	// Pin the execution architecture. A seccomp filter that matches only on
+	// the syscall number is bypassable on x86_64 via the i386 compat gate
+	// (int 0x80), where syscall numbers differ entirely, and via the x32 ABI.
+	// We reject any syscall whose seccomp_data.arch is not our native arch BEFORE
+	// inspecting the number, then (on x86_64) reject x32 syscall numbers which
+	// share AUDIT_ARCH_X86_64. Violations kill the whole process — there is no
+	// legitimate reason for the sandboxed program to issue cross-arch syscalls.
+	insts = append(insts,
+		syscall.SockFilter{Code: bpfLoadWordAbsolute, K: seccompDataArchOffset},
+		syscall.SockFilter{Code: bpfJmpEq, Jt: 1, Jf: 0, K: uint32(seccompAuditArch)},
+		syscall.SockFilter{Code: bpfJmpReturn, K: uint32(seccompRetKillProcess)},
+	)
+	// Load the syscall number for all subsequent comparisons.
+	insts = append(insts, syscall.SockFilter{Code: bpfLoadWordAbsolute, K: seccompDataNROffset})
+	if seccompX32SyscallBit != 0 {
 		insts = append(insts,
-			syscall.SockFilter{Code: bpfJmpEq, Jf: 3, K: uint32(syscall.SYS_CLONE)},
-			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 16},
-			syscall.SockFilter{Code: bpfJmpSet, Jt: 1, K: cloneThreadFlag},
-			syscall.SockFilter{Code: bpfJmpReturn, K: retKillOrTrap},
-			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0},
+			syscall.SockFilter{Code: bpfJmpSet, Jt: 0, Jf: 1, K: uint32(seccompX32SyscallBit)},
+			syscall.SockFilter{Code: bpfJmpReturn, K: uint32(seccompRetKillProcess)},
 		)
+	}
+
+	// restrictClone is true whenever we need to inspect clone() flags — either to
+	// block nested user/mount namespaces (default unless AllowUserns) or to
+	// block process forks (BlockFork). When set we also force clone3 to ENOSYS so
+	// the flag inspection cannot be evaded via the un-inspectable clone3 path.
+	blockUserns := !cfg.AllowUserns
+	restrictClone := blockUserns || cfg.BlockFork
+	if restrictClone {
+		// clone3 passes its flags behind a struct pointer that BPF cannot deref.
+		// Returning ENOSYS makes glibc/musl transparently fall back to clone(),
+		// which we inspect below. This is the same technique container runtimes
+		// use in their default seccomp profiles.
+		if sysCLONE3 != 9999 {
+			insts = append(insts,
+				syscall.SockFilter{Code: bpfJmpEq, Jt: 0, Jf: 1, K: uint32(sysCLONE3)},
+				syscall.SockFilter{Code: bpfJmpReturn, K: uint32(seccompRetErrno) | uint32(syscall.ENOSYS)},
+			)
+		}
+
+		// clone() flag inspection. `inner` runs only when A == SYS_CLONE; a
+		// trailing reload of the nr follows it so later checks see the number.
+		var inner []syscall.SockFilter
+		inner = append(inner, syscall.SockFilter{Code: bpfLoadWordAbsolute, K: seccompDataArg0Offset}) // A = clone flags
+		if blockUserns {
+			// Deny creation of nested user or mount namespaces. EPERM lets
+			// runtimes degrade gracefully rather than dying with SIGSYS.
+			inner = append(inner,
+				syscall.SockFilter{Code: bpfJmpSet, Jt: 0, Jf: 1, K: cloneNewUserFlag | cloneNewNSFlag},
+				syscall.SockFilter{Code: bpfJmpReturn, K: uint32(seccompRetErrno) | uint32(syscall.EPERM)},
+			)
+		}
+		if cfg.BlockFork {
+			// Allow thread creation (CLONE_THREAD set); kill genuine process forks.
+			retKillOrTrap := uint32(seccompRetKill)
+			if cfg.EnableAudit {
+				trapVal := uint16(6 | (syscall.SYS_CLONE&0xFF)<<8)
+				retKillOrTrap = uint32(seccompRetTrap) | uint32(trapVal)
+			}
+			inner = append(inner,
+				syscall.SockFilter{Code: bpfJmpSet, Jt: 1, Jf: 0, K: cloneThreadFlag},
+				syscall.SockFilter{Code: bpfJmpReturn, K: retKillOrTrap},
+			)
+		}
+		// If A != SYS_CLONE, jump past the whole inner block to the reload.
+		insts = append(insts, syscall.SockFilter{Code: bpfJmpEq, Jt: 0, Jf: uint8(len(inner)), K: uint32(syscall.SYS_CLONE)})
+		insts = append(insts, inner...)
+		insts = append(insts, syscall.SockFilter{Code: bpfLoadWordAbsolute, K: seccompDataNROffset}) // reload nr
 	}
 
 	// Socket filtering (UNIX domain socket AF_UNIX, Netlink AF_NETLINK, RAW SOCK_RAW)
@@ -2674,6 +2907,30 @@ func applySeccomp(cfg config.ExecConfig) error {
 		insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: uint32(seccompRetErrno) | uint32(syscall.EPERM)})
 	}
 	insts = append(insts, syscall.SockFilter{Code: bpfJmpReturn, K: seccompRetAllow})
+	return insts
+}
+
+// setNoNewPrivs sets PR_SET_NO_NEW_PRIVS on the calling thread. This is a
+// precondition for an unprivileged process to install Landlock and seccomp
+// restrictions. It must run BEFORE the Landlock restrict_self calls: in
+// reduced-isolation mode (no user namespace, hence no CAP_SYS_ADMIN) those calls
+// fail with EPERM unless no_new_privs is already set. The call is idempotent, so
+// applySeccomp may safely set it again. The prctl number 38 is PR_SET_NO_NEW_PRIVS.
+func setNoNewPrivs() {
+	syscall.Syscall6(syscall.SYS_PRCTL, 38, 1, 0, 0, 0, 0)
+}
+
+func applySeccomp(cfg config.ExecConfig) error {
+	// Prevent unit tests from accidentally applying seccomp filters to the Go test runner process,
+	// which permanently poisons the OS thread and causes other tests to fail with EPERM or SIGSYS.
+	if os.Getenv("SAFER_EXEC_CONFIG_PATH") == "" && os.Getenv("SAFER_EXEC_CONFIG") == "" && strings.HasSuffix(os.Args[0], ".test") {
+		return nil
+	}
+
+	// Ensure no_new_privs is set (idempotent; also set earlier before Landlock).
+	setNoNewPrivs()
+
+	insts := buildSeccompProgram(cfg)
 
 	prog := syscall.SockFprog{Len: uint16(len(insts)), Filter: &insts[0]}
 	_, _, errno := syscall.RawSyscall(sysSeccomp, 1, 0, uintptr(unsafe.Pointer(&prog)))

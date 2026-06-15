@@ -439,6 +439,21 @@ export class SaferExec extends EventEmitter {
 
     /** @type {boolean} Map UID 0 inside namespace to caller's real UID (Linux only, opt-in) */
     this._mapToTargetUid = options.mapToTargetUid || false;
+
+    /**
+     * @type {boolean} Permit the sandboxed process to create nested user/mount
+     * namespaces (CLONE_NEWUSER/CLONE_NEWNS). Defaults to false: nested
+     * namespaces are blocked by seccomp because they are a common entry point
+     * for unprivileged-userns kernel privilege-escalation bugs. Linux only.
+     */
+    this._allowUserns = options.allowUserns || false;
+
+    /**
+     * @type {boolean} Permit degrading to an escapable chroot when pivot_root
+     * fails. Defaults to false: a pivot_root failure is fatal so filesystem
+     * isolation is never silently weakened. Linux only.
+     */
+    this._allowChrootFallback = options.allowChrootFallback || false;
   }
 
   /**
@@ -714,6 +729,12 @@ export class SaferExec extends EventEmitter {
     }
     if (typeof raw.mapToTargetUid === 'boolean') {
       this._mapToTargetUid = raw.mapToTargetUid;
+    }
+    if (typeof raw.allowUserns === 'boolean') {
+      this._allowUserns = raw.allowUserns;
+    }
+    if (typeof raw.allowChrootFallback === 'boolean') {
+      this._allowChrootFallback = raw.allowChrootFallback;
     }
     if (raw.setUpDev !== undefined) {
       this.setUpDev(raw.setUpDev);
@@ -1396,6 +1417,37 @@ export class SaferExec extends EventEmitter {
   }
 
   /**
+   * Permit the sandboxed process to create nested user and mount namespaces
+   * (CLONE_NEWUSER / CLONE_NEWNS). Disabled by default: nested namespaces are
+   * blocked by seccomp because they are a common entry point for
+   * unprivileged-userns kernel privilege-escalation bugs and are not needed by
+   * normal package or build tooling. Enable only for workloads that legitimately
+   * sandbox themselves. Linux-only.
+   *
+   * @param {boolean} [enable=true] - Whether to allow nested namespace creation
+   * @returns {SaferExec} This instance for chaining
+   */
+  allowUserns(enable = true) {
+    this._allowUserns = enable;
+    return this;
+  }
+
+  /**
+   * Permit degrading to an escapable chroot when pivot_root fails. Disabled by
+   * default: a pivot_root failure is treated as fatal so filesystem isolation is
+   * never silently weakened to a chroot (which a sandboxed process can escape).
+   * Enable only on hosts where pivot_root is unavailable and a weaker boundary
+   * is acceptable. Linux-only.
+   *
+   * @param {boolean} [enable=true] - Whether to allow the chroot fallback
+   * @returns {SaferExec} This instance for chaining
+   */
+  allowChrootFallback(enable = true) {
+    this._allowChrootFallback = enable;
+    return this;
+  }
+
+  /**
    * Kill the sandboxed process with SIGKILL when its parent process dies.
    * Uses PR_SET_PDEATHSIG to prevent orphaned sandbox processes.
    * Linux-only. Enabled by default.
@@ -2006,6 +2058,8 @@ export class SaferExec extends EventEmitter {
       privateTmp: this._privateTmp,
       bindFds: this._bindFds,
       mapToTargetUid: this._mapToTargetUid,
+      allowUserns: this._allowUserns,
+      allowChrootFallback: this._allowChrootFallback,
     };
 
     const effectiveTimeout = this._timeoutMs;

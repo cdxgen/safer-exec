@@ -34,3 +34,16 @@ const (
 	sysMEMBARRIER_unified = 324
 	sysOPENAT2_unified    = 437
 )
+
+// seccompAuditArch is the AUDIT_ARCH_* value the seccomp filter pins the
+// process to. On x86_64 this is AUDIT_ARCH_X86_64 (EM_X86_64 | __AUDIT_ARCH_64BIT
+// | __AUDIT_ARCH_LE = 0x3E | 0x80000000 | 0x40000000). Any syscall arriving with
+// a different arch (e.g. the i386 compat gate via int 0x80, AUDIT_ARCH_I386
+// 0x40000003) is rejected, closing the classic compat-ABI seccomp bypass.
+const seccompAuditArch = 0xC000003E
+
+// seccompX32SyscallBit is the bit set on x32 ABI syscall numbers
+// (__X32_SYSCALL_BIT). x32 syscalls run under AUDIT_ARCH_X86_64, so the arch
+// check alone does not catch them; the filter additionally rejects any syscall
+// number with this bit set. Zero on architectures without an x32 ABI.
+const seccompX32SyscallBit = 0x40000000

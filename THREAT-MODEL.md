@@ -57,6 +57,34 @@ The Node.js layer serializes an `ExecConfig` object to JSON. The Go struct expec
 | `cbomOutputPath`  | string   | Write CycloneDX CBOM JSON file     |
 | `cryptoProbeMode` | string   | Depth of crypto probe (operations) |
 
+## 1.5 Default Configuration and Opt-in Hardening
+
+Several isolation mechanisms are **opt-in** and are not active unless explicitly
+enabled. Operators must not assume an out-of-the-box configuration enables every
+control described in this document. The table below reflects the actual defaults
+applied by the Node.js layer (`npm/src/index.js`) and the Go engine.
+
+| Control                                                            | Default                   | Notes                                                                                                       |
+| ------------------------------------------------------------------ | ------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Seccomp architecture pinning                                       | **on** (always)           | Rejects foreign-arch (i386 compat gate) and x32 syscalls; not configurable off.                             |
+| Block nested user/mount namespaces (`CLONE_NEWUSER`/`CLONE_NEWNS`) | **on**                    | Disable with `allowUserns`. clone3 is forced to ENOSYS so the clone() flag check cannot be evaded.          |
+| Seccomp default hardening blocklist                                | **on**                    | ptrace, mount, unshare, bpf, keyctl, setuid/setgid, module loading, io_uring, etc.                          |
+| `pivot_root` failure handling                                      | **fatal**                 | Does not silently degrade to an escapable chroot. Opt in to the weaker fallback with `allowChrootFallback`. |
+| Environment sanitization                                           | **on**                    | Sensitive-looking keys stripped unless `allowEnvs` lists them.                                              |
+| `setUpDev` (minimal `/dev`)                                        | **on** for full isolation |                                                                                                             |
+| `blockFork`                                                        | **off**                   | Enable to prevent the target from creating any child process.                                               |
+| `bindUseFd` (TOCTTOU-safe bind mounts)                             | **off**                   | Enable for the O_PATH + re-stat protection described in §3.16.                                              |
+| `submountEnforce` (read-only submount closure)                     | **off**                   | Enable for the protection described in §3.12.                                                               |
+| `procHardening` (read-only `/proc/sys`, etc.)                      | **off**                   |                                                                                                             |
+| `protectSystem` / `protectHome`                                    | **off**                   |                                                                                                             |
+| `mapToTargetUid`                                                   | **off**                   |                                                                                                             |
+| `useReaper` (PID 1 reaper)                                         | **off**                   | Incompatible with `blockFork`.                                                                              |
+
+For production use, enable `strict` so that initialization warnings (cgroup,
+landlock, seccomp, pivot_root) become hard errors rather than silent
+degradations, and explicitly turn on the opt-in controls relevant to your
+workload.
+
 ## 2. Sandbox Mechanisms
 
 ### macOS (Seatbelt + RLIMIT)
@@ -98,9 +126,9 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **Impact:** The command reaches an unintended host. The Seatbelt and Landlock rules only filter by IP, not by hostname.
 
-**Mitigation:** The Node.js layer resolves all `allowHosts` to IPs before spawning the Go binary. The Go binary also performs its own resolution on the platform side. Both sets of IPs are included in the rules.
+**Mitigation:** The Node.js layer resolves all `allowHosts` to IPs before spawning the Go binary. Note, however, that neither platform enforces a remote-IP allowlist at the sandbox layer — see §3.3. Host resolution is used to derive the set of allowed ports and to drive eBPF URL observability on Linux, not to pin connections to specific IPs.
 
-**Residual risk:** DNS changes between resolution and execution window. IPv6 addresses are resolved but Landlock rules on Linux only cover IPv4 by default for the basic path.
+**Residual risk:** Because egress is filtered by port rather than by IP (§3.3), DNS spoofing/rebinding does not change the effective exposure: any host is already reachable on an allowed port. For strict egress control, use `disableNetwork` or an external firewall/eBPF egress policy.
 
 ### 3.2 Filesystem Escapes
 
@@ -126,12 +154,29 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **How isolation works:**
 
-- **Linux:** A new network namespace is created when `disableNetwork` is true. Landlock v2 rules restrict TCP connections to explicitly configured ports plus well-known ports (1-1024).
-- **macOS:** Seatbelt rules allow outbound connections. Port filtering uses `remote ip "*:PORT"` patterns.
+- **Linux:** A new network namespace is created when `disableNetwork` is true — this is the only mechanism that fully severs egress. When the network is not disabled, Landlock restricts TCP connections to the configured ports. Landlock filters by port, **not** by IP.
+- **macOS:** Seatbelt port filtering uses `remote ip "*:PORT"` patterns.
+
+**Egress is filtered by port, not by host/IP (important).** Neither Landlock
+(Linux) nor Seatbelt (macOS) can pin outbound connections to a specific remote IP
+address: Landlock has no IP-level rule type, and Seatbelt's `(remote ip ...)`
+filter only accepts `*` or `localhost` as the host. Consequently `allowHosts` /
+`allowIPs` constrain only the _ports_ that may be used (and, on macOS, prevent a
+fall-through to fully-unrestricted egress). They do **not** prevent the sandboxed
+process from reaching an arbitrary host on an allowed port (e.g. exfiltration to
+an attacker server over 443). When host-pinning is requested:
+
+- **macOS** emits a warning that IP pinning is not enforceable and confines egress
+  to the requested ports only.
+- **Linux** can fully sever egress with `disableNetwork`; for observability of the
+  specific hosts/URLs reached, use `allowURLRules` with eBPF HTTP tracing
+  (`traceHTTPURLs`), which records and flags per-URL violations.
 
 **Residual risk:**
 
-- macOS Seatbelt port rules use wildcard IP patterns that match any source IP on the target port.
+- Within an allowed port, any remote host is reachable on both platforms. True
+  per-IP egress confinement requires `disableNetwork` (full cut) or a
+  host-level firewall/eBPF egress policy outside `safer-exec`.
 
 ### 3.4 Resource Exhaustion
 
@@ -184,7 +229,33 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **Impact:** The target can perform syscalls not typically needed but does not affect isolation quality.
 
-**Blocked syscalls:** ptrace, kcmp, unshare, mount, pivot_root, syscall (meta-syscall). When `blockFork` is set: clone (except CLONE_THREAD), fork, vfork. When `traceExec` or blockExec wildcard is set: execve.
+**Architecture pinning:** The filter loads `seccomp_data.arch` and kills the
+process (SECCOMP_RET_KILL_PROCESS) for any syscall that does not arrive under the
+native architecture. On x86_64 it additionally rejects x32-ABI syscall numbers
+(those carrying `__X32_SYSCALL_BIT`). Without this, a process could bypass the
+entire number-based blocklist via the i386 compat gate (`int 0x80`, where syscall
+numbers differ) or the x32 ABI. The architecture guard runs before the syscall
+number is inspected.
+
+**Blocked syscalls:** ptrace, kcmp, unshare, mount, pivot_root, syscall
+(meta-syscall), personality, the setuid/setgid family, capset, the
+setxattr/removexattr family, bpf, perf_event_open, userfaultfd, keyctl,
+request_key, fanotify/inotify, io_uring (setup/enter/register), process_vm_readv/writev,
+module loading (init/finit/delete_module), quotactl, swapon/swapoff, time
+manipulation (settimeofday/clock_settime/adjtimex), syslog, ioperm/iopl, acct,
+reboot, kexec_load, and chroot.
+
+**Namespace creation:** `clone()` flags are inspected; `CLONE_NEWUSER` and
+`CLONE_NEWNS` are denied (EPERM) by default so the sandboxed process cannot
+create nested namespaces (a common precondition for unprivileged-userns kernel
+LPEs). Because BPF cannot dereference the `clone3` arguments struct, `clone3` is
+forced to ENOSYS, causing libc to fall back to the inspectable `clone()` path.
+This is disabled by `allowUserns`.
+
+**Fork blocking:** When `blockFork` is set, `clone` without `CLONE_THREAD`,
+`fork`, and `vfork` are blocked while thread creation (`CLONE_THREAD`) is
+preserved. `clone3` is already forced to ENOSYS (see above), so it cannot evade
+the fork block.
 
 **What is not blocked:** All other syscalls including read, write, openat, stat, fstat, lstat, access, connect, socket, recvfrom, sendto, etc.
 
@@ -201,11 +272,33 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 **How isolation works:**
 
 - **macOS:** Seatbelt rules restrict `process-exec` to specified binaries. The `blockFork` flag removes the `process-fork` allow rule. The `traceExec` flag adds `(trace process-exec "*")` to log all child processes.
-- **Linux:** Seccomp-bpf filters block `fork`, `vfork`, and `execve` syscalls. The `clone` syscall is handled with a flag check to allow thread creation (CLONE_THREAD) while blocking process forks. The `allowExec` flag filters by executable name. The `blockExec` flag blocks specific binaries.
+- **Linux:** Seccomp-bpf filters `fork`, `vfork`, and `clone` (flag-checked to allow `CLONE_THREAD`), and forces `clone3` to ENOSYS, when `blockFork` is set. The `allowExec`/`blockExec` flags filter exec by executable name.
+
+**Exec-control limitation (important):** Stateless seccomp cannot allow the
+target's own initial `exec` while blocking every descendant — the launcher and
+any child share the same two exec syscalls (`execve`/`execveat`), so exactly one
+must remain open and a child can use whichever that is. The engine therefore
+makes the guarantee precise rather than absolute:
+
+- `blockExec: ['*']` **with** `blockFork`: no child process can be created at all,
+  so the only exec is the target's own launch (an in-place self-replacement stays
+  inside the same sandbox and cannot escalate). The `execveat` evasion vector is
+  blocked; `execve` stays open solely for the launcher. **This is the recommended
+  configuration for fully preventing subprocess execution.**
+- `blockExec: ['*']` **without** `blockFork`: children can exist and inherit the
+  filter. `execve` (the libc exec path used by `sh`/`system`/`posix_spawn`) is
+  blocked, but a child invoking the `execveat` syscall directly is an irreducible
+  residual; the engine emits a warning recommending `blockFork`.
+- `traceExec`: tracing observes rather than blocks, so no exec syscall is filtered
+  at the seccomp layer; exec events are surfaced by the eBPF/audit layer.
+
+For a hard guarantee against arbitrary subprocess execution that does not depend
+on this asymmetry, combine `blockExec: ['*']` with `blockFork`.
 
 **Residual risk:**
 
-- Wildcard blocking (`blockExec: ['*']`) blocks all exec calls. This may cause the command to fail if it needs to spawn subprocesses.
+- Wildcard blocking (`blockExec: ['*']`) without `blockFork` leaves the `execveat`
+  syscall reachable by descendants, as described above.
 - The `traceExec` flag on Linux uses seccomp `SIGSYS` trapping on `execve`. This adds overhead to every child process spawn.
 - Fork blocking on macOS uses Seatbelt rules. The command may still fork but the child inherits the same Seatbelt profile.
 
@@ -245,11 +338,13 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 **Linux escape paths:**
 
 1. Unshare additional namespaces to create nested isolation (blocked by seccomp).
-2. Mount new filesystems to discover host state (blocked by seccomp).
-3. Trace sibling processes (blocked by seccomp ptrace rule).
-4. Pivot root again (blocked by seccomp pivot_root rule, and failure is a hard error).
-5. Use clone3 to bypass fork/clone blocking (blocked when BlockFork is enabled).
-6. Use execveat to bypass execve blocking (blocked when TraceExec or BlockExec wildcard is enabled).
+2. Create nested user/mount namespaces via `clone`/`clone3` to obtain namespaced capabilities for kernel LPEs (blocked by default: `CLONE_NEWUSER`/`CLONE_NEWNS` denied and `clone3` forced to ENOSYS; opt out with `allowUserns`).
+3. Mount new filesystems to discover host state (blocked by seccomp).
+4. Trace sibling processes (blocked by seccomp ptrace rule).
+5. Pivot root again (blocked by seccomp pivot_root rule; a failed initial pivot_root is fatal by default rather than degrading to chroot).
+6. Issue blocklisted syscalls via the i386 compat gate or x32 ABI (blocked by architecture pinning; see §3.7).
+7. Use clone3 to bypass fork/clone blocking (clone3 is forced to ENOSYS, so it falls back to the flag-checked clone path).
+8. Use execveat to bypass execve blocking — see the exec-control limitation in §3.8; closed when `blockExec: ['*']` is combined with `blockFork`.
 
 **Network namespace:**
 
@@ -269,9 +364,9 @@ By default, the sandboxed process is prevented from listening on any network por
 
 **Impact:** Writable submounts leak through apparently read-only bind mounts. For example, bind-mounting `/usr` as read-only but `/usr/local` (a separate mount) remaining writable.
 
-**How isolation works:** After each read-only bind mount, the engine parses `/proc/self/mountinfo` to discover all submounts under the target, then individually remounts each with `MS_REMOUNT | MS_BIND | MS_RDONLY`. This closes the `MS_REC` propagation loophole regardless of kernel version or host configuration.
+**How isolation works:** When `submountEnforce` is enabled (**opt-in; off by default**), after each read-only bind mount the engine parses `/proc/self/mountinfo` to discover all submounts under the target, then individually remounts each with `MS_REMOUNT | MS_BIND | MS_RDONLY`. This closes the `MS_REC` propagation loophole regardless of kernel version or host configuration. Mountinfo fields are octal-unescaped (e.g. `\040` → space) before comparison so submounts whose paths contain whitespace are matched correctly.
 
-**Residual risk:** Race condition between the initial mount and the submount scan. A process could rapidly create new submounts during this window.
+**Residual risk:** With `submountEnforce` off (the default), writable submounts under a read-only bind mount remain writable. When enabled, a race remains between the initial mount and the submount scan in which a process could rapidly create new submounts.
 
 ### 3.13 PID Namespace Zombie Accumulation
 
@@ -309,9 +404,27 @@ By default, the sandboxed process is prevented from listening on any network por
 
 **Impact:** The mount operation binds an unintended target path, potentially exposing host files inside the sandbox.
 
-**How isolation works:** When `bindUseFd` is enabled (default), the source path is opened via `O_PATH` before mounting, mounted through `/proc/self/fd/N`, and then `fstat(fd)` is compared against `lstat(target)` to detect swaps. If the inode or device number differ, the mount is rolled back with `MNT_DETACH` and an error is returned.
+**How isolation works:** When `bindUseFd` is enabled (**opt-in; off by default**), the source path is opened via `O_PATH` before mounting, mounted through `/proc/self/fd/N`, and then `fstat(fd)` is compared against `lstat(target)` to detect swaps. If the inode or device number differ, the mount is rolled back with `MNT_DETACH` and an error is returned.
 
-**Residual risk:** The race window is reduced to the interval between `fstat` and `mount` (microseconds). A TOCTTOU attack in this window requires precise timing.
+**Residual risk:** With `bindUseFd` enabled the race window is reduced to the interval between `fstat` and `mount` (microseconds). With the default (`bindUseFd` off), the plain `mount(source, target)` path is used and the full symlink-swap race window is present — enable `bindUseFd` for workloads where the bind-mount sources are attacker-influenced.
+
+### 3.17 Pre-Sandbox Helper Resolution (Linux)
+
+**Threat:** Before the sandbox namespaces exist, the Linux engine runs the system
+helpers `unshare` (to create the namespaces) and `ip` (to bring up loopback).
+These run with the launching user's privileges. If they were resolved via the
+inherited `PATH`, a caller that prepends an attacker-controlled directory (a
+common CI pattern, e.g. `./node_modules/.bin` or `.` on `PATH`) could substitute
+a malicious `unshare`/`ip` and achieve code execution before any confinement is
+applied.
+
+**How isolation works:** Both helpers are resolved with `lookTrustedTool`, which
+searches only a fixed set of standard absolute directories (`/usr/bin`, `/bin`,
+`/usr/sbin`, `/sbin`), ignores `$PATH`, and requires the resolved file to be a
+regular file that is not group- or world-writable. `ip` is skipped entirely when
+no trusted binary is found; `unshare` falls back to the bare name only on exotic
+systems where it is absent from every standard directory (no worse than the
+historical behavior, while the common case is fully pinned).
 
 ## 4. Platform-Aware Policies
 
@@ -337,14 +450,15 @@ Policies are resolved at runtime based on the operating system. The following pl
 
 This section analyzes advanced threat vectors, escape techniques, and how `safer-exec` counters them.
 
-| Escape Vector                      | Technical Mechanism                                                                                                                                                                      | `safer-exec` Mitigation Status                                                                                                        |
-| :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------ |
-| **Kernel Exploits via Namespaces** | Attackers use unprivileged user namespaces (`CLONE_NEWUSER`) to gain local capabilities (e.g., `CAP_NET_ADMIN`) and exploit bugs in kernel subsystems (like `netfilter` or `OverlayFS`). | **Mitigated**: Seccomp blocks `unshare` and namespace clone flags by default. `PR_SET_NO_NEW_PRIVS` prevents privilege transitions.   |
-| **Mach Port IPC Exploits (macOS)** | Sandboxed processes target system daemons over Mach IPC to run code in a privileged context.                                                                                             | **Mitigated**: Seatbelt profiles restrict Mach port service lookups to the absolute minimum required bootstrap components.            |
-| **eBPF/LSM/Perf Monitoring**       | Attackers load eBPF probes, performance monitors (`perf_event_open`), or uprobes to spy on memory, environment variables, or other processes.                                            | **Mitigated**: Seccomp blocks `bpf`, `perf_event_open`, `userfaultfd`, and `keyctl` system calls by default.                          |
-| **Privilege Escalation**           | Processes use `setuid`, `setgid`, or `setcap` to gain elevated access or modify attributes.                                                                                              | **Mitigated**: Seccomp blocks all `setuid`, `setgid`, `capset`, and `setxattr` / extended attribute manipulation syscalls by default. |
-| **UDP Socket Evasion**             | Landlock limits network rules to TCP. Attackers use UDP or RAW sockets to bypass restrictions.                                                                                           | **Mitigated**: Active network namespace unsharing (`CLONE_NEWNET`) cuts off all socket families (UDP, Netlink, RAW) entirely.         |
-| **Sandbox Tool Reuse**             | Attackers execute `safer-exec` or `safer-exec-rt` to spawn secondary escaped tasks.                                                                                                      | **Mitigated**: Default `BlockExec` rules automatically register and forbid the execution of the sandbox binary itself.                |
+| Escape Vector                      | Technical Mechanism                                                                                                                                                                      | `safer-exec` Mitigation Status                                                                                                                                                                                                                           |
+| :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Kernel Exploits via Namespaces** | Attackers use unprivileged user namespaces (`CLONE_NEWUSER`) to gain local capabilities (e.g., `CAP_NET_ADMIN`) and exploit bugs in kernel subsystems (like `netfilter` or `OverlayFS`). | **Mitigated**: Seccomp blocks `unshare`, denies `CLONE_NEWUSER`/`CLONE_NEWNS` in the `clone()` flag check, and forces `clone3` to ENOSYS so it cannot evade the check. `PR_SET_NO_NEW_PRIVS` prevents privilege transitions. Opt out with `allowUserns`. |
+| **Seccomp Compat-ABI Bypass**      | On x86_64 an attacker issues blocklisted syscalls through the i386 compat gate (`int 0x80`, different syscall numbers) or the x32 ABI to evade a number-only filter.                     | **Mitigated**: The filter pins `seccomp_data.arch` to the native architecture and rejects x32 syscall numbers before inspecting the number, killing any cross-ABI syscall.                                                                               |
+| **Mach Port IPC Exploits (macOS)** | Sandboxed processes target system daemons over Mach IPC to run code in a privileged context.                                                                                             | **Mitigated**: Seatbelt profiles restrict Mach port service lookups to the absolute minimum required bootstrap components.                                                                                                                               |
+| **eBPF/LSM/Perf Monitoring**       | Attackers load eBPF probes, performance monitors (`perf_event_open`), or uprobes to spy on memory, environment variables, or other processes.                                            | **Mitigated**: Seccomp blocks `bpf`, `perf_event_open`, `userfaultfd`, and `keyctl` system calls by default.                                                                                                                                             |
+| **Privilege Escalation**           | Processes use `setuid`, `setgid`, or `setcap` to gain elevated access or modify attributes.                                                                                              | **Mitigated**: Seccomp blocks all `setuid`, `setgid`, `capset`, and `setxattr` / extended attribute manipulation syscalls by default.                                                                                                                    |
+| **UDP Socket Evasion**             | Landlock limits network rules to TCP. Attackers use UDP or RAW sockets to bypass restrictions.                                                                                           | **Mitigated**: Active network namespace unsharing (`CLONE_NEWNET`) cuts off all socket families (UDP, Netlink, RAW) entirely.                                                                                                                            |
+| **Sandbox Tool Reuse**             | Attackers execute `safer-exec` or `safer-exec-rt` to spawn secondary escaped tasks.                                                                                                      | **Mitigated**: Default `BlockExec` rules automatically register and forbid the execution of the sandbox binary itself.                                                                                                                                   |
 
 ## 5. Assumptions
 

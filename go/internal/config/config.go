@@ -410,6 +410,22 @@ type ExecConfig struct {
 	// the caller's real UID so the sandboxed process runs with the caller's
 	// identity rather than appearing as root. Linux-only.
 	MapToTargetUid bool `json:"mapToTargetUid,omitempty"`
+
+	// AllowUserns, when true, permits the sandboxed process to create nested
+	// user and mount namespaces via clone()/clone3() (CLONE_NEWUSER/CLONE_NEWNS).
+	// Defaults to false: nested namespaces are blocked by seccomp because they
+	// are the entry point for many unprivileged-userns kernel privilege-escalation
+	// bugs and are not needed by normal package/build tooling. Set to true only
+	// for workloads that legitimately sandbox themselves. Linux-only.
+	AllowUserns bool `json:"allowUserns,omitempty"`
+
+	// AllowChrootFallback, when true, permits the engine to fall back to chroot()
+	// when pivot_root() fails. Defaults to false: a chroot-based root is escapable
+	// (e.g. via an fd to a directory outside the new root, or fchdir/.. when
+	// combined with namespace tricks), so silently degrading to it would weaken
+	// filesystem isolation. With the default, a pivot_root failure is fatal even
+	// outside --strict. Linux-only.
+	AllowChrootFallback bool `json:"allowChrootFallback,omitempty"`
 }
 
 // SeccompFilterSpec describes an additional seccomp-bpf filter to stack.
