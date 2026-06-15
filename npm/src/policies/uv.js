@@ -91,6 +91,8 @@ export function uvPolicy() {
     },
 
     blockFork: true,
+
+    denyPersistenceWrites: true,
     blockExec: ['*'],
   };
 }

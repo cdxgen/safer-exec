@@ -78,6 +78,7 @@ export function pypiPolicy() {
 
     /** OS-level blocking to prevent Python's `subprocess` or `os.system` */
     blockFork: true,
+    denyPersistenceWrites: true,
     // '*' blocks SYS_EXECVE via seccomp for child processes.
     // Shell names block the initial command in execCommand, preventing shell-based
     // persistence attacks (e.g. 'echo malware >> ~/.bashrc') in reduced-isolation mode

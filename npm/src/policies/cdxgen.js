@@ -82,6 +82,8 @@ export function cdxgenPolicy() {
 
     // 5. EXECUTION CONTROLS
     blockFork: false,
+    denyPersistenceWrites: true,
+    blockInterpreters: true,
     blockExec: [],
   };
 }

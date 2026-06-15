@@ -54,6 +54,9 @@ const (
 	sysGETRANDOM  = sysGETRANDOM_unified
 	sysMEMBARRIER = sysMEMBARRIER_unified
 	sysOPENAT2    = sysOPENAT2_unified
+
+	sysMEMFD_CREATE  = sysMEMFD_CREATE_unified
+	sysPKEY_MPROTECT = sysPKEY_MPROTECT_unified
 )
 
 const (
@@ -75,6 +78,13 @@ const (
 	seccompDataNROffset   = 0  // int nr
 	seccompDataArchOffset = 4  // __u32 arch
 	seccompDataArg0Offset = 16 // __u64 args[0] (low 32 bits at offset 16 on LE)
+	seccompDataArg2Offset = 32 // __u64 args[2] (low 32 bits at offset 32 on LE)
+)
+
+// Memory-protection bits used by the W^X (BlockJIT) seccomp checks.
+const (
+	protExec  = 0x4 // PROT_EXEC
+	protWrite = 0x2 // PROT_WRITE
 )
 
 const sysSeccomp = sysSeccomp_unified
@@ -2764,6 +2774,12 @@ func buildSeccompProgram(cfg config.ExecConfig) []syscall.SockFilter {
 		// to the inspectable clone() path.
 		blockCalls = append(blockCalls, sysFORK, sysVFORK)
 	}
+	if cfg.BlockJIT {
+		// memfd_create backs the anonymous-file exec trick (write code to an
+		// in-memory fd, then execveat it). Deny it outright; the mmap/mprotect
+		// W^X checks below close the in-place code-generation path.
+		blockCalls = append(blockCalls, sysMEMFD_CREATE)
+	}
 	hasBlockExecWildcard := false
 	for _, item := range cfg.BlockExec {
 		if item == "*" {
@@ -2895,6 +2911,38 @@ func buildSeccompProgram(cfg config.ExecConfig) []syscall.SockFilter {
 			syscall.SockFilter{Code: bpfJmpEq, Jt: 0, Jf: 1, K: sockRaw},
 			syscall.SockFilter{Code: bpfJmpReturn, K: retKillOrTrapSocket},
 			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: 0}, // reload
+		)
+	}
+
+	// W^X enforcement (BlockJIT). Deny the two in-place code-generation paths
+	// at the syscall level: mprotect/pkey_mprotect that adds PROT_EXEC, and
+	// mmap that requests PROT_WRITE|PROT_EXEC at once. memfd_create is denied
+	// via the blocklist above. EPERM (not SIGSYS) lets a runtime that probes
+	// for JIT support degrade gracefully. This breaks legitimate JITs, so it
+	// is only emitted when explicitly requested.
+	if cfg.BlockJIT {
+		jitErrno := uint32(seccompRetErrno) | uint32(syscall.EPERM)
+
+		// mprotect / pkey_mprotect: kill if prot (arg2) has PROT_EXEC. Layout
+		// per call: jeq, ld arg2, jset, ret, reload-nr.
+		for _, nr := range []int{syscall.SYS_MPROTECT, sysPKEY_MPROTECT} {
+			insts = append(insts,
+				syscall.SockFilter{Code: bpfJmpEq, Jt: 0, Jf: 3, K: uint32(nr)},         // not this call -> reload
+				syscall.SockFilter{Code: bpfLoadWordAbsolute, K: seccompDataArg2Offset}, // A = prot
+				syscall.SockFilter{Code: bpfJmpSet, Jt: 0, Jf: 1, K: protExec},          // PROT_EXEC set -> ret
+				syscall.SockFilter{Code: bpfJmpReturn, K: jitErrno},                     //
+				syscall.SockFilter{Code: bpfLoadWordAbsolute, K: seccompDataNROffset},   // reload nr
+			)
+		}
+
+		// mmap: kill if prot (arg2) has both PROT_EXEC and PROT_WRITE.
+		insts = append(insts,
+			syscall.SockFilter{Code: bpfJmpEq, Jt: 0, Jf: 4, K: uint32(syscall.SYS_MMAP)}, // not mmap -> reload
+			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: seccompDataArg2Offset},       // A = prot
+			syscall.SockFilter{Code: bpfJmpSet, Jt: 0, Jf: 2, K: protExec},                // no PROT_EXEC -> reload
+			syscall.SockFilter{Code: bpfJmpSet, Jt: 0, Jf: 1, K: protWrite},               // no PROT_WRITE -> reload
+			syscall.SockFilter{Code: bpfJmpReturn, K: jitErrno},                           //
+			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: seccompDataNROffset},         // reload nr
 		)
 	}
 

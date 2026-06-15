@@ -374,3 +374,55 @@ func TestUnescapeMountField(t *testing.T) {
 		}
 	}
 }
+
+func TestSeccomp_BlockJIT_Mprotect(t *testing.T) {
+	prog := buildSeccompProgram(config.ExecConfig{BlockJIT: true})
+
+	// mprotect adding PROT_EXEC is denied.
+	if got := evalSeccomp(t, prog, seccompAuditArch, uint32(syscall.SYS_MPROTECT), [6]uint64{0, 0, protExec}); got != resErrno(syscall.EPERM) {
+		t.Errorf("mprotect(PROT_EXEC): got %#x, want EPERM", uint32(got))
+	}
+	// pkey_mprotect adding PROT_EXEC is denied.
+	if got := evalSeccomp(t, prog, seccompAuditArch, uint32(sysPKEY_MPROTECT), [6]uint64{0, 0, protExec}); got != resErrno(syscall.EPERM) {
+		t.Errorf("pkey_mprotect(PROT_EXEC): got %#x, want EPERM", uint32(got))
+	}
+	// mprotect without PROT_EXEC (e.g. making memory read-only) is allowed.
+	if got := evalSeccomp(t, prog, seccompAuditArch, uint32(syscall.SYS_MPROTECT), [6]uint64{0, 0, protWrite}); got != resAllow {
+		t.Errorf("mprotect(PROT_WRITE): got %#x, want ALLOW", uint32(got))
+	}
+}
+
+func TestSeccomp_BlockJIT_Mmap(t *testing.T) {
+	prog := buildSeccompProgram(config.ExecConfig{BlockJIT: true})
+
+	// W+X mmap is denied.
+	if got := evalSeccomp(t, prog, seccompAuditArch, uint32(syscall.SYS_MMAP), [6]uint64{0, 0, protWrite | protExec}); got != resErrno(syscall.EPERM) {
+		t.Errorf("mmap(PROT_WRITE|PROT_EXEC): got %#x, want EPERM", uint32(got))
+	}
+	// Write-only mmap (the common case) is allowed.
+	if got := evalSeccomp(t, prog, seccompAuditArch, uint32(syscall.SYS_MMAP), [6]uint64{0, 0, protWrite}); got != resAllow {
+		t.Errorf("mmap(PROT_WRITE): got %#x, want ALLOW", uint32(got))
+	}
+	// Exec-only mmap (mapping a signed library) is allowed.
+	if got := evalSeccomp(t, prog, seccompAuditArch, uint32(syscall.SYS_MMAP), [6]uint64{0, 0, protExec}); got != resAllow {
+		t.Errorf("mmap(PROT_EXEC): got %#x, want ALLOW", uint32(got))
+	}
+}
+
+func TestSeccomp_BlockJIT_MemfdCreate(t *testing.T) {
+	prog := buildSeccompProgram(config.ExecConfig{BlockJIT: true})
+	if got := evalSeccomp(t, prog, seccompAuditArch, uint32(sysMEMFD_CREATE), [6]uint64{}); got != resErrno(syscall.EPERM) {
+		t.Errorf("memfd_create: got %#x, want EPERM", uint32(got))
+	}
+}
+
+func TestSeccomp_BlockJIT_Disabled(t *testing.T) {
+	// Without BlockJIT, the W+X paths are not filtered.
+	prog := buildSeccompProgram(config.ExecConfig{})
+	if got := evalSeccomp(t, prog, seccompAuditArch, uint32(syscall.SYS_MPROTECT), [6]uint64{0, 0, protExec}); got != resAllow {
+		t.Errorf("mprotect(PROT_EXEC) without BlockJIT: got %#x, want ALLOW", uint32(got))
+	}
+	if got := evalSeccomp(t, prog, seccompAuditArch, uint32(syscall.SYS_MMAP), [6]uint64{0, 0, protWrite | protExec}); got != resAllow {
+		t.Errorf("mmap(W|X) without BlockJIT: got %#x, want ALLOW", uint32(got))
+	}
+}

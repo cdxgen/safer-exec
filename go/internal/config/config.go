@@ -301,8 +301,47 @@ type ExecConfig struct {
 	// The file is created with 0600 permissions and deleted after reading.
 	ConfigFilePath string `json:"configFilePath,omitempty"`
 
-	// AllowEnvs is a list of environment variables allowed to pass through
+	// AllowEnvs is a list of environment variables allowed to pass through.
+	// This is the single opt-in for both credential-bearing variables and
+	// loader-control variables (DYLD_*, LD_*, NODE_OPTIONS, DEVELOPER_DIR,
+	// ...); the latter are stripped unless their exact name is listed here.
 	AllowEnvs []string `json:"allowEnvs"`
+
+	// BlockInterpreters, when true, denies execution of preinstalled
+	// Apple-signed scripting engines and sampling tools that carry
+	// unsigned-executable-memory, library-validation, or task-port
+	// exemptions (tclsh, wish, perl, system python, ruby, expect, and the
+	// com.apple.SamplingTools binaries) and starves them of the FFI
+	// frameworks (Tcl/Tk/Ffidl) used to load in-memory shellcode. macOS-only;
+	// ignored on other platforms. The command itself is never blocked.
+	BlockInterpreters bool `json:"blockInterpreters,omitempty"`
+
+	// DenyPersistenceWrites, when true, denies writes to well-known
+	// auto-execution and persistence locations (LaunchAgents/LaunchDaemons,
+	// plugin loader directories, preference stores, /usr/local/bin) that a
+	// build or package install never legitimately needs to write to. A path
+	// explicitly named in WritePaths is exempt. Enforced via Seatbelt on
+	// macOS, where these trees are otherwise reachable through the broad
+	// default read/write allows. On Linux the namespace + Landlock model is
+	// already deny-by-default for any path not granted via WritePaths, so the
+	// flag is informational there.
+	DenyPersistenceWrites bool `json:"denyPersistenceWrites,omitempty"`
+
+	// AllowWritableDylibLoad, when true, disables the (otherwise default
+	// under BlockInterpreters) deny on reading .dylib files from writable or
+	// temporary directories. Enable it for native-addon builds that compile
+	// and immediately dlopen a dynamic library from the build tree. macOS-only.
+	AllowWritableDylibLoad bool `json:"allowWritableDylibLoad,omitempty"`
+
+	// BlockJIT, when true, blocks the syscalls that turn writable memory into
+	// executable memory or execute anonymous files: mprotect/pkey_mprotect
+	// with PROT_EXEC on a writable mapping, mmap with PROT_WRITE|PROT_EXEC or
+	// MAP_JIT, and memfd_create. This stops in-memory shellcode loaders at the
+	// syscall level. It breaks legitimate JITs (V8/node, the JVM, LuaJIT) and
+	// is therefore opt-in. Enforced via seccomp on Linux; on macOS, where
+	// Seatbelt cannot filter syscalls, it strengthens the interpreter denies
+	// and emits a warning that in-process JIT cannot be prevented.
+	BlockJIT bool `json:"blockJIT,omitempty"`
 
 	// AllowHidden, when true, permits read/write to hidden files and directories
 	AllowHidden bool `json:"allowHidden"`
@@ -684,9 +723,15 @@ type PolicyFile struct {
 	BlockTPM       bool `json:"blockTPM,omitempty"`
 	SpoofAntiVM    bool `json:"spoofAntiVM,omitempty"`
 	TraceLibraries bool `json:"traceLibraries,omitempty"`
-	GPUUsed        bool `json:"gpuUsed,omitempty"`
-	TPMUsed        bool `json:"tpmUsed,omitempty"`
-	AntiVMActive   bool `json:"antiVMActive,omitempty"`
+
+	// Hardening controls (mirror of the ExecConfig fields)
+	BlockInterpreters      bool `json:"blockInterpreters,omitempty"`
+	DenyPersistenceWrites  bool `json:"denyPersistenceWrites,omitempty"`
+	AllowWritableDylibLoad bool `json:"allowWritableDylibLoad,omitempty"`
+	BlockJIT               bool `json:"blockJIT,omitempty"`
+	GPUUsed                bool `json:"gpuUsed,omitempty"`
+	TPMUsed                bool `json:"tpmUsed,omitempty"`
+	AntiVMActive           bool `json:"antiVMActive,omitempty"`
 
 	// HTTP access log — populated when --trace-http-urls is used with --learn
 	// or --audit. Records observed HTTP requests with method, host, and path.

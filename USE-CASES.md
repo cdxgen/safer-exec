@@ -20,6 +20,24 @@ Modern supply-chain attacks target developer environments and build pipelines vi
 - **Malicious Behavior**: Reading secrets, establishing persistence via `.bashrc` modifications, or initiating reverse shells.
 - **Mitigation**: Limit package installation to pre-compiled binaries (Wheels only) to prevent compilation-stage script execution, and lock down filesystem write access and socket connections.
 
+### 3. Living-off-the-land Interpreters & In-Memory Shellcode (macOS)
+
+- **Attack Vector**: A postinstall script re-execs a preinstalled, Apple-signed binary that carries a code-signing exemption — `tclsh` (which ships the Ffidl libffi binding plus `http`/`tls`), `wish`, system `perl`/`python3`/`ruby`, `expect`, or the `com.apple.SamplingTools` binaries (`symbols`, `vmmap`, `atos`, ...).
+- **Malicious Behavior**: Using `mmap`/`mprotect` to map and execute raw shellcode, or `load`-ing an unsigned dylib (library-validation is exempted), fetched from a remote URL and run **entirely in memory** — invisible to filesystem diffing and to `process-exec` denials, because the interpreter itself is the allowed binary.
+- **Mitigation**: `blockInterpreters` denies these binaries (framework-path aware) and starves the Tcl/Tk/Ffidl frameworks of reads; `blockJIT` (Linux) blocks the W^X syscalls outright.
+
+### 4. Loader-Hijack Environment Variables
+
+- **Attack Vector**: A package sets a loader-control variable — `DYLD_INSERT_LIBRARIES`, `LD_PRELOAD`, `DEVELOPER_DIR`, `NODE_OPTIONS`, `PYTHONPATH`, `GIT_SSH_COMMAND` — that the dynamic loader or runtime honors when a later tool starts.
+- **Malicious Behavior**: Injecting an attacker dylib/`.so` into an allowed process, or forcing an entitled binary down an insecure external-library fallback path (the CoreSymbolication `DEVELOPER_DIR` chain).
+- **Mitigation**: These keys are stripped from the environment by default and only pass through when explicitly named in `allowEnvs`.
+
+### 5. Persistence & Privilege-Escalation Staging
+
+- **Attack Vector**: A confined install writes a payload to an auto-execution location: `~/Library/LaunchAgents`, plugin trees scanned by root daemons, or the world-writable `/usr/local/bin` that system diagnostic tools resolve helpers from.
+- **Malicious Behavior**: Surviving the sandbox (login persistence) or having code executed later by a privileged service (local privilege escalation).
+- **Mitigation**: `denyPersistenceWrites` makes these locations read-only to the sandboxed process. On Linux the namespace + Landlock allowlist already denies any path not explicitly granted.
+
 ---
 
 ## Mitigating Supply-Chain Attacks using the CLI
@@ -124,6 +142,66 @@ const runner = new SaferExec()
 ```
 
 This forces the process to run entirely within its single initial memory space and denies any `child_process` execution attempts.
+
+### Defense-in-Depth: Block LOLBins, In-Memory Shellcode, and Persistence
+
+Layer the anti-evasion controls on top of exec/fork blocking. This combination
+closes the in-memory and living-off-the-land paths that survive a pure
+`blockExec`/`blockFork` policy:
+
+```javascript
+import { SaferExec } from "@cdxgen/safer-exec";
+
+const result = await new SaferExec()
+  .applyPolicy("npm") // already sets blockInterpreters + denyPersistenceWrites
+  .blockFork()
+  .blockExec("*") // no external programs
+  .blockInterpreters() // no tclsh/perl/python/ruby/SamplingTools loading in-memory shellcode (macOS)
+  .denyPersistenceWrites() // no LaunchAgents / plugin / /usr/local/bin drops
+  .run("npm", ["ci"]);
+```
+
+```bash
+# CLI equivalent
+safer-exec --policy=npm --block-fork --block-interpreters --deny-persistence-writes -- npm ci
+```
+
+### Hardening an Untrusted Native Binary (Linux W^X)
+
+For a binary that must run but should never generate executable code at runtime
+(no JIT), enforce W^X at the syscall level. `mprotect(PROT_EXEC)`, `mmap` with
+`PROT_WRITE|PROT_EXEC`, and `memfd_create` are denied, defeating in-memory
+shellcode loaders:
+
+```javascript
+import { SaferExec } from "@cdxgen/safer-exec";
+
+const result = await new SaferExec()
+  .disableNetwork()
+  .blockFork()
+  .blockJIT() // Linux W^X; do NOT use for V8/JVM/LuaJIT workloads
+  .readPaths("/usr/lib", "/lib")
+  .run("/opt/vendor/analyzer", ["--scan", "./src"]);
+```
+
+```bash
+safer-exec --block-jit --disable-network -- /opt/vendor/analyzer --scan ./src
+```
+
+### Allowing a Loader-Control Variable Deliberately
+
+Loader-control variables are stripped by default. When an instrumentation harness
+genuinely needs one (e.g. a profiler dylib), name it in `allowEnvs` — the single,
+auditable opt-in:
+
+```javascript
+import { SaferExec } from "@cdxgen/safer-exec";
+
+const result = await new SaferExec()
+  .env("DYLD_INSERT_LIBRARIES", "/opt/profiler/libprofile.dylib")
+  .allowEnvs("DYLD_INSERT_LIBRARIES") // without this, the variable is dropped
+  .run("/usr/bin/myapp", []);
+```
 
 ---
 

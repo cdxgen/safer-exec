@@ -55,6 +55,10 @@ export function gomodPolicy() {
     },
 
     blockFork: true,
+
+    denyPersistenceWrites: true,
+
+    blockInterpreters: true,
     blockExec: ['*'],
   };
 }

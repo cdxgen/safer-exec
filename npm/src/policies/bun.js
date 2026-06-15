@@ -64,6 +64,10 @@ export function bunPolicy() {
     },
 
     blockFork: true,
+
+    denyPersistenceWrites: true,
+
+    blockInterpreters: true,
     blockExec: ['*'],
   };
 }

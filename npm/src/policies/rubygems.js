@@ -83,6 +83,8 @@ export function rubygemsPolicy() {
     },
 
     blockFork: true,
+
+    denyPersistenceWrites: true,
     blockExec: ['*'],
   };
 }

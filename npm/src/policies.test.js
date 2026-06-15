@@ -387,4 +387,38 @@ describe('policies', () => {
       });
     }
   });
+
+  describe('hardening flags', () => {
+    // Every hardened policy denies writes to persistence locations.
+    const persistencePolicies = {
+      npm: npmPolicy, yarn: yarnPolicy, pnpm: pnpmPolicy, bun: bunPolicy,
+      deno: denoPolicy, pypi: pypiPolicy, uv: uvPolicy, maven: mavenPolicy,
+      cargo: cargoPolicy, rubygems: rubygemsPolicy, composer: composerPolicy,
+      gomod: gomodPolicy, cdxgen: cdxgenPolicy,
+    };
+    for (const [name, fn] of Object.entries(persistencePolicies)) {
+      it(`${name} denies persistence writes`, () => {
+        strict.equal(fn().denyPersistenceWrites, true);
+      });
+    }
+
+    // Non-interpreter ecosystems block the entitled scripting engines.
+    for (const [name, fn] of Object.entries({
+      npm: npmPolicy, yarn: yarnPolicy, pnpm: pnpmPolicy, bun: bunPolicy,
+      deno: denoPolicy, maven: mavenPolicy, cargo: cargoPolicy,
+      composer: composerPolicy, gomod: gomodPolicy,
+    })) {
+      it(`${name} blocks interpreters`, () => {
+        strict.equal(fn().blockInterpreters, true);
+      });
+    }
+
+    // Interpreter-driven ecosystems must NOT block interpreters (it would
+    // break their own runtime child processes).
+    for (const [name, fn] of Object.entries({ pypi: pypiPolicy, uv: uvPolicy, rubygems: rubygemsPolicy })) {
+      it(`${name} does not block interpreters`, () => {
+        strict.ok(!fn().blockInterpreters);
+      });
+    }
+  });
 });

@@ -68,6 +68,8 @@ export function mavenPolicy() {
 
     /** OS-level blocking to prevent malicious maven-antrun-plugin or shell tasks */
     blockFork: true,
+    denyPersistenceWrites: true,
+    blockInterpreters: true,
     blockExec: ['*'],
   };
 }

@@ -33,6 +33,9 @@ const (
 	sysGETRANDOM_unified  = 318
 	sysMEMBARRIER_unified = 324
 	sysOPENAT2_unified    = 437
+
+	sysMEMFD_CREATE_unified  = 319
+	sysPKEY_MPROTECT_unified = 329
 )
 
 // seccompAuditArch is the AUDIT_ARCH_* value the seccomp filter pins the

@@ -57,6 +57,7 @@ import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import { resolveHosts } from './net.js';
+import { stripDangerousEnv } from './env.js';
 import { run as runBinary, runPipe as runBinaryPipe } from './runner.js';
 import { npmPolicy } from './policies/npm.js';
 import { pnpmPolicy } from './policies/pnpm.js';
@@ -331,6 +332,18 @@ export class SaferExec extends EventEmitter {
 
     /** @type {string[]} Environment variables allowed to pass through */
     this._allowEnvs = options.allowEnvs || [];
+
+    /** @type {boolean} Deny execution of Apple-signed scripting engines / sampling tools (macOS) */
+    this._blockInterpreters = options.blockInterpreters || false;
+
+    /** @type {boolean} Deny writes to auto-execution / persistence locations */
+    this._denyPersistenceWrites = options.denyPersistenceWrites || false;
+
+    /** @type {boolean} Permit loading .dylib from writable/temp dirs under blockInterpreters (macOS) */
+    this._allowWritableDylibLoad = options.allowWritableDylibLoad || false;
+
+    /** @type {boolean} Block JIT / W^X syscalls (mprotect PROT_EXEC, memfd_create, MAP_JIT) */
+    this._blockJIT = options.blockJIT || false;
 
     /** @type {boolean} Allow reading/writing hidden files and directories */
     this._allowHidden = options.allowHidden || false;
@@ -631,6 +644,18 @@ export class SaferExec extends EventEmitter {
     }
     if (raw.blockFork) {
       this.blockFork();
+    }
+    if (raw.blockInterpreters) {
+      this.blockInterpreters();
+    }
+    if (raw.denyPersistenceWrites) {
+      this.denyPersistenceWrites();
+    }
+    if (raw.allowWritableDylibLoad) {
+      this.allowWritableDylibLoad();
+    }
+    if (raw.blockJIT) {
+      this.blockJIT();
     }
 
     // Observability
@@ -1177,6 +1202,62 @@ export class SaferExec extends EventEmitter {
   }
 
   /**
+   * Deny execution of preinstalled Apple-signed scripting engines and
+   * sampling tools that carry unsigned-executable-memory, library-validation,
+   * or task-port exemptions (tclsh, wish, perl, system python, ruby, expect,
+   * and the com.apple.SamplingTools binaries), and starve them of the FFI
+   * frameworks (Tcl/Tk/Ffidl) used to load in-memory shellcode. macOS-only;
+   * the sandboxed command itself is never blocked.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  blockInterpreters() {
+    this._blockInterpreters = true;
+    return this;
+  }
+
+  /**
+   * Deny writes to well-known auto-execution and persistence locations
+   * (LaunchAgents/LaunchDaemons, plugin loader directories, login shell rc
+   * files, autostart/cron directories, /usr/local/bin) that a build or
+   * package install never legitimately needs to write to. Paths explicitly
+   * passed to {@link writePaths} remain writable.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  denyPersistenceWrites() {
+    this._denyPersistenceWrites = true;
+    return this;
+  }
+
+  /**
+   * Permit loading .dylib files from writable or temporary directories even
+   * when {@link blockInterpreters} is active. Enable this for native-addon
+   * builds that compile and immediately load a dynamic library from the build
+   * tree. macOS-only.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  allowWritableDylibLoad() {
+    this._allowWritableDylibLoad = true;
+    return this;
+  }
+
+  /**
+   * Block the syscalls that turn writable memory into executable memory or
+   * execute anonymous files (mprotect/pkey_mprotect PROT_EXEC on writable
+   * mappings, mmap PROT_WRITE|PROT_EXEC or MAP_JIT, memfd_create). This stops
+   * in-memory shellcode loaders at the syscall level on Linux. It breaks
+   * legitimate JITs (V8/node, the JVM, LuaJIT) and is therefore opt-in.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  blockJIT() {
+    this._blockJIT = true;
+    return this;
+  }
+
+  /**
    * Log every child process spawned by the sandboxed command.
    *
    * Fork and exec are allowed, but every child process is logged with
@@ -1247,6 +1328,11 @@ export class SaferExec extends EventEmitter {
   /**
    * Allow specific environment variables to pass through from the host process.
    *
+   * This is also the opt-in for loader-control variables (DYLD_*, LD_*,
+   * NODE_OPTIONS, DEVELOPER_DIR, ...), which are stripped by default because
+   * they can hijack library loading or inject startup code; name one here only
+   * when you intend that.
+   *
    * @param {...string} envs - Names of environment variables to allow
    * @returns {SaferExec} This instance for chaining
    */
@@ -1258,6 +1344,7 @@ export class SaferExec extends EventEmitter {
     }
     return this;
   }
+
 
   /**
    * Allow/disallow reading and writing to hidden files and directories.
@@ -1989,6 +2076,15 @@ export class SaferExec extends EventEmitter {
         finalEnv[name] = process.env[name];
       }
     }
+    // Strip loader-control variables (DYLD_*, LD_*, NODE_OPTIONS, ...) before
+    // they reach the sandboxed process; naming one in allowEnvs is the
+    // explicit opt-in. The Go engine repeats this filtering as a backstop.
+    const sanitizedEnv = stripDangerousEnv(finalEnv, this._allowEnvs);
+    for (const k of Object.keys(finalEnv)) {
+      if (!(k in sanitizedEnv)) {
+        delete finalEnv[k];
+      }
+    }
     finalEnv.RUNNING_IN_SAFER_EXEC_SANDBOX = 'true';
 
     // Build the config object
@@ -2041,6 +2137,10 @@ export class SaferExec extends EventEmitter {
       cryptoProbeMode: this._cryptoProbeMode,
       allowURLRules: this._allowURLRules,
       allowEnvs: this._allowEnvs,
+      blockInterpreters: this._blockInterpreters,
+      denyPersistenceWrites: this._denyPersistenceWrites,
+      allowWritableDylibLoad: this._allowWritableDylibLoad,
+      blockJIT: this._blockJIT,
       allowHidden: this._allowHidden,
       allowListen: this._allowListen,
       setUpDev: this._setUpDev,

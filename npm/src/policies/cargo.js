@@ -56,6 +56,10 @@ export function cargoPolicy() {
     },
 
     blockFork: true,
+
+    denyPersistenceWrites: true,
+
+    blockInterpreters: true,
     blockExec: ['*'],
   };
 }

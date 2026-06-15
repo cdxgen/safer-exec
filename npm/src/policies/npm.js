@@ -67,6 +67,10 @@ export function npmPolicy() {
     },
 
     blockFork: true,
+
+    denyPersistenceWrites: true,
+
+    blockInterpreters: true,
     blockExec: ['*', 'gcc', 'g++', 'clang', 'clang++', 'cc', 'c++', 'ld', 'as', 'make', 'cmake', 'ninja'],
   };
 }

@@ -87,6 +87,10 @@ Options:
   --allow-exec=<cmd>         Allow only specific executables to run (repeatable)
   --block-exec=<cmd>         Block specific executables from running (repeatable)
   --block-fork               Prevent the command from forking new processes
+  --block-interpreters       Deny Apple-signed scripting engines / sampling tools that can load in-memory shellcode (macOS)
+  --deny-persistence-writes  Deny writes to LaunchAgents, plugin loaders, /usr/local/bin and other persistence locations
+  --allow-writable-dylib-load Permit loading .dylib from writable/temp dirs under --block-interpreters (macOS)
+  --block-jit                Block W^X / JIT syscalls (mprotect PROT_EXEC, memfd_create, MAP_JIT); breaks V8/JVM (Linux)
   --trace-exec               Log every child process spawned (fork + exec audit)
   --trace-libraries          Track dynamically loaded libraries at runtime
   --trace-output-file=<file> Write tracked libraries to file (implies trace-libraries)
@@ -103,7 +107,7 @@ Options:
   -a, --audit                Enable sandbox violation auditing
       --audit-output-file=<f> Write audit log to file (implies audit)
   -s, --strict               Treat sandbox setup warnings as errors
-      --allow-envs=<vars>     Comma-separated host env vars to pass through (always sanitized by default)
+      --allow-envs=<vars>     Comma-separated host env vars to pass through (sanitized by default; also the opt-in for loader-control vars like DYLD_*, LD_*, NODE_OPTIONS)
       --allow-hidden          Allow access to hidden files and directories (blocked by default)
       --allow-listen=<list>   Comma-separated list of IP addresses or ip:port strings to allow listening on (blocked by default)
       --no-set-up-dev         Disable minimal /dev setup (default: enabled, Linux only)
@@ -298,6 +302,18 @@ function parseCliArgs() {
         multiple: true,
       },
       'block-fork': {
+        type: 'boolean',
+      },
+      'block-interpreters': {
+        type: 'boolean',
+      },
+      'deny-persistence-writes': {
+        type: 'boolean',
+      },
+      'allow-writable-dylib-load': {
+        type: 'boolean',
+      },
+      'block-jit': {
         type: 'boolean',
       },
       'trace-exec': {
@@ -563,6 +579,18 @@ function buildExec(values, cmd, args) {
   }
   if (values['block-fork']) {
     exec.blockFork();
+  }
+  if (values['block-interpreters']) {
+    exec.blockInterpreters();
+  }
+  if (values['deny-persistence-writes']) {
+    exec.denyPersistenceWrites();
+  }
+  if (values['allow-writable-dylib-load']) {
+    exec.allowWritableDylibLoad();
+  }
+  if (values['block-jit']) {
+    exec.blockJIT();
   }
   if (values['trace-exec']) {
     exec.traceExec();

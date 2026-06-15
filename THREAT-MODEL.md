@@ -27,35 +27,39 @@ Node.js (policy + DNS) --[JSON on stdin]--> Go binary --[sandbox]--> target comm
 
 The Node.js layer serializes an `ExecConfig` object to JSON. The Go struct expects the following fields:
 
-| Field             | Type     | Description                        |
-| ----------------- | -------- | ---------------------------------- |
-| `cmd`             | string   | Command to execute                 |
-| `args`            | string[] | Command arguments                  |
-| `env`             | object   | Environment variables              |
-| `readPaths`       | string[] | Filesystem read paths              |
-| `writePaths`      | string[] | Filesystem write paths             |
-| `allowHosts`      | string[] | Hostnames to allow                 |
-| `allowIPs`        | string[] | Resolved IP addresses              |
-| `allowPorts`      | number[] | TCP ports to allow                 |
-| `disableNetwork`  | boolean  | Cut all network access             |
-| `maxMemoryMB`     | number   | Memory limit in megabytes          |
-| `maxCPUCores`     | number   | CPU limit as fractional cores      |
-| `maxProcesses`    | number   | Max child processes                |
-| `timeoutMs`       | number   | Hard kill timeout in milliseconds  |
-| `workingDir`      | string   | Working directory                  |
-| `enableAudit`     | boolean  | Enable violation auditing          |
-| `enableDiff`      | boolean  | Enable filesystem diffing          |
-| `enableLearn`     | boolean  | Enable learning mode               |
-| `allowExec`       | string[] | Executables to allow               |
-| `blockExec`       | string[] | Executables to block               |
-| `blockFork`       | boolean  | Prevent forking                    |
-| `traceExec`       | boolean  | Log child processes                |
-| `strict`          | boolean  | Treat warnings as hard errors      |
-| `allowEnvs`       | string[] | Allowed host env vars              |
-| `allowHidden`     | boolean  | Allow hidden paths read/write      |
-| `traceCrypto`     | boolean  | Capture TLS & non-TLS operations   |
-| `cbomOutputPath`  | string   | Write CycloneDX CBOM JSON file     |
-| `cryptoProbeMode` | string   | Depth of crypto probe (operations) |
+| Field                    | Type     | Description                             |
+| ------------------------ | -------- | --------------------------------------- |
+| `cmd`                    | string   | Command to execute                      |
+| `args`                   | string[] | Command arguments                       |
+| `env`                    | object   | Environment variables                   |
+| `readPaths`              | string[] | Filesystem read paths                   |
+| `writePaths`             | string[] | Filesystem write paths                  |
+| `allowHosts`             | string[] | Hostnames to allow                      |
+| `allowIPs`               | string[] | Resolved IP addresses                   |
+| `allowPorts`             | number[] | TCP ports to allow                      |
+| `disableNetwork`         | boolean  | Cut all network access                  |
+| `maxMemoryMB`            | number   | Memory limit in megabytes               |
+| `maxCPUCores`            | number   | CPU limit as fractional cores           |
+| `maxProcesses`           | number   | Max child processes                     |
+| `timeoutMs`              | number   | Hard kill timeout in milliseconds       |
+| `workingDir`             | string   | Working directory                       |
+| `enableAudit`            | boolean  | Enable violation auditing               |
+| `enableDiff`             | boolean  | Enable filesystem diffing               |
+| `enableLearn`            | boolean  | Enable learning mode                    |
+| `allowExec`              | string[] | Executables to allow                    |
+| `blockExec`              | string[] | Executables to block                    |
+| `blockFork`              | boolean  | Prevent forking                         |
+| `blockInterpreters`      | boolean  | Deny entitled scripting engines (macOS) |
+| `denyPersistenceWrites`  | boolean  | Deny persistence-location writes        |
+| `allowWritableDylibLoad` | boolean  | Relax writable-`.dylib` deny (macOS)    |
+| `blockJIT`               | boolean  | Block W^X / JIT syscalls (Linux)        |
+| `traceExec`              | boolean  | Log child processes                     |
+| `strict`                 | boolean  | Treat warnings as hard errors           |
+| `allowEnvs`              | string[] | Allowed host env vars                   |
+| `allowHidden`            | boolean  | Allow hidden paths read/write           |
+| `traceCrypto`            | boolean  | Capture TLS & non-TLS operations        |
+| `cbomOutputPath`         | string   | Write CycloneDX CBOM JSON file          |
+| `cryptoProbeMode`        | string   | Depth of crypto probe (operations)      |
 
 ## 1.5 Default Configuration and Opt-in Hardening
 
@@ -64,21 +68,24 @@ enabled. Operators must not assume an out-of-the-box configuration enables every
 control described in this document. The table below reflects the actual defaults
 applied by the Node.js layer (`npm/src/index.js`) and the Go engine.
 
-| Control                                                            | Default                   | Notes                                                                                                       |
-| ------------------------------------------------------------------ | ------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Seccomp architecture pinning                                       | **on** (always)           | Rejects foreign-arch (i386 compat gate) and x32 syscalls; not configurable off.                             |
-| Block nested user/mount namespaces (`CLONE_NEWUSER`/`CLONE_NEWNS`) | **on**                    | Disable with `allowUserns`. clone3 is forced to ENOSYS so the clone() flag check cannot be evaded.          |
-| Seccomp default hardening blocklist                                | **on**                    | ptrace, mount, unshare, bpf, keyctl, setuid/setgid, module loading, io_uring, etc.                          |
-| `pivot_root` failure handling                                      | **fatal**                 | Does not silently degrade to an escapable chroot. Opt in to the weaker fallback with `allowChrootFallback`. |
-| Environment sanitization                                           | **on**                    | Sensitive-looking keys stripped unless `allowEnvs` lists them.                                              |
-| `setUpDev` (minimal `/dev`)                                        | **on** for full isolation |                                                                                                             |
-| `blockFork`                                                        | **off**                   | Enable to prevent the target from creating any child process.                                               |
-| `bindUseFd` (TOCTTOU-safe bind mounts)                             | **off**                   | Enable for the O_PATH + re-stat protection described in §3.16.                                              |
-| `submountEnforce` (read-only submount closure)                     | **off**                   | Enable for the protection described in §3.12.                                                               |
-| `procHardening` (read-only `/proc/sys`, etc.)                      | **off**                   |                                                                                                             |
-| `protectSystem` / `protectHome`                                    | **off**                   |                                                                                                             |
-| `mapToTargetUid`                                                   | **off**                   |                                                                                                             |
-| `useReaper` (PID 1 reaper)                                         | **off**                   | Incompatible with `blockFork`.                                                                              |
+| Control                                                            | Default                   | Notes                                                                                                                            |
+| ------------------------------------------------------------------ | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Seccomp architecture pinning                                       | **on** (always)           | Rejects foreign-arch (i386 compat gate) and x32 syscalls; not configurable off.                                                  |
+| Block nested user/mount namespaces (`CLONE_NEWUSER`/`CLONE_NEWNS`) | **on**                    | Disable with `allowUserns`. clone3 is forced to ENOSYS so the clone() flag check cannot be evaded.                               |
+| Seccomp default hardening blocklist                                | **on**                    | ptrace, mount, unshare, bpf, keyctl, setuid/setgid, module loading, io_uring, etc.                                               |
+| `pivot_root` failure handling                                      | **fatal**                 | Does not silently degrade to an escapable chroot. Opt in to the weaker fallback with `allowChrootFallback`.                      |
+| Environment sanitization                                           | **on**                    | Sensitive-looking and loader-control keys (`DYLD_*`/`LD_*`/`NODE_OPTIONS`/...) stripped unless `allowEnvs` lists them. See §3.5. |
+| `setUpDev` (minimal `/dev`)                                        | **on** for full isolation |                                                                                                                                  |
+| `blockFork`                                                        | **off**                   | Enable to prevent the target from creating any child process.                                                                    |
+| `blockInterpreters`                                                | **off** (on in policies)  | macOS. Denies entitled scripting engines / sampling tools (§3.8.1). Built-in non-interpreter policies enable it.                 |
+| `denyPersistenceWrites`                                            | **off** (on in policies)  | Denies writes to LaunchAgents/plugin loaders/`/usr/local/bin` (§3.8.2). All built-in policies enable it.                         |
+| `blockJIT`                                                         | **off**                   | Linux. Seccomp W^X (§3.8.1). Breaks V8/JVM/LuaJIT; never enabled by default.                                                     |
+| `bindUseFd` (TOCTTOU-safe bind mounts)                             | **off**                   | Enable for the O_PATH + re-stat protection described in §3.16.                                                                   |
+| `submountEnforce` (read-only submount closure)                     | **off**                   | Enable for the protection described in §3.12.                                                                                    |
+| `procHardening` (read-only `/proc/sys`, etc.)                      | **off**                   |                                                                                                                                  |
+| `protectSystem` / `protectHome`                                    | **off**                   |                                                                                                                                  |
+| `mapToTargetUid`                                                   | **off**                   |                                                                                                                                  |
+| `useReaper` (PID 1 reaper)                                         | **off**                   | Incompatible with `blockFork`.                                                                                                   |
 
 For production use, enable `strict` so that initialization warnings (cgroup,
 landlock, seccomp, pivot_root) become hard errors rather than silent
@@ -201,9 +208,14 @@ an attacker server over 443). When host-pinning is requested:
 
 **Impact:** The command may use different configuration, connect to different hosts, or behave differently than expected.
 
-**How isolation works:** By default, the sandbox does not inherit host environment variables other than safe defaults (such as PATH, HOME, TERM, LANG, and LC\_\*). Custom environment variables can be set via `env()`, and host environment variables can be allowed via `allowEnvs()`. Environment variables are sanitized by default: any key containing TOKEN, PASSWORD, SECRET, API_KEY, CLIENT_SECRET, SESSION, COOKIE, AUTH, or KEY is stripped before execution, unless the key was explicitly permitted via `allowEnvs()` which bypasses this sanitization.
+**How isolation works:** By default, the sandbox does not inherit host environment variables other than safe defaults (such as PATH, HOME, TERM, LANG, and LC\_\*). Custom environment variables can be set via `env()`, and host environment variables can be allowed via `allowEnvs()`. Environment variables are sanitized by default along two axes:
 
-**Residual risk:** PATH, HOME, and other safe defaults are inherited even when a custom environment is set. The sanitization check is case-insensitive but does not inspect environment variable values, only key names.
+- **Credential-bearing keys** — any key containing TOKEN, PASSWORD, SECRET, API_KEY, CLIENT_SECRET, SESSION, COOKIE, AUTH, or KEY is stripped.
+- **Loader-control keys** — variables that steer the dynamic loader or a language runtime and so enable code injection: `DYLD_*` and `LD_*` (any member, e.g. `DYLD_INSERT_LIBRARIES`, `LD_PRELOAD`, `LD_AUDIT`), plus `DEVELOPER_DIR` (CoreSymbolication external-dylib path), `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `PYTHONPATH`, `RUBYOPT`, `PERL5LIB`, `GCONV_PATH`, `GIT_SSH_COMMAND`, and similar. These are stripped even though they do not match a credential pattern.
+
+A key listed in `allowEnvs()` bypasses **both** filters — it is the single, deliberate opt-in for passing either a credential or a loader-control variable through. The Go engine repeats this filtering as a backstop, so a policy or caller that sets a loader-control variable directly in `env` cannot smuggle it past the strip without also allow-listing it.
+
+**Residual risk:** PATH, HOME, and other safe defaults are inherited even when a custom environment is set. The filter inspects key names, not values. Allow-listing a loader-control variable (e.g. for an instrumentation harness) re-enables its injection capability by design; this is an explicit operator decision. macOS additionally strips `DYLD_*` for SIP-protected/restricted target binaries at the kernel level regardless of this layer.
 
 ### 3.6 Seatbelt Profile Construction (macOS)
 
@@ -301,6 +313,77 @@ on this asymmetry, combine `blockExec: ['*']` with `blockFork`.
   syscall reachable by descendants, as described above.
 - The `traceExec` flag on Linux uses seccomp `SIGSYS` trapping on `execve`. This adds overhead to every child process spawn.
 - Fork blocking on macOS uses Seatbelt rules. The command may still fork but the child inherits the same Seatbelt profile.
+
+### 3.8.1 Living-off-the-land interpreters and in-memory code execution (`blockInterpreters`, `blockJIT`)
+
+**Threat:** A confined process re-execs a preinstalled, Apple-signed binary that
+carries a code-signing exemption — `com.apple.security.cs.allow-unsigned-executable-memory`
+or `com.apple.security.cs.disable-library-validation` — and uses it to run code
+the sandbox never sees on disk. `tclsh` is the canonical example: it ships the
+Ffidl libffi binding plus `http`/`tls`, so a script can `mmap`/`mprotect` raw
+shellcode or `load` an unsigned dylib, fetched from a remote URL, entirely in
+memory. The same exemptions cover `wish`, system `perl`/`python3`/`ruby`,
+`expect`, and the `com.apple.SamplingTools` binaries (`symbols`, `vmmap`,
+`atos`, ...), which additionally hold `com.apple.system-task-ports` (arbitrary
+`task_for_pid`). This bypasses both filesystem confinement (nothing is written)
+and `process-exec` denials (the interpreter itself is the allowed binary).
+
+**Impact:** Arbitrary native code execution inside the sandbox, invisible to
+`--diff` and to write-path confinement; potential dylib hijack via a writable
+path; egress over an allowed port (which macOS Seatbelt cannot pin to a host).
+
+**How isolation works:**
+
+- `blockInterpreters` (macOS) emits last-match-wins `process-exec` denies for the
+  entitled interpreters and sampling tools, using framework-root `subpath` rules
+  so direct-framework invocation (e.g. the versioned `tclsh8.5`) is covered, not
+  just the `/usr/bin` shims. It also denies `file-read*` on the Tcl/Tk frameworks
+  and `/System/Library/Tcl` (where Ffidl lives), starving the FFI bridge even if
+  an interpreter is reachable. A self-command guard (symlink-resolved) exempts the
+  binary the caller deliberately asked to run and warns instead of breaking it.
+  Under `blockInterpreters`, reads of `.dylib` files from writable/temp trees are
+  also denied (the `load bad.dylib` vector), with `allowWritableDylibLoad` as the
+  escape hatch for native-addon builds.
+- `blockJIT` (Linux) closes the primitive at the syscall level — the only place it
+  can truly be stopped — via seccomp: `mprotect`/`pkey_mprotect` adding `PROT_EXEC`,
+  `mmap` with `PROT_WRITE|PROT_EXEC`, and `memfd_create` (anonymous-file exec) all
+  return EPERM.
+
+**Residual risk:** The unsigned-executable-memory primitive is a syscall-level
+capability that **Seatbelt cannot filter**, so on macOS in-process JIT inside an
+_allowed_ binary (including the target command itself) cannot be prevented — only
+detected, via EndpointSecurity `es_event_mmap`/`es_event_mprotect` telemetry and
+the Tcl/Ffidl framework reads surfaced by `traceLibraries`. `blockJIT` is opt-in
+because it breaks legitimate JITs (V8/Node, the JVM, LuaJIT). `blockInterpreters`
+is macOS-specific; on Linux the entitlement model does not apply, and arbitrary
+interpreters are governed by `allowExec`/`blockExec` and `blockJIT` instead.
+
+### 3.8.2 Persistence and privilege-escalation staging (`denyPersistenceWrites`)
+
+**Threat:** A confined build writes a payload to a well-known auto-execution
+location so it survives the sandbox or is later picked up by a privileged system
+service: `~/Library/LaunchAgents` (login persistence), the plugin trees scanned by
+root daemons (`/Library/DirectoryServices/PlugIns`, MIDI drivers, QuickLook),
+preference stores that can be poisoned into launching code, or the
+world-writable `/usr/local/bin` that macOS diagnostic tools resolve helpers from.
+None of these are legitimate build/install write targets.
+
+**Impact:** Persistence across the sandbox boundary; in some chains, code executed
+later by a privileged service (local privilege escalation).
+
+**How isolation works:** `denyPersistenceWrites` emits `file-write*` denies for
+these locations after the temp/write allows so they win under last-match-wins. A
+path explicitly granted via `writePaths` is exempt. All built-in policies enable
+it. On Linux the namespace + Landlock allowlist is already deny-by-default for any
+path not granted, so the flag is informational there rather than additive.
+
+**Residual risk:** The deny list enumerates known locations; a novel persistence
+vector outside it is not covered. The flag removes only the in-sandbox _staging_
+step — it does not patch the privileged service that would consume the payload.
+safer-exec also never authenticates an IPC/helper peer by bare PID (the
+`audit_token`-vs-`processIdentifier` PID-reuse bug class), and applies the
+sandbox profile at process start rather than after the process has warmed up
+privileged caches.
 
 ### 3.9 Learning Mode
 

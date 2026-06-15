@@ -65,6 +65,10 @@ export function denoPolicy() {
     },
 
     blockFork: true,
+
+    denyPersistenceWrites: true,
+
+    blockInterpreters: true,
     blockExec: ['*'],
   };
 }

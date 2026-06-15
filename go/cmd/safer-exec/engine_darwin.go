@@ -762,6 +762,148 @@ func setResourceLimits(cfg config.ExecConfig) error {
 	return nil
 }
 
+// interpreterExecLiteralDenies lists the absolute paths of preinstalled
+// Apple-signed scripting engines and com.apple.SamplingTools binaries that
+// carry unsigned-executable-memory, library-validation, or task-port
+// exemptions and so can be abused to run in-memory shellcode or attach to
+// other processes. Denied for process-exec under BlockInterpreters.
+var interpreterExecLiteralDenies = []string{
+	"/usr/bin/tclsh",
+	"/usr/bin/wish",
+	"/usr/bin/expect",
+	"/usr/bin/perl",
+	"/usr/bin/ruby",
+	"/usr/bin/python3", // system python (org.python.python); Homebrew/pyenv live elsewhere
+	"/usr/bin/auvaltool",
+	"/usr/bin/auval",
+	// com.apple.SamplingTools — hold com.apple.system-task-ports (task_for_pid)
+	"/usr/bin/symbols",
+	"/usr/bin/vmmap",
+	"/usr/bin/vmmap32",
+	"/usr/bin/sample",
+	"/usr/bin/leaks",
+	"/usr/bin/leaks32",
+	"/usr/bin/heap",
+	"/usr/bin/heap32",
+	"/usr/bin/atos",
+	"/usr/bin/malloc_history",
+	"/usr/bin/malloc_history32",
+	"/usr/bin/stringdups",
+	"/usr/bin/stringdups32",
+	"/usr/bin/filtercalltree",
+}
+
+// interpreterExecSubpathDenies lists framework roots whose binaries must be
+// denied for process-exec, covering direct-framework invocation that the
+// /usr/bin shims above would miss (e.g. the versioned tclsh8.5).
+var interpreterExecSubpathDenies = []string{
+	"/System/Library/Frameworks/Tcl.framework",
+	"/System/Library/Frameworks/Tk.framework",
+	"/System/Library/Frameworks/AudioToolbox.framework/XPCServices",
+}
+
+// interpreterReadDenies lists framework/library trees that hold the FFI
+// bridge (Ffidl) and Tcl/Tk runtime; denying reads prevents an allowed
+// interpreter from loading them to make raw mmap/mprotect calls.
+var interpreterReadDenies = []string{
+	"/System/Library/Tcl", // Ffidl ships here
+	"/System/Library/Frameworks/Tcl.framework",
+	"/System/Library/Frameworks/Tk.framework",
+}
+
+// cmdRealPaths returns the candidate absolute paths a target command may run
+// as: the resolved command and, when it is a symlink (e.g. /usr/bin/tclsh ->
+// the Tcl.framework binary), its symlink target. Seatbelt matches rules
+// against the real path, so the self-command guard must consider both.
+func cmdRealPaths(resolvedCmd string) []string {
+	paths := []string{resolvedCmd}
+	if real, err := filepath.EvalSymlinks(resolvedCmd); err == nil && real != resolvedCmd {
+		paths = append(paths, real)
+	}
+	return paths
+}
+
+// underAny reports whether p equals or is contained beneath any of the given
+// candidate paths.
+func underAny(prefix string, candidates []string) bool {
+	for _, c := range candidates {
+		if c == prefix || strings.HasPrefix(c, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// writeInterpreterExecDenies emits process-exec deny rules for the entitled
+// interpreters and sampling tools. A path is skipped when it is the very
+// command the caller asked to run (including via symlink), so deliberately
+// running, say, perl is not silently broken; a warning is emitted instead.
+func writeInterpreterExecDenies(sb *strings.Builder, resolvedCmd string) {
+	cmdPaths := cmdRealPaths(resolvedCmd)
+	for _, p := range interpreterExecLiteralDenies {
+		if underAny(p, cmdPaths) {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: blockInterpreters is on but the target command is %q; allowing it to run while still blocking it as a child of others.\n", p)
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("(deny process-exec (literal %q))\n", p))
+	}
+	sb.WriteString("(deny process-exec (regex #\"^/usr/bin/perl5\\.[0-9.]+$\"))\n")
+	for _, p := range interpreterExecSubpathDenies {
+		if underAny(p, cmdPaths) {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: blockInterpreters is on but the target command resolves under %q; not blocking it.\n", p)
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("(deny process-exec (subpath %q))\n", p))
+	}
+}
+
+// writeInterpreterReadDenies emits file-read deny rules for the Tcl/Tk/Ffidl
+// trees, skipping a tree the target command itself lives under (so an
+// explicitly-run interpreter can still load its own runtime).
+func writeInterpreterReadDenies(sb *strings.Builder, resolvedCmd string) {
+	cmdPaths := cmdRealPaths(resolvedCmd)
+	for _, p := range interpreterReadDenies {
+		if underAny(p, cmdPaths) {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("(deny file-read* (subpath %q))\n", p))
+	}
+}
+
+// persistenceWriteDenies returns the auto-execution and persistence
+// directories that should be read-only to a confined build: LaunchAgents and
+// LaunchDaemons, the plugin loader trees scanned by privileged daemons
+// (DirectoryService, MIDIServer, QuickLook), preference stores that can be
+// poisoned into launching code, and the world-writable /usr/local/bin that
+// system diagnostic tools resolve helpers from. HOME-relative entries are
+// added when HOME is set.
+func persistenceWriteDenies() []string {
+	paths := []string{
+		"/Library/LaunchAgents",
+		"/Library/LaunchDaemons",
+		"/Library/DirectoryServices/PlugIns",
+		"/Library/Audio/MIDI Drivers",
+		"/Library/QuickLook",
+		"/Library/Preferences",
+		"/usr/local/bin",
+		"/usr/local/sbin",
+	}
+	if home := os.Getenv("HOME"); home != "" {
+		paths = append(paths,
+			filepath.Join(home, "Library/LaunchAgents"),
+			filepath.Join(home, "Library/LaunchDaemons"),
+			filepath.Join(home, "Library/Audio/MIDI Drivers"),
+			filepath.Join(home, "Library/QuickLook"),
+			filepath.Join(home, "Library/Internet Plug-Ins"),
+			filepath.Join(home, "Library/Spotlight"),
+			filepath.Join(home, "Library/Services"),
+			filepath.Join(home, "Library/Mail/Bundles"),
+			filepath.Join(home, "Library/Preferences"),
+		)
+	}
+	return paths
+}
+
 // buildSeatbeltProfile generates a macOS Seatbelt profile from the config.
 func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	var sb strings.Builder
@@ -846,6 +988,16 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		sb.WriteString("(allow process-exec)\n")
 	}
 
+	// Deny preinstalled Apple-signed scripting engines and sampling tools.
+	// These carry unsigned-executable-memory, library-validation, or
+	// task-port exemptions, so a confined process could re-exec one and load
+	// in-memory shellcode or an unsigned dylib that bypasses our filesystem
+	// and exec confinement. Emitted last so the denies win under Seatbelt's
+	// last-match-wins evaluation, regardless of the allow rules above.
+	if cfg.BlockInterpreters {
+		writeInterpreterExecDenies(&sb, resolvedCmd)
+	}
+
 	// Trace exec if requested
 	if cfg.TraceExec {
 		sb.WriteString("(trace process-exec)\n")
@@ -895,6 +1047,14 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		sb.WriteString("(deny file-read* (subpath \"/etc/security\"))\n")
 		sb.WriteString("(deny file-read* (subpath \"/private/etc/security\"))\n")
 		sb.WriteString("(deny file-read* (subpath \"/System/Library/Frameworks/Security.framework\"))\n")
+	}
+
+	// Starve the FFI bridge: deny reads of the Tcl/Tk frameworks and the Tcl
+	// script library (where Ffidl lives), so even an allowed interpreter
+	// cannot load the libffi binding used to call mmap/mprotect directly.
+	// Emitted after the broad /System read allow so the denies win.
+	if cfg.BlockInterpreters {
+		writeInterpreterReadDenies(&sb, resolvedCmd)
 	}
 
 	// Allow reading the specific command binary if it's an absolute path
@@ -977,6 +1137,49 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	for _, p := range sensitiveReadDenies {
 		sb.WriteString(fmt.Sprintf("(deny file-read* (subpath %q))\n", p))
 		sb.WriteString(fmt.Sprintf("(deny file-write* (subpath %q))\n", p))
+	}
+
+	// Deny writes to auto-execution and persistence locations. A build or
+	// package install never legitimately stages a LaunchAgent, a loader
+	// plugin, or a binary in /usr/local/bin, but those are exactly where a
+	// malicious script would drop a payload to survive the sandbox or be
+	// picked up by a privileged system service. Emitted after the temp/write
+	// allows so the denies win; a path the caller explicitly granted via
+	// WritePaths is exempt.
+	if cfg.DenyPersistenceWrites {
+		writePathSet := make(map[string]bool, len(cfg.WritePaths))
+		for _, w := range cfg.WritePaths {
+			writePathSet[filepath.Clean(w)] = true
+		}
+		for _, p := range persistenceWriteDenies() {
+			if writePathSet[filepath.Clean(p)] {
+				continue
+			}
+			sb.WriteString(fmt.Sprintf("(deny file-write* (subpath %q))\n", p))
+		}
+	}
+
+	// Under blockInterpreters, deny reading .dylib files from the writable and
+	// temporary trees. The disable-library-validation exemption lets an
+	// entitled interpreter dlopen an unsigned dylib; if it can only be read
+	// from writable scratch space, that path is closed. Native-addon builds
+	// that compile and immediately load a dylib from the build tree can opt
+	// out with AllowWritableDylibLoad; loadable Node addons (.node) are never
+	// matched.
+	if cfg.BlockInterpreters && !cfg.AllowWritableDylibLoad {
+		dylibDenyPaths := append([]string{"/private/tmp", "/tmp", os.TempDir()}, cfg.WritePaths...)
+		seen := make(map[string]bool)
+		for _, p := range dylibDenyPaths {
+			if p == "" {
+				continue
+			}
+			cp := filepath.Clean(p)
+			if seen[cp] {
+				continue
+			}
+			seen[cp] = true
+			sb.WriteString(fmt.Sprintf("(deny file-read* (subpath %q) (regex #\"\\.dylib$\"))\n", cp))
+		}
 	}
 
 	// Network rules

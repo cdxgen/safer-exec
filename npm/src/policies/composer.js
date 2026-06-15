@@ -78,6 +78,8 @@ export function composerPolicy() {
 
     /** OS-level blocking to prevent composer from spawning child processes */
     blockFork: true,
+    denyPersistenceWrites: true,
+    blockInterpreters: true,
     blockExec: ['*'],
   };
 }

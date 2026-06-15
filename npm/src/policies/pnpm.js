@@ -143,6 +143,8 @@ export function pnpmPolicy() {
 
     // 5. EXECUTION CONTROLS
     blockFork: true,
+    denyPersistenceWrites: true,
+    blockInterpreters: true,
     blockExec: ['*'],
   };
 }

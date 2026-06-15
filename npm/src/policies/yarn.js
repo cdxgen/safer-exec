@@ -71,6 +71,10 @@ export function yarnPolicy() {
     },
 
     blockFork: true,
+
+    denyPersistenceWrites: true,
+
+    blockInterpreters: true,
     blockExec: ['*'],
   };
 }

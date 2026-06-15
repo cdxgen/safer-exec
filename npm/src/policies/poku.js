@@ -69,6 +69,8 @@ export function pokuPolicy() {
 
     // 5. EXECUTION CONTROLS
     blockFork: false,
+    denyPersistenceWrites: true,
+    blockInterpreters: true,
     blockExec: [],
   };
 }

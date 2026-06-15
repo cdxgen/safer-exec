@@ -116,6 +116,14 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	merged.TPMUsed = base.TPMUsed || observed.TPMUsed
 	merged.AntiVMActive = base.AntiVMActive || observed.AntiVMActive
 
+	// Hardening controls — restrictive flags OR together (any layer that
+	// turns one on wins); AllowWritableDylibLoad is a relaxation, so it only
+	// holds when both layers permit it.
+	merged.BlockInterpreters = base.BlockInterpreters || observed.BlockInterpreters
+	merged.DenyPersistenceWrites = base.DenyPersistenceWrites || observed.DenyPersistenceWrites
+	merged.BlockJIT = base.BlockJIT || observed.BlockJIT
+	merged.AllowWritableDylibLoad = base.AllowWritableDylibLoad && observed.AllowWritableDylibLoad
+
 	// HTTP access — union, deduplicated by (method, host, path) key.
 	merged.HTTPAccess = mergeHTTPAccess(base.HTTPAccess, observed.HTTPAccess)
 

@@ -37,7 +37,18 @@ safer-exec --block-exec=sh -- npm install
 safer-exec --block-fork -- npm install
 safer-exec --trace-exec -- npm install
 
-# Pass through specific environment variables from the host (environment is sanitized by default)
+# Block Apple-signed scripting engines / sampling tools that can load in-memory
+# shellcode or unsigned dylibs (tclsh, wish, perl, system python, ruby, vmmap, ...)
+safer-exec --block-interpreters -- npm install
+
+# Deny writes to persistence locations (LaunchAgents, plugin loaders, /usr/local/bin, ...)
+safer-exec --deny-persistence-writes -- npm install
+
+# Block W^X / JIT syscalls at the syscall level (Linux; breaks V8/JVM/LuaJIT)
+safer-exec --block-jit -- ./run-untrusted-binary
+
+# Pass through specific environment variables from the host (environment is sanitized by default).
+# Loader-control vars (DYLD_*, LD_*, NODE_OPTIONS, DEVELOPER_DIR, ...) are stripped unless named here.
 safer-exec --allow-envs=VAR1,VAR2 -- npm install
 
 # Process lifecycle control (Linux only)
@@ -112,141 +123,153 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 
 `new SaferExec(options?)`
 
-| Option               | Type       | Default         | Description                                                                                                                                      |
-| -------------------- | ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `allowHosts`         | `string[]` | `[]`            | Hostnames to allow network access to                                                                                                             |
-| `allowURLRules`      | `Object[]` | `[]`            | Fine-grained URL rules — exact, wildcard, regex, path, method (Linux only, requires `traceHTTPURLs`)                                             |
-| `readPaths`          | `string[]` | `[]`            | Filesystem paths to read from                                                                                                                    |
-| `writePaths`         | `string[]` | `[]`            | Filesystem paths to write to                                                                                                                     |
-| `env`                | `Object`   | `{}`            | Environment variables to set                                                                                                                     |
-| `disableNetwork`     | `boolean`  | `false`         | Cut all network access                                                                                                                           |
-| `maxMemoryMB`        | `number`   | `512`           | Memory limit in megabytes (default: 512)                                                                                                         |
-| `maxCPUCores`        | `number`   | `1.0`           | CPU limit as fractional cores (default: 1.0)                                                                                                     |
-| `maxProcesses`       | `number`   | `100`           | Max child processes — anti-fork bomb (default: 100)                                                                                              |
-| `maxReadIOPS`        | `number`   | `0`             | Max read IO operations per second — I/O bomb prevention (Linux only)                                                                             |
-| `maxWriteIOPS`       | `number`   | `0`             | Max write IO operations per second — I/O bomb prevention (Linux only)                                                                            |
-| `maxReadBps`         | `number`   | `0`             | Max read bandwidth in bytes per second (Linux only)                                                                                              |
-| `maxWriteBps`        | `number`   | `0`             | Max write bandwidth in bytes per second (Linux only)                                                                                             |
-| `timeoutMs`          | `number`   | `60000`         | Hard kill timeout in milliseconds (default: 60000)                                                                                               |
-| `workingDir`         | `string`   | `process.cwd()` | Working directory                                                                                                                                |
-| `binaryPath`         | `string`   | auto-resolved   | Override Go binary path                                                                                                                          |
-| `enableAudit`        | `boolean`  | `false`         | Enable violation auditing                                                                                                                        |
-| `allowPorts`         | `number[]` | `[]`            | TCP ports to allow                                                                                                                               |
-| `enableDiff`         | `boolean`  | `false`         | Enable filesystem mutation diffing                                                                                                               |
-| `enableLearn`        | `boolean`  | `false`         | Enable behavioral auto-profiling                                                                                                                 |
-| `validateProfile`    | `boolean`  | `false`         | Validate Seatbelt profile syntax without executing (macOS only)                                                                                  |
-| `allowExec`          | `string[]` | `[]`            | Executables the command is allowed to run                                                                                                        |
-| `blockExec`          | `string[]` | `[]`            | Executables to block from running                                                                                                                |
-| `blockFork`          | `boolean`  | `false`         | Prevent forking new processes                                                                                                                    |
-| `traceExec`          | `boolean`  | `false`         | Log every child process spawned                                                                                                                  |
-| `strict`             | `boolean`  | `false`         | Treat sandbox setup warnings as errors                                                                                                           |
-| `allowCrypto`        | `boolean`  | `true`          | Permit cryptographic library/device access                                                                                                       |
-| `blockCrypto`        | `boolean`  | `false`         | Block system crypto libraries access                                                                                                             |
-| `blockCryptoEntropy` | `boolean`  | `false`         | Block entropy (/dev/random) device access                                                                                                        |
-| `detectFIPS`         | `boolean`  | `false`         | Enable FIPS compliance checks/logging                                                                                                            |
-| `strictFIPS`         | `boolean`  | `false`         | Force strict FIPS validation                                                                                                                     |
-| `allowGPU`           | `boolean`  | `false`         | Permit process to utilize host GPU nodes                                                                                                         |
-| `blockTPM`           | `boolean`  | `false`         | Restrict hardware access to TPM device                                                                                                           |
-| `spoofAntiVM`        | `boolean`  | `false`         | Intercept debugger & virtualization checks                                                                                                       |
-| `traceLibraries`     | `boolean`  | `false`         | Track dynamic library loading (opt-in)                                                                                                           |
-| `traceHTTPURLs`      | `boolean`  | `false`         | Capture HTTPS request URLs via eBPF uprobes (Linux only, requires CAP_BPF)                                                                       |
-| `allowEnvs`          | `string[]` | `[]`            | Host env vars to pass through (environment is sanitized by default)                                                                              |
-| `allowHidden`        | `boolean`  | `false`         | Allow read/write access to hidden files and directories (dotfiles)                                                                               |
-| `allowListen`        | `string[]` | `[]`            | IP addresses or ip:port strings to allow listening on (blocked by default, even on loopback)                                                     |
-| `traceCrypto`        | `boolean`  | `false`         | Enable cryptographic tracing — cipher suites and library detection (Linux only, requires CAP_BPF). Auto-enables `traceHTTPURLs`.                 |
-| `cbomOutputPath`     | `string`   | `""`            | Write a CycloneDX CBOM JSON document to this path when `traceCrypto` is active                                                                   |
-| `cryptoProbeMode`    | `string`   | `"tls-only"`    | Crypto probe depth: `"tls-only"` (default) captures TLS ciphers; `"operations"` also captures digest, encrypt, sign operations (higher overhead) |
+| Option                   | Type       | Default         | Description                                                                                                                                                                        |
+| ------------------------ | ---------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `allowHosts`             | `string[]` | `[]`            | Hostnames to allow network access to                                                                                                                                               |
+| `allowURLRules`          | `Object[]` | `[]`            | Fine-grained URL rules — exact, wildcard, regex, path, method (Linux only, requires `traceHTTPURLs`)                                                                               |
+| `readPaths`              | `string[]` | `[]`            | Filesystem paths to read from                                                                                                                                                      |
+| `writePaths`             | `string[]` | `[]`            | Filesystem paths to write to                                                                                                                                                       |
+| `env`                    | `Object`   | `{}`            | Environment variables to set                                                                                                                                                       |
+| `disableNetwork`         | `boolean`  | `false`         | Cut all network access                                                                                                                                                             |
+| `maxMemoryMB`            | `number`   | `512`           | Memory limit in megabytes (default: 512)                                                                                                                                           |
+| `maxCPUCores`            | `number`   | `1.0`           | CPU limit as fractional cores (default: 1.0)                                                                                                                                       |
+| `maxProcesses`           | `number`   | `100`           | Max child processes — anti-fork bomb (default: 100)                                                                                                                                |
+| `maxReadIOPS`            | `number`   | `0`             | Max read IO operations per second — I/O bomb prevention (Linux only)                                                                                                               |
+| `maxWriteIOPS`           | `number`   | `0`             | Max write IO operations per second — I/O bomb prevention (Linux only)                                                                                                              |
+| `maxReadBps`             | `number`   | `0`             | Max read bandwidth in bytes per second (Linux only)                                                                                                                                |
+| `maxWriteBps`            | `number`   | `0`             | Max write bandwidth in bytes per second (Linux only)                                                                                                                               |
+| `timeoutMs`              | `number`   | `60000`         | Hard kill timeout in milliseconds (default: 60000)                                                                                                                                 |
+| `workingDir`             | `string`   | `process.cwd()` | Working directory                                                                                                                                                                  |
+| `binaryPath`             | `string`   | auto-resolved   | Override Go binary path                                                                                                                                                            |
+| `enableAudit`            | `boolean`  | `false`         | Enable violation auditing                                                                                                                                                          |
+| `allowPorts`             | `number[]` | `[]`            | TCP ports to allow                                                                                                                                                                 |
+| `enableDiff`             | `boolean`  | `false`         | Enable filesystem mutation diffing                                                                                                                                                 |
+| `enableLearn`            | `boolean`  | `false`         | Enable behavioral auto-profiling                                                                                                                                                   |
+| `validateProfile`        | `boolean`  | `false`         | Validate Seatbelt profile syntax without executing (macOS only)                                                                                                                    |
+| `allowExec`              | `string[]` | `[]`            | Executables the command is allowed to run                                                                                                                                          |
+| `blockExec`              | `string[]` | `[]`            | Executables to block from running                                                                                                                                                  |
+| `blockFork`              | `boolean`  | `false`         | Prevent forking new processes                                                                                                                                                      |
+| `blockInterpreters`      | `boolean`  | `false`         | Deny Apple-signed scripting engines / sampling tools that can load in-memory shellcode or unsigned dylibs (macOS only)                                                             |
+| `denyPersistenceWrites`  | `boolean`  | `false`         | Deny writes to LaunchAgents, plugin loaders, `/usr/local/bin`, preference stores and other persistence locations (enforced on macOS)                                               |
+| `allowWritableDylibLoad` | `boolean`  | `false`         | Permit loading `.dylib` from writable/temp dirs under `blockInterpreters` — for native-addon builds (macOS only)                                                                   |
+| `blockJIT`               | `boolean`  | `false`         | Block W^X / JIT syscalls (mprotect PROT_EXEC, mmap W+X, memfd_create). Breaks V8/JVM/LuaJIT; opt-in (Linux only)                                                                   |
+| `traceExec`              | `boolean`  | `false`         | Log every child process spawned                                                                                                                                                    |
+| `strict`                 | `boolean`  | `false`         | Treat sandbox setup warnings as errors                                                                                                                                             |
+| `allowCrypto`            | `boolean`  | `true`          | Permit cryptographic library/device access                                                                                                                                         |
+| `blockCrypto`            | `boolean`  | `false`         | Block system crypto libraries access                                                                                                                                               |
+| `blockCryptoEntropy`     | `boolean`  | `false`         | Block entropy (/dev/random) device access                                                                                                                                          |
+| `detectFIPS`             | `boolean`  | `false`         | Enable FIPS compliance checks/logging                                                                                                                                              |
+| `strictFIPS`             | `boolean`  | `false`         | Force strict FIPS validation                                                                                                                                                       |
+| `allowGPU`               | `boolean`  | `false`         | Permit process to utilize host GPU nodes                                                                                                                                           |
+| `blockTPM`               | `boolean`  | `false`         | Restrict hardware access to TPM device                                                                                                                                             |
+| `spoofAntiVM`            | `boolean`  | `false`         | Intercept debugger & virtualization checks                                                                                                                                         |
+| `traceLibraries`         | `boolean`  | `false`         | Track dynamic library loading (opt-in)                                                                                                                                             |
+| `traceHTTPURLs`          | `boolean`  | `false`         | Capture HTTPS request URLs via eBPF uprobes (Linux only, requires CAP_BPF)                                                                                                         |
+| `allowEnvs`              | `string[]` | `[]`            | Host env vars to pass through (sanitized by default; also the opt-in for loader-control vars like `DYLD_*`, `LD_*`, `NODE_OPTIONS`, `DEVELOPER_DIR`, which are stripped otherwise) |
+| `allowHidden`            | `boolean`  | `false`         | Allow read/write access to hidden files and directories (dotfiles)                                                                                                                 |
+| `allowListen`            | `string[]` | `[]`            | IP addresses or ip:port strings to allow listening on (blocked by default, even on loopback)                                                                                       |
+| `traceCrypto`            | `boolean`  | `false`         | Enable cryptographic tracing — cipher suites and library detection (Linux only, requires CAP_BPF). Auto-enables `traceHTTPURLs`.                                                   |
+| `cbomOutputPath`         | `string`   | `""`            | Write a CycloneDX CBOM JSON document to this path when `traceCrypto` is active                                                                                                     |
+| `cryptoProbeMode`        | `string`   | `"tls-only"`    | Crypto probe depth: `"tls-only"` (default) captures TLS ciphers; `"operations"` also captures digest, encrypt, sign operations (higher overhead)                                   |
 
 ### Instance Methods
 
 All methods return `this` for chaining except `.run()`.
 
-| Method                     | Description                                                                                                                            |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `.applyPolicy(name)`       | Apply a pre-defined policy. Throws if unknown.                                                                                         |
-| `.allowHosts(...hosts)`    | Add hostnames to the network allow list                                                                                                |
-| `.allowUrls(...urls)`      | Add fine-grained URL rules — strings or `{host,protocol,path,methods,port}` objects (Linux only)                                       |
-| `.readPaths(...paths)`     | Add filesystem read paths                                                                                                              |
-| `.writePaths(...paths)`    | Add filesystem write paths                                                                                                             |
-| `.env(key, value)`         | Set an environment variable                                                                                                            |
-| `.disableNetwork()`        | Disable all network access                                                                                                             |
-| `.maxMemory(mb)`           | Set memory limit in megabytes                                                                                                          |
-| `.maxCPUCores(cores)`      | Set CPU limit as fractional cores (e.g. 0.5)                                                                                           |
-| `.maxProcesses(count)`     | Set maximum child process count                                                                                                        |
-| `.maxReadIOPS(iops)`       | Set max read IO operations per second (Linux only)                                                                                     |
-| `.maxWriteIOPS(iops)`      | Set max write IO operations per second (Linux only)                                                                                    |
-| `.maxReadBps(bps)`         | Set max read bytes per second (Linux only)                                                                                             |
-| `.maxWriteBps(bps)`        | Set max write bytes per second (Linux only)                                                                                            |
-| `.timeout(ms)`             | Set hard kill timeout in milliseconds                                                                                                  |
-| `.binaryPath(path)`        | Override the Go binary path                                                                                                            |
-| `.workingDir(dir)`         | Set the working directory                                                                                                              |
-| `.enableAudit()`           | Enable sandbox violation auditing                                                                                                      |
-| `.allowPorts(...ports)`    | Set allowed TCP ports                                                                                                                  |
-| `.enableDiff()`            | Enable filesystem mutation diffing                                                                                                     |
-| `.enableLearn()`           | Enable behavioral auto-profiling                                                                                                       |
-| `.validateProfile()`       | Validate Seatbelt profile syntax without executing (macOS)                                                                             |
-| `.allowExec(...cmds)`      | Restrict which executables can run                                                                                                     |
-| `.blockExec(...cmds)`      | Block specific executables from running                                                                                                |
-| `.blockFork()`             | Prevent the command from forking new processes                                                                                         |
-| `.traceExec()`             | Log every child process spawned                                                                                                        |
-| `.strict()`                | Treat sandbox setup warnings as hard errors                                                                                            |
-| `.resolveSymlinks()`       | Resolve target command symlink in PATH                                                                                                 |
-| `.allowCrypto(allow)`      | Allow/disallow cryptographic operations                                                                                                |
-| `.blockCrypto()`           | Restrict system cryptographic libraries                                                                                                |
-| `.blockCryptoEntropy()`    | Restrict entropy devices (/dev/random)                                                                                                 |
-| `.detectFIPS()`            | Log and watch for FIPS lookups                                                                                                         |
-| `.strictFIPS()`            | Restrict runtime to strict FIPS compliant mode                                                                                         |
-| `.allowGPU(allow)`         | Allow/disallow access to host GPU nodes                                                                                                |
-| `.blockTPM()`              | Restrict hardware access to TPM device                                                                                                 |
-| `.spoofAntiVM()`           | Intercept debugger & virtualization checks                                                                                             |
-| `.traceLibraries()`        | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS)                                                               |
-| `.traceHTTPURLs()`         | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)                                                                   |
-| `.allowEnvs(...keys)`      | Allow specific host environment variables to pass through from the host process                                                        |
-| `.allowHidden(allow)`      | Allow/disallow access to hidden files and directories (dotfiles)                                                                       |
-| `.allowListen(list)`       | Allow listening/binding on specific IP addresses or ip:port strings (blocked by default, even loopback)                                |
-| `.traceCrypto()`           | Enable TLS cipher suite and crypto library detection via eBPF uprobes (Linux only). Auto-enables `.traceHTTPURLs()`.                   |
-| `.cbom(path)`              | Set the output path for the CycloneDX CBOM JSON document (requires `.traceCrypto()`)                                                   |
-| `.cryptoProbeMode(mode)`   | Set crypto probe depth: `"tls-only"` (default) or `"operations"` (also captures digest/sign ops)                                       |
-| `.setUpDev(enable)`        | Enabled by default. Pass `false` to disable minimal `/dev` setup inside sandbox. Linux-only.                                           |
-| `.dieWithParent()`         | Enabled by default. Kill sandboxed process with SIGKILL when parent dies (PR_SET_PDEATHSIG). Linux-only. Pass `false` to disable.      |
-| `.newSession()`            | Enabled by default. Disconnect from controlling terminal via setsid(). Linux-only. Pass `false` to disable.                            |
-| `.tmpOverlayPaths(...)`    | Create ephemeral writable overlays at paths (overlayfs, Linux only)                                                                    |
-| `.bindUseFd(use)`          | Opt-in. Use fd-based bind mounting for TOCTTOU safety. Linux-only.                                                                     |
-| `.seccompFilters(filters)` | Stack additional seccomp-bpf filters (base64 encoded or file path, Linux only)                                                         |
-| `.protectSystem(mode)`     | Opt-in (default `"off"`). Make system directories read-only automatically. Modes: `"strict"`, `"full"`, `"off"`. Linux-only.           |
-| `.protectHome(mode)`       | Opt-in. Isolate the user's home directory. Modes: `"read-only"`, `"tmpfs"`, `"off"` (default). Linux-only.                             |
-| `.privateTmp(enable)`      | Replace `/tmp` and `/var/tmp` with fresh tmpfs. Linux-only.                                                                            |
-| `.bindFds(...specs)`       | Bind-mount pre-opened file descriptors into the sandbox. Each spec: `{ fd: number, target: string, readOnly?: boolean }` — Linux-only. |
-| `.lockFilesExclusive(...)` | Acquire exclusive (write) advisory locks. Convenience for serialized coordination.                                                     |
-| `.seccompPolicy(policy)`   | Stack a Kafel-style seccomp policy using simple syntax. Example: `"ALLOW openat, read, write; DEFAULT KILL"`                           |
-| `.mapToTargetUid(enable)`  | Map UID 0 inside namespace to the caller's real UID. Linux-only.                                                                       |
-| `.lockFiles(...specs)`     | accepts `{ path: string, exclusive?: boolean }` objects in addition to plain strings.                                                  |
+| Method                      | Description                                                                                                                                                                          |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `.applyPolicy(name)`        | Apply a pre-defined policy. Throws if unknown.                                                                                                                                       |
+| `.allowHosts(...hosts)`     | Add hostnames to the network allow list                                                                                                                                              |
+| `.allowUrls(...urls)`       | Add fine-grained URL rules — strings or `{host,protocol,path,methods,port}` objects (Linux only)                                                                                     |
+| `.readPaths(...paths)`      | Add filesystem read paths                                                                                                                                                            |
+| `.writePaths(...paths)`     | Add filesystem write paths                                                                                                                                                           |
+| `.env(key, value)`          | Set an environment variable                                                                                                                                                          |
+| `.disableNetwork()`         | Disable all network access                                                                                                                                                           |
+| `.maxMemory(mb)`            | Set memory limit in megabytes                                                                                                                                                        |
+| `.maxCPUCores(cores)`       | Set CPU limit as fractional cores (e.g. 0.5)                                                                                                                                         |
+| `.maxProcesses(count)`      | Set maximum child process count                                                                                                                                                      |
+| `.maxReadIOPS(iops)`        | Set max read IO operations per second (Linux only)                                                                                                                                   |
+| `.maxWriteIOPS(iops)`       | Set max write IO operations per second (Linux only)                                                                                                                                  |
+| `.maxReadBps(bps)`          | Set max read bytes per second (Linux only)                                                                                                                                           |
+| `.maxWriteBps(bps)`         | Set max write bytes per second (Linux only)                                                                                                                                          |
+| `.timeout(ms)`              | Set hard kill timeout in milliseconds                                                                                                                                                |
+| `.binaryPath(path)`         | Override the Go binary path                                                                                                                                                          |
+| `.workingDir(dir)`          | Set the working directory                                                                                                                                                            |
+| `.enableAudit()`            | Enable sandbox violation auditing                                                                                                                                                    |
+| `.allowPorts(...ports)`     | Set allowed TCP ports                                                                                                                                                                |
+| `.enableDiff()`             | Enable filesystem mutation diffing                                                                                                                                                   |
+| `.enableLearn()`            | Enable behavioral auto-profiling                                                                                                                                                     |
+| `.validateProfile()`        | Validate Seatbelt profile syntax without executing (macOS)                                                                                                                           |
+| `.allowExec(...cmds)`       | Restrict which executables can run                                                                                                                                                   |
+| `.blockExec(...cmds)`       | Block specific executables from running                                                                                                                                              |
+| `.blockFork()`              | Prevent the command from forking new processes                                                                                                                                       |
+| `.blockInterpreters()`      | Deny Apple-signed scripting engines / sampling tools that can load in-memory shellcode or unsigned dylibs (macOS)                                                                    |
+| `.denyPersistenceWrites()`  | Deny writes to LaunchAgents, plugin loaders, `/usr/local/bin` and other persistence locations (enforced on macOS)                                                                    |
+| `.allowWritableDylibLoad()` | Permit loading `.dylib` from writable/temp dirs under `.blockInterpreters()` — for native-addon builds (macOS)                                                                       |
+| `.blockJIT()`               | Block W^X / JIT syscalls (mprotect PROT_EXEC, mmap W+X, memfd_create). Breaks V8/JVM/LuaJIT; opt-in (Linux)                                                                          |
+| `.traceExec()`              | Log every child process spawned                                                                                                                                                      |
+| `.strict()`                 | Treat sandbox setup warnings as hard errors                                                                                                                                          |
+| `.resolveSymlinks()`        | Resolve target command symlink in PATH                                                                                                                                               |
+| `.allowCrypto(allow)`       | Allow/disallow cryptographic operations                                                                                                                                              |
+| `.blockCrypto()`            | Restrict system cryptographic libraries                                                                                                                                              |
+| `.blockCryptoEntropy()`     | Restrict entropy devices (/dev/random)                                                                                                                                               |
+| `.detectFIPS()`             | Log and watch for FIPS lookups                                                                                                                                                       |
+| `.strictFIPS()`             | Restrict runtime to strict FIPS compliant mode                                                                                                                                       |
+| `.allowGPU(allow)`          | Allow/disallow access to host GPU nodes                                                                                                                                              |
+| `.blockTPM()`               | Restrict hardware access to TPM device                                                                                                                                               |
+| `.spoofAntiVM()`            | Intercept debugger & virtualization checks                                                                                                                                           |
+| `.traceLibraries()`         | Track dynamic library loading (LD_AUDIT on Linux, audit events on macOS)                                                                                                             |
+| `.traceHTTPURLs()`          | Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only)                                                                                                                 |
+| `.allowEnvs(...keys)`       | Allow specific host environment variables to pass through. Also the opt-in for loader-control vars (`DYLD_*`, `LD_*`, `NODE_OPTIONS`, `DEVELOPER_DIR`), which are stripped otherwise |
+| `.allowHidden(allow)`       | Allow/disallow access to hidden files and directories (dotfiles)                                                                                                                     |
+| `.allowListen(list)`        | Allow listening/binding on specific IP addresses or ip:port strings (blocked by default, even loopback)                                                                              |
+| `.traceCrypto()`            | Enable TLS cipher suite and crypto library detection via eBPF uprobes (Linux only). Auto-enables `.traceHTTPURLs()`.                                                                 |
+| `.cbom(path)`               | Set the output path for the CycloneDX CBOM JSON document (requires `.traceCrypto()`)                                                                                                 |
+| `.cryptoProbeMode(mode)`    | Set crypto probe depth: `"tls-only"` (default) or `"operations"` (also captures digest/sign ops)                                                                                     |
+| `.setUpDev(enable)`         | Enabled by default. Pass `false` to disable minimal `/dev` setup inside sandbox. Linux-only.                                                                                         |
+| `.dieWithParent()`          | Enabled by default. Kill sandboxed process with SIGKILL when parent dies (PR_SET_PDEATHSIG). Linux-only. Pass `false` to disable.                                                    |
+| `.newSession()`             | Enabled by default. Disconnect from controlling terminal via setsid(). Linux-only. Pass `false` to disable.                                                                          |
+| `.tmpOverlayPaths(...)`     | Create ephemeral writable overlays at paths (overlayfs, Linux only)                                                                                                                  |
+| `.bindUseFd(use)`           | Opt-in. Use fd-based bind mounting for TOCTTOU safety. Linux-only.                                                                                                                   |
+| `.seccompFilters(filters)`  | Stack additional seccomp-bpf filters (base64 encoded or file path, Linux only)                                                                                                       |
+| `.protectSystem(mode)`      | Opt-in (default `"off"`). Make system directories read-only automatically. Modes: `"strict"`, `"full"`, `"off"`. Linux-only.                                                         |
+| `.protectHome(mode)`        | Opt-in. Isolate the user's home directory. Modes: `"read-only"`, `"tmpfs"`, `"off"` (default). Linux-only.                                                                           |
+| `.privateTmp(enable)`       | Replace `/tmp` and `/var/tmp` with fresh tmpfs. Linux-only.                                                                                                                          |
+| `.bindFds(...specs)`        | Bind-mount pre-opened file descriptors into the sandbox. Each spec: `{ fd: number, target: string, readOnly?: boolean }` — Linux-only.                                               |
+| `.lockFilesExclusive(...)`  | Acquire exclusive (write) advisory locks. Convenience for serialized coordination.                                                                                                   |
+| `.seccompPolicy(policy)`    | Stack a Kafel-style seccomp policy using simple syntax. Example: `"ALLOW openat, read, write; DEFAULT KILL"`                                                                         |
+| `.mapToTargetUid(enable)`   | Map UID 0 inside namespace to the caller's real UID. Linux-only.                                                                                                                     |
+| `.lockFiles(...specs)`      | accepts `{ path: string, exclusive?: boolean }` objects in addition to plain strings.                                                                                                |
 
 ### OS & Capability Support Matrix
 
-| API Method                             | macOS | Linux | Windows / BSD | Required Capabilities / Permissions                    | Notes                                                                          |
-| :------------------------------------- | :---: | :---: | :-----------: | :----------------------------------------------------- | :----------------------------------------------------------------------------- |
-| `.allowHosts(...)`                     |  Yes  |  Yes  |      No       | None                                                   | On Linux: DNS resolution to IP. On macOS: Seatbelt rules.                      |
-| `.allowListen(...)`                    |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | Blocks loopback port binding by default unless explicitly permitted.           |
-| `.allowPorts(...)`                     |  Yes  |  Yes  |      No       | None                                                   | Restricts outbound ports. macOS uses Seatbelt; Linux uses Landlock.            |
-| `.allowUrls(...)`                      |  No   |  Yes  |      No       | `CAP_BPF`, `CAP_PERFMON`                               | Requires eBPF tracing engine.                                                  |
-| `.readPaths(...)` / `.writePaths(...)` |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | Restricts filesystem access. macOS uses Seatbelt; Linux uses Mount Namespaces. |
-| `.disableNetwork()`                    |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS blocks outbound; Linux unshares Net Namespace.                           |
-| `.maxMemory(...)`                      |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_AS`. Linux: cgroups v2 `memory.max`.                            |
-| `.maxCPUCores(...)`                    |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_CPU`. Linux: cgroups v2 `cpu.max`.                              |
-| `.maxProcesses(...)`                   |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_NPROC`. Linux: cgroups v2 `pids.max`.                           |
-| `.maxReadIOPS(...)` etc.               |  No   |  Yes  |      No       | Cgroups write permission                               | Linux cgroups v2 `io.max` throttling.                                          |
-| `.enableAudit()`                       |  Yes  |  Yes  |      No       | None                                                   | macOS uses Seatbelt trace; Linux uses Seccomp-BPF trap.                        |
-| `.enableDiff()`                        |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS: Shadow dir snapshot. Linux: OverlayFS mount.                            |
-| `.enableLearn()`                       |  Yes  |  Yes  |      No       | None (macOS), `SYS_PTRACE` or `ptrace_scope=0` (Linux) | macOS parses Seatbelt trace logs. Linux uses `strace` or fallback.             |
-| `.allowExec(...)` / `.blockExec(...)`  |  Yes  |  Yes  |      No       | None                                                   | Restricts process execution. macOS uses Seatbelt; Linux uses Seccomp.          |
-| `.blockFork()`                         |  Yes  |  Yes  |      No       | None                                                   | macOS uses Seatbelt; Linux uses Seccomp.                                       |
-| `.traceExec()`                         |  Yes  |  Yes  |      No       | None                                                   | Logs child spawns. macOS: Seatbelt trace. Linux: Seccomp trap.                 |
-| `.allowGPU(...)`                       |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Bind mounts device nodes to sandbox.                               |
-| `.blockTPM()`                          |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Restricts access to `/dev/tpm*`.                                   |
-| `.spoofAntiVM()`                       |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Conceals sandbox execution details.                                |
-| `.traceLibraries()`                    |  Yes  |  Yes  |      No       | None                                                   | macOS: `DYLD_INSERT_LIBRARIES`. Linux: `LD_AUDIT`.                             |
-| `.traceHTTPURLs()` / `.traceCrypto()`  |  No   |  Yes  |      No       | `CAP_BPF`, `CAP_PERFMON`                               | Linux eBPF TLS uprobes.                                                        |
+| API Method                             | macOS | Linux | Windows / BSD | Required Capabilities / Permissions                    | Notes                                                                                                                                                  |
+| :------------------------------------- | :---: | :---: | :-----------: | :----------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.allowHosts(...)`                     |  Yes  |  Yes  |      No       | None                                                   | On Linux: DNS resolution to IP. On macOS: Seatbelt rules.                                                                                              |
+| `.allowListen(...)`                    |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | Blocks loopback port binding by default unless explicitly permitted.                                                                                   |
+| `.allowPorts(...)`                     |  Yes  |  Yes  |      No       | None                                                   | Restricts outbound ports. macOS uses Seatbelt; Linux uses Landlock.                                                                                    |
+| `.allowUrls(...)`                      |  No   |  Yes  |      No       | `CAP_BPF`, `CAP_PERFMON`                               | Requires eBPF tracing engine.                                                                                                                          |
+| `.readPaths(...)` / `.writePaths(...)` |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | Restricts filesystem access. macOS uses Seatbelt; Linux uses Mount Namespaces.                                                                         |
+| `.disableNetwork()`                    |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS blocks outbound; Linux unshares Net Namespace.                                                                                                   |
+| `.maxMemory(...)`                      |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_AS`. Linux: cgroups v2 `memory.max`.                                                                                                    |
+| `.maxCPUCores(...)`                    |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_CPU`. Linux: cgroups v2 `cpu.max`.                                                                                                      |
+| `.maxProcesses(...)`                   |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_NPROC`. Linux: cgroups v2 `pids.max`.                                                                                                   |
+| `.maxReadIOPS(...)` etc.               |  No   |  Yes  |      No       | Cgroups write permission                               | Linux cgroups v2 `io.max` throttling.                                                                                                                  |
+| `.enableAudit()`                       |  Yes  |  Yes  |      No       | None                                                   | macOS uses Seatbelt trace; Linux uses Seccomp-BPF trap.                                                                                                |
+| `.enableDiff()`                        |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS: Shadow dir snapshot. Linux: OverlayFS mount.                                                                                                    |
+| `.enableLearn()`                       |  Yes  |  Yes  |      No       | None (macOS), `SYS_PTRACE` or `ptrace_scope=0` (Linux) | macOS parses Seatbelt trace logs. Linux uses `strace` or fallback.                                                                                     |
+| `.allowExec(...)` / `.blockExec(...)`  |  Yes  |  Yes  |      No       | None                                                   | Restricts process execution. macOS uses Seatbelt; Linux uses Seccomp.                                                                                  |
+| `.blockFork()`                         |  Yes  |  Yes  |      No       | None                                                   | macOS uses Seatbelt; Linux uses Seccomp.                                                                                                               |
+| `.blockInterpreters()`                 |  Yes  |  n/a  |      No       | None                                                   | macOS-only. Denies tclsh/wish/perl/python/ruby/SamplingTools exec + starves Tcl/Tk/Ffidl reads. No-op elsewhere.                                       |
+| `.denyPersistenceWrites()`             |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS: Seatbelt write denies on LaunchAgents/plugins/`/usr/local/bin`. Linux: already deny-by-default via Landlock allowlist.                          |
+| `.allowWritableDylibLoad()`            |  Yes  |  n/a  |      No       | None                                                   | macOS-only. Relaxes the `.blockInterpreters()` writable-`.dylib` read deny.                                                                            |
+| `.blockJIT()`                          |  No   |  Yes  |      No       | None                                                   | Linux-only (Seccomp W^X). Denies mprotect PROT_EXEC, mmap W+X, memfd_create. Breaks V8/JVM/LuaJIT — opt-in. On macOS, Seatbelt cannot filter syscalls. |
+| `.traceExec()`                         |  Yes  |  Yes  |      No       | None                                                   | Logs child spawns. macOS: Seatbelt trace. Linux: Seccomp trap.                                                                                         |
+| `.allowGPU(...)`                       |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Bind mounts device nodes to sandbox.                                                                                                       |
+| `.blockTPM()`                          |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Restricts access to `/dev/tpm*`.                                                                                                           |
+| `.spoofAntiVM()`                       |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Conceals sandbox execution details.                                                                                                        |
+| `.traceLibraries()`                    |  Yes  |  Yes  |      No       | None                                                   | macOS: `DYLD_INSERT_LIBRARIES`. Linux: `LD_AUDIT`.                                                                                                     |
+| `.traceHTTPURLs()` / `.traceCrypto()`  |  No   |  Yes  |      No       | `CAP_BPF`, `CAP_PERFMON`                               | Linux eBPF TLS uprobes.                                                                                                                                |
 
 ### Static Methods
 
@@ -505,6 +528,8 @@ Available policies: `npm`, `pnpm`, `yarn`, `pypi`, `maven`, `cargo`, `rubygems`,
 Each policy is platform-aware. Paths are resolved at runtime based on the operating system. For example, the npm policy detects the Node binary directory, resolves SSL certificate paths for macOS versus Linux, and sets registry host allow lists for npm, Yarn, and JS CDN endpoints.
 
 Policies that cover JavaScript package managers include `blockFork: true` and `blockExec: ['*']` by default to prevent postinstall scripts from spawning subprocesses.
+
+All built-in policies set `denyPersistenceWrites: true`, so an install can never stage a LaunchAgent, a loader plugin, or a binary in `/usr/local/bin` (enforced on macOS; Linux is already deny-by-default for ungranted paths). The non-interpreter ecosystems (`npm`, `pnpm`, `yarn`, `bun`, `deno`, `maven`, `cargo`, `gomod`, `composer`) additionally set `blockInterpreters: true`, blocking the Apple-signed scripting engines and sampling tools that can load in-memory shellcode. The interpreter-driven ecosystems (`pypi`, `uv`, `rubygems`) deliberately leave `blockInterpreters` off, since their own runtime is one of those engines. `blockJIT` is never enabled by default — every ecosystem runs or can invoke a JIT (V8/Node, the JVM), so enable it only for workloads you know do not JIT.
 
 ## Fork and Exec Control
 

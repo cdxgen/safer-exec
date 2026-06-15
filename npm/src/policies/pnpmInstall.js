@@ -35,6 +35,8 @@ export function pnpmInstallPolicy() {
     readPaths: Array.from(readPaths),
     writePaths: Array.from(writePaths),
     blockFork: false,
+    denyPersistenceWrites: true,
+    blockInterpreters: true,
     blockExec: [],
   };
 }
