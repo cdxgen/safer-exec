@@ -18,12 +18,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -70,7 +72,7 @@ func writeStructured(cfg config.ExecConfig, marker string, data []byte) {
 func run(cfg config.ExecConfig) error {
 	// Handle dump profile mode: output profile and exit
 	if cfg.DumpProfile {
-		profile := buildSeatbeltProfile(cfg)
+		profile := buildSeatbeltProfile(cfg, 0)
 		writeStructured(cfg, "PROFILE:", []byte(profile))
 		return nil
 	}
@@ -121,7 +123,29 @@ func run(cfg config.ExecConfig) error {
 		}
 	}
 
-	// Set environment securely using filtered environment
+	// Egress proxy: enforce the hostname allowlist at CONNECT time and confine
+	// all outbound traffic to the loopback proxy port. This is the only way to
+	// get hostname-level egress control on macOS (Seatbelt is port-only).
+	// Must run before BuildEnv so the injected HTTP(S)_PROXY variables reach
+	// the sandboxed process.
+	var proxy *egressProxy
+	proxyPort := 0
+	if cfg.ProxyEgress {
+		if p, err := startEgressProxy(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: egress proxy unavailable (%v); falling back to port-only egress confinement\n", err)
+		} else {
+			proxy = p
+			defer p.Close()
+			proxyPort = p.port
+			p.injectEnv(&cfg)
+			// The sandboxed process must be able to reach 127.0.0.1:proxyPort.
+			cfg.AllowLoopback = true
+			fmt.Fprintf(os.Stderr, "safer-exec: egress proxy listening on 127.0.0.1:%d; outbound traffic is confined to it and hostnames are enforced at CONNECT time\n", proxyPort)
+		}
+	}
+
+	// Set environment securely using filtered environment (includes any proxy
+	// variables injected above)
 	env := config.BuildEnv(cfg.Env)
 
 	// Library tracing on macOS: modern macOS (Big Sur+) hardened runtime prevents
@@ -143,7 +167,7 @@ func run(cfg config.ExecConfig) error {
 	}
 
 	// Build the Seatbelt profile (after potentially adding the dylib path to ReadPaths)
-	profile := buildSeatbeltProfile(cfg)
+	profile := buildSeatbeltProfile(cfg, proxyPort)
 
 	// Write profile to a temporary file
 	tmpFile, err := os.CreateTemp("", "safer-exec-profile-*.sb")
@@ -192,11 +216,32 @@ func run(cfg config.ExecConfig) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
+	auditStartedAt := time.Now()
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("running command: %w", err)
+	}
+	// The sandboxed target keeps the sandbox-exec PID (the profile is applied
+	// and the command exec'd in place), used later for audit attribution.
+	rootPID := cmd.Process.Pid
+
+	waitDone := func() error { return cmd.Wait() }
+
+	// os.Exit skips deferred cleanup, so proxy teardown and audit flushes are
+	// funneled through here on every exit path.
+	finish := func() {
+		if proxy != nil {
+			proxy.flushViolations()
+			proxy.Close()
+			proxy = nil
+		}
+		reportDarwinAudit(cfg, auditStartedAt, rootPID)
+	}
+
 	// Set a hard timeout using a goroutine if timeoutMs is set
 	if cfg.TimeoutMs > 0 {
 		done := make(chan error, 1)
 		go func() {
-			done <- cmd.Run()
+			done <- waitDone()
 		}()
 
 		select {
@@ -204,30 +249,36 @@ func run(cfg config.ExecConfig) error {
 			if err != nil {
 				if exitErr, ok := err.(*exec.ExitError); ok {
 					code := exitErr.ExitCode()
+					finish()
 					if code == 132 || code == 137 || code == 153 {
 						os.Exit(0)
 					}
 					os.Exit(code)
 				}
+				finish()
 				return fmt.Errorf("running command: %w", err)
 			}
 		case <-time.After(time.Duration(cfg.TimeoutMs) * time.Millisecond):
 			cmd.Process.Kill()
 			<-done
+			finish()
 			os.Exit(124) // Standard timeout exit code
 		}
 	} else {
-		if err := cmd.Run(); err != nil {
+		if err := waitDone(); err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				code := exitErr.ExitCode()
+				finish()
 				if code == 132 || code == 137 || code == 153 {
 					os.Exit(0)
 				}
 				os.Exit(code)
 			}
+			finish()
 			return fmt.Errorf("running command: %w", err)
 		}
 	}
+	finish()
 
 	// Handle diff mode: snapshot after execution and output diff
 	if cfg.EnableDiff && len(cfg.WritePaths) > 0 {
@@ -244,10 +295,48 @@ func run(cfg config.ExecConfig) error {
 	return nil
 }
 
+// reportDarwinAudit emits Seatbelt violations recorded during the run as JSON
+// audit lines on stderr (the protocol the Node runner parses with
+// parseAuditLog: one {"type","target","details"} object per line, matching
+// the Linux engine's logAuditEntry shape). macOS reports sandbox denials to
+// the unified log rather than a pipe, so they are read back with
+// /usr/bin/log show after the sandboxed process has exited. Best effort: on
+// failure a warning is printed and the run result stands.
+func reportDarwinAudit(cfg config.ExecConfig, startedAt time.Time, rootPID int) {
+	if !cfg.EnableAudit {
+		return
+	}
+	events := collectSandboxViolations(startedAt, rootPID)
+	const maxAuditEntries = 1000
+	if len(events) > maxAuditEntries {
+		events = events[:maxAuditEntries]
+	}
+	for _, ev := range events {
+		target := ev.Path
+		if target == "" {
+			target = ev.Target
+		}
+		if ev.Port != 0 {
+			target = fmt.Sprintf("%s:%d", ev.Target, ev.Port)
+		}
+		if target == "" {
+			continue
+		}
+		entry := map[string]string{
+			"type":    ev.Type,
+			"target":  target,
+			"details": fmt.Sprintf("violation detected at %s", target),
+		}
+		if data, err := json.Marshal(entry); err == nil {
+			fmt.Fprintf(os.Stderr, "%s\n", string(data))
+		}
+	}
+}
+
 // runValidateProfile validates the generated Seatbelt profile using sandbox-exec -n.
 // This syntax-checks the profile without executing the command, reporting any errors.
 func runValidateProfile(cfg config.ExecConfig) error {
-	profile := buildSeatbeltProfile(cfg)
+	profile := buildSeatbeltProfile(cfg, 0)
 
 	sandboxPath, err := exec.LookPath("sandbox-exec")
 	if err != nil {
@@ -368,6 +457,10 @@ func runLearn(cfg config.ExecConfig) error {
 
 	policy := parser.BuildPolicy(cfg.Cmd, cfg.Args)
 
+	// Preserve the hardening/isolation flags this run was configured with so
+	// the learned policy can be re-applied without silently dropping them.
+	policy = config.OverlayExecConfigToPolicy(cfg, policy)
+
 	// If --policy-file was also given, merge with existing file and write back
 	if cfg.PolicyFilePath != "" {
 		base, err := config.ReadPolicyFile(cfg.PolicyFilePath)
@@ -390,8 +483,12 @@ func runLearn(cfg config.ExecConfig) error {
 }
 
 // runDryRun executes the command in dry-run mode: most operations are denied
-// via Seatbelt, system paths are explicitly allowed so the binary can start.
-// On macOS, Seatbelt traces go to the system log for audit.
+// via Seatbelt while system bootstrap paths stay readable so the binary can
+// start and walk its control flow. Denied operations are reported by the
+// kernel to the unified log (sandboxd / "Sandbox: proc(pid) deny ..." lines),
+// which we collect via /usr/bin/log show after the run and turn into the
+// DRYRUN report. The sandboxed process tree keeps the sandbox-exec PID and
+// its descendants use higher PIDs, so attribution is "event pid >= root pid".
 func runDryRun(cfg config.ExecConfig) error {
 	// Resolve the command path and its real path (for symlinks)
 	cmdPath, err := exec.LookPath(cfg.Cmd)
@@ -417,6 +514,8 @@ func runDryRun(cfg config.ExecConfig) error {
 	}
 	profFile.Close()
 
+	startedAt := time.Now()
+
 	// Run under sandbox-exec with the dry-run profile
 	fullArgs := append([]string{"-f", profFile.Name(), cmdPath}, cfg.Args...)
 	cmd := exec.Command("sandbox-exec", fullArgs...)
@@ -427,14 +526,16 @@ func runDryRun(cfg config.ExecConfig) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	_ = cmd.Run() // ignore real exit code
-
-	// Build result with synthetic exit 0
-	result := &config.DryRunResult{
-		ExitCode: 0,
-		Events:   []config.DryRunEvent{},
-		Summary:  config.DryRunSummary{},
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting dry-run: %w", err)
 	}
+	// sandbox-exec applies the profile and execs the target in-place, so the
+	// target keeps this PID; every descendant gets a higher PID.
+	rootPID := cmd.Process.Pid
+	_ = cmd.Wait() // ignore real exit code
+
+	events := collectSandboxViolations(startedAt, rootPID)
+	result := buildDryRunResult(events, cfg.Cmd, cfg.Args)
 
 	data, err := json.Marshal(result)
 	if err != nil {
@@ -466,6 +567,13 @@ func buildDryRunProfile(cfg config.ExecConfig, cmdPath string) string {
 	sb.WriteString("(allow file-read* (subpath \"/usr/lib\"))\n")
 	sb.WriteString("(allow file-read* (subpath \"/System\"))\n")
 	sb.WriteString("(allow file-read* (subpath \"/dev\"))\n")
+
+	// Root-directory reads and metadata lookups happen during bootstrap path
+	// resolution for every process. Without these allows the target aborts on
+	// its first denied lookup (deny kills via SIGABRT before the program even
+	// starts), which would reduce the whole report to bootstrap noise.
+	sb.WriteString("(allow file-read-data (literal \"/\"))\n")
+	sb.WriteString("(allow file-read-metadata)\n")
 
 	// Allow dyld shared cache (needed for process bootstrap)
 	sb.WriteString("(allow file-read* (subpath \"/private/var/db/dyld\"))\n")
@@ -503,178 +611,138 @@ func buildDryRunProfile(cfg config.ExecConfig, cmdPath string) string {
 	return sb.String()
 }
 
-// parseDryRunTrace parses a Seatbelt trace log and extracts dry-run events.
-func parseDryRunTrace(tracePath string) []config.DryRunEvent {
-	f, err := os.Open(tracePath)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
+// sandboxEventLine matches unified-log sandbox reports of the form
+//
+//	kernel[0:t] (Sandbox) Sandbox: cat(40289) deny(1) file-read-data /path
+//
+// capturing process name, pid, decision, operation, and the remainder
+// (operation argument). Duplicate-report aggregation lines
+// ("N duplicate reports for Sandbox: ...") do not match because they put the
+// report count before "Sandbox:".
+var sandboxEventLine = regexp.MustCompile(`Sandbox: ([^\s(]+)\((\d+)\) (allow|deny)(?:\(\d+\))? (\S+)(?: (.*))?$`)
 
+// collectSandboxViolations reads Seatbelt deny reports for processes at or
+// after rootPID from the unified log. Seatbelt violations are emitted by the
+// kernel (sender "Sandbox") and aggregated by sandboxd; both forms are
+// covered by matching on the "Sandbox: ..." message text. The log subsystem
+// flushes asynchronously, so the query is retried once after a short delay
+// when the first attempt returns nothing.
+func collectSandboxViolations(since time.Time, rootPID int) []config.DryRunEvent {
 	var events []config.DryRunEvent
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	for attempt := 0; attempt < 2; attempt++ {
+		events = querySandboxLog(since, rootPID)
+		if len(events) > 0 {
+			return events
 		}
-
-		event := parseDryRunLine(line)
-		if event != nil {
-			events = append(events, *event)
-		}
+		time.Sleep(1200 * time.Millisecond)
 	}
-
 	return events
 }
 
-// parseDryRunLine extracts a dry-run event from a single Seatbelt trace line.
-func parseDryRunLine(line string) *config.DryRunEvent {
-	var event config.DryRunEvent
+// querySandboxLog runs `/usr/bin/log show` for the window starting at since
+// and converts matching deny lines into DryRunEvents attributed to the
+// sandboxed tree (pid >= rootPID; PIDs are handed out in increasing order, so
+// pre-existing noisy processes that started earlier sort themselves out).
+func querySandboxLog(since time.Time, rootPID int) []config.DryRunEvent {
+	cmd := exec.Command("/usr/bin/log", "show",
+		"--start", since.Format("2006-01-02 15:04:05"),
+		"--debug", "--info",
+		"--predicate", `eventMessage BEGINSWITH "Sandbox" OR eventMessage CONTAINS "for Sandbox:"`,
+		"--style", "compact")
+	out, err := cmd.Output()
+	if err != nil {
+		// log show may be unavailable or slow on some systems; dry-run still
+		// succeeds, just without the event report.
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: reading unified log for sandbox events: %v\n", err)
+		return nil
+	}
 
-	if strings.Contains(line, "file-read") && strings.Contains(line, "file-read-metadata") {
-		event.Type = "file-metadata"
-	} else if strings.Contains(line, "file-read") {
-		event.Type = "file-read"
-	} else if strings.Contains(line, "file-write") {
-		event.Type = "file-write"
-	} else if strings.Contains(line, "network-outbound") {
+	var events []config.DryRunEvent
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		pid, ev := sandboxEventFromLine(scanner.Text())
+		if ev == nil || pid < rootPID {
+			continue
+		}
+		events = append(events, *ev)
+	}
+	return events
+}
+
+// sandboxEventFromLine converts one unified-log line into the reporting PID
+// and its deny event (nil when the line is not a reportable violation —
+// allow lines, duplicate-report aggregation, and noisy op classes).
+func sandboxEventFromLine(line string) (int, *config.DryRunEvent) {
+	if strings.Contains(line, "duplicate report") {
+		return 0, nil
+	}
+	m := sandboxEventLine.FindStringSubmatch(line)
+	if m == nil {
+		return 0, nil
+	}
+	if m[3] != "deny" {
+		return 0, nil
+	}
+	pid, _ := strconv.Atoi(m[2])
+	return pid, sandboxOpToEvent(m[4], m[5])
+}
+
+// sandboxOpToEvent converts a Seatbelt operation + argument into a
+// DryRunEvent. Noisy bootstrap classes (mach-lookup, sysctl-read,
+// user-preference-read, ipc-*, iokit-*, system-socket) are dropped: they
+// flood the report and are not actionable for supply-chain auditing.
+func sandboxOpToEvent(op, arg string) *config.DryRunEvent {
+	var event config.DryRunEvent
+	switch {
+	case op == "network-outbound":
 		event.Type = "network-outbound"
-		if ip, port := extractNetworkTarget(line); ip != "" {
-			event.Target = ip
-			event.Port = port
-		}
+		parseNetworkArg(arg, &event)
 		return &event
-	} else if strings.Contains(line, "network-bind") || strings.Contains(line, "network-inbound") {
+	case op == "network-bind" || op == "network-inbound":
 		event.Type = "network-bind"
-		if ip, port := extractNetworkTarget(line); ip != "" {
-			event.Target = ip
-			event.Port = port
-		}
+		parseNetworkArg(arg, &event)
 		return &event
-	} else if strings.Contains(line, "process-exec") {
+	case op == "process-exec":
 		event.Type = "process-exec"
-		event.Path = extractTracePath(line)
+		event.Path = strings.TrimSpace(arg)
 		return &event
-	} else if strings.Contains(line, "process-fork") {
+	case op == "process-fork":
 		event.Type = "process-fork"
 		return &event
-	} else if strings.Contains(line, "signal") {
-		event.Type = "signal"
+	case strings.HasPrefix(op, "file-read-metadata") || op == "file-read-meta":
+		event.Type = "file-metadata"
+		event.Path = strings.TrimSpace(arg)
 		return &event
-	} else {
+	case strings.HasPrefix(op, "file-read"):
+		event.Type = "file-read"
+		event.Path = strings.TrimSpace(arg)
+		return &event
+	case strings.HasPrefix(op, "file-write"):
+		event.Type = "file-write"
+		event.Path = strings.TrimSpace(arg)
+		return &event
+	default:
 		return nil
 	}
-
-	event.Path = extractTracePath(line)
-	if event.Path == "" {
-		return nil
-	}
-
-	return &event
 }
 
-// extractTracePath finds the file path in a trace line (last quoted string).
-func extractTracePath(line string) string {
-	lastQuote := -1
-	for i := len(line) - 1; i >= 0; i-- {
-		if line[i] == '"' {
-			lastQuote = i
-			break
+// parseNetworkArg fills Target/Port from a Seatbelt network argument. TCP
+// denials look like "remote:IP:PORT" (or remote:*:port when a port-wide rule
+// denied the connect); Unix-socket denials carry a plain filesystem path.
+func parseNetworkArg(arg string, event *config.DryRunEvent) {
+	arg = strings.TrimSpace(arg)
+	if rest, ok := strings.CutPrefix(arg, "remote:"); ok {
+		host, port, err := net.SplitHostPort(rest)
+		if err != nil {
+			event.Target = rest
+			return
 		}
+		event.Target = host
+		event.Port, _ = strconv.Atoi(port)
+		return
 	}
-	if lastQuote <= 0 {
-		return ""
-	}
-	start := lastQuote - 1
-	for start >= 0 && line[start] != '"' {
-		start--
-	}
-	if start < 0 {
-		return ""
-	}
-	return line[start+1 : lastQuote]
-}
-
-// extractNetworkTarget parses IP:port from a network-outbound trace line.
-func extractNetworkTarget(line string) (string, int) {
-	idx := strings.Index(line, "to \"")
-	if idx == -1 {
-		idx = strings.Index(line, "to '")
-	}
-	if idx == -1 {
-		return "", 0
-	}
-
-	rest := line[idx+4:]
-	end := strings.IndexAny(rest, "\"'")
-	if end == -1 {
-		return "", 0
-	}
-
-	target := rest[:end]
-	parts := strings.Split(target, ":")
-	if len(parts) == 2 {
-		port, _ := strconv.Atoi(parts[1])
-		return parts[0], port
-	}
-	if len(parts) == 1 {
-		return parts[0], 0
-	}
-	return target, 0
-}
-
-// buildDryRunResult constructs a DryRunResult from collected events.
-func buildDryRunResult(events []config.DryRunEvent, cmd string, args []string) *config.DryRunResult {
-	result := &config.DryRunResult{
-		ExitCode: 0,
-		Events:   events,
-	}
-
-	// Sort events by type for predictable output
-	sort.Slice(result.Events, func(i, j int) bool {
-		if result.Events[i].Type != result.Events[j].Type {
-			return result.Events[i].Type < result.Events[j].Type
-		}
-		return result.Events[i].Path < result.Events[j].Path
-	})
-
-	// Deduplicate events
-	seen := make(map[string]bool)
-	var deduped []config.DryRunEvent
-	for _, e := range result.Events {
-		key := fmt.Sprintf("%s|%s|%s|%d", e.Type, e.Path, e.Target, e.Port)
-		if !seen[key] {
-			seen[key] = true
-			deduped = append(deduped, e)
-		}
-	}
-	result.Events = deduped
-
-	// Compute summary
-	for _, e := range result.Events {
-		switch e.Type {
-		case "file-read":
-			result.Summary.FileReads++
-		case "file-write":
-			result.Summary.FileWrites++
-		case "file-metadata":
-			result.Summary.FileMetadata++
-		case "network-outbound":
-			result.Summary.NetworkOutbound++
-		case "network-bind":
-			result.Summary.NetworkBind++
-		case "process-exec":
-			result.Summary.ExecAttempts++
-		case "process-fork":
-			result.Summary.ForkAttempts++
-		}
-	}
-	result.Summary.TotalEvents = len(result.Events)
-
-	return result
+	event.Target = arg
 }
 
 // buildLearnProfile generates a permissive Seatbelt profile with trace rules.
@@ -905,13 +973,40 @@ func persistenceWriteDenies() []string {
 }
 
 // buildSeatbeltProfile generates a macOS Seatbelt profile from the config.
-func buildSeatbeltProfile(cfg config.ExecConfig) string {
+// proxyPort is the loopback port of the egress proxy when ProxyEgress is
+// active, 0 otherwise.
+func buildSeatbeltProfile(cfg config.ExecConfig, proxyPort int) string {
 	var sb strings.Builder
 
 	sb.WriteString("(version 1)\n")
 	sb.WriteString("(deny default)\n")
 	sb.WriteString("(import \"system.sb\")\n")
 	sb.WriteString("(allow signal)\n")
+
+	// Trust and network-configuration services. TLS stacks that use the
+	// Security framework instead of reading certificate files directly
+	// (e.g. anything going through SecTrust) evaluate the system trust store
+	// via mach-lookup to trustd, and read proxy/interface configuration via
+	// configd. Without these allows, HTTPS from such runtimes fails with
+	// "bad certificate format". Both are read-only evaluation services: they
+	// expose no user secrets and no code execution.
+	sb.WriteString(`(allow mach-lookup (global-name "com.apple.trustd"))` + "\n")
+	sb.WriteString(`(allow mach-lookup (global-name "com.apple.trustd.agent"))` + "\n")
+	sb.WriteString(`(allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))` + "\n")
+
+	// securityd and the user-database services stay OUT of the baseline.
+	// com.apple.SecurityServer is the keychain endpoint — reachable securityd
+	// means a sandboxed build script can ask an unlocked login keychain for
+	// items whose ACL does not force a prompt. opendirectoryd/memberd expose
+	// the user and group database. Certificate validation does not need any
+	// of them (that is trustd, allowed above), so they are opt-in: .NET is
+	// the known case, since its SslStream path talks to securityd and it
+	// resolves the home directory through getpwuid() rather than $HOME.
+	if cfg.AllowSecurityServices {
+		sb.WriteString(`(allow mach-lookup (global-name "com.apple.SecurityServer"))` + "\n")
+		sb.WriteString(`(allow mach-lookup (global-name "com.apple.system.opendirectoryd"))` + "\n")
+		sb.WriteString(`(allow mach-lookup (global-name "com.apple.memberd"))` + "\n")
+	}
 
 	// Fork control — always allow fork (deny default blocks it);
 	// only when BlockFork is true do we deny fork.
@@ -1166,6 +1261,12 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	// that compile and immediately load a dylib from the build tree can opt
 	// out with AllowWritableDylibLoad; loadable Node addons (.node) are never
 	// matched.
+	//
+	// IMPORTANT: on current macOS the (subpath X) + (regex Y) combination does
+	// NOT conjoin — the regex alone matches system-wide, so a bare `\.dylib$`
+	// regex would deny loading every non-cached dylib on the host (dotnet's
+	// libhostfxr, Homebrew libraries, ...). Each deny therefore uses a single
+	// regex anchored to ^<tree>/ … \.dylib$.
 	if cfg.BlockInterpreters && !cfg.AllowWritableDylibLoad {
 		dylibDenyPaths := append([]string{"/private/tmp", "/tmp", os.TempDir()}, cfg.WritePaths...)
 		seen := make(map[string]bool)
@@ -1178,7 +1279,7 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 				continue
 			}
 			seen[cp] = true
-			sb.WriteString(fmt.Sprintf("(deny file-read* (subpath %q) (regex #\"\\.dylib$\"))\n", cp))
+			sb.WriteString(fmt.Sprintf("(deny file-read* (regex #\"^%s/.*\\.dylib$\"))\n", regexp.QuoteMeta(cp)))
 		}
 	}
 
@@ -1199,8 +1300,30 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		sb.WriteString(fmt.Sprintf("(allow network-inbound (local ip %q))\n", target))
 	}
 
-	if cfg.AllowLoopback {
+	if cfg.AllowLoopback && proxyPort == 0 {
 		sb.WriteString("(allow network-outbound (remote ip \"localhost:*\"))\n")
+	}
+
+	// Egress proxy mode: ALL outbound traffic is forced through the loopback
+	// proxy, which enforces the hostname allowlist at CONNECT time. This is
+	// the only hostname-level egress control available on macOS — Seatbelt
+	// cannot pin remote IPs. Everything not explicitly allowed below stays
+	// denied by (deny default).
+	if proxyPort > 0 {
+		sb.WriteString(fmt.Sprintf("(allow network-outbound (remote ip \"localhost:%d\"))\n", proxyPort))
+		// DNS to the system resolver is a unix-socket connection, not TCP;
+		// keep it working so local name resolution inside the sandbox is
+		// unaffected (target hostnames are resolved by the proxy in the
+		// parent anyway).
+		sb.WriteString("(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n")
+		if cfg.EnableAudit {
+			sb.WriteString("(trace network-outbound)\n")
+		}
+		if cfg.EnableAudit {
+			sb.WriteString("(trace file-read*)\n")
+			sb.WriteString("(trace file-write*)\n")
+		}
+		return sb.String()
 	}
 
 	// macOS Seatbelt cannot express a remote-IP allowlist: its (remote ip ...)
@@ -1222,6 +1345,12 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 		if hostPinningRequested && len(ports) == 0 {
 			ports = []int{80, 443}
 		}
+		// DNS resolution on macOS connects to the system resolver over a
+		// unix socket, not TCP — without this allow every getaddrinfo fails
+		// (curl exit 6, dotnet NU1301) even when the target ports are open.
+		// The lookup itself is name resolution, not egress to an arbitrary
+		// host; the resolved destination is still gated by the port rules.
+		sb.WriteString("(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n")
 		if len(ports) > 0 {
 			for _, port := range ports {
 				sb.WriteString(fmt.Sprintf("(allow network-outbound (remote ip \"*:%d\"))\n", port))
@@ -1232,16 +1361,17 @@ func buildSeatbeltProfile(cfg config.ExecConfig) string {
 	}
 
 	if cfg.DisableNetwork {
+		// disableNetwork is absolute: nothing is re-allowed except loopback
+		// when explicitly requested. (Previously the requested ports were
+		// re-allowed when host pinning was set, but Seatbelt cannot pin IPs,
+		// so that made every host reachable on those ports — the opposite of
+		// disabling the network. It only looked correct because DNS was
+		// itself broken.) Linux semantics (a fresh network namespace) match.
 		sb.WriteString("(deny network-outbound)\n")
-		// Re-allow loopback outbound specifically if loopback is permitted
 		if cfg.AllowLoopback {
 			sb.WriteString("(allow network-outbound (remote ip \"localhost:*\"))\n")
 		}
-		// With the network disabled, only the explicitly requested ports are
-		// re-allowed. If nothing is requested there is nothing to re-allow.
-		if hostPinningRequested || len(cfg.AllowPorts) > 0 {
-			writeOutboundRules()
-		} else if cfg.EnableAudit {
+		if cfg.EnableAudit {
 			sb.WriteString("(trace network-outbound)\n")
 		}
 	} else {

@@ -123,6 +123,26 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	merged.DenyPersistenceWrites = base.DenyPersistenceWrites || observed.DenyPersistenceWrites
 	merged.BlockJIT = base.BlockJIT || observed.BlockJIT
 	merged.AllowWritableDylibLoad = base.AllowWritableDylibLoad && observed.AllowWritableDylibLoad
+	// AllowSecurityServices exposes securityd/opendirectoryd, so it is a
+	// relaxation too: both layers must ask for it.
+	merged.AllowSecurityServices = base.AllowSecurityServices && observed.AllowSecurityServices
+	merged.ProxyEgress = base.ProxyEgress || observed.ProxyEgress
+
+	// Linux hardening round-trip — opt-in hardening ORs together; escape
+	// hatches (AllowChrootFallback weakens pivot_root fail-closed) require
+	// both layers to permit them.
+	merged.TmpOverlayPaths = unionStrings(base.TmpOverlayPaths, observed.TmpOverlayPaths)
+	merged.SeccompFilters = mergeSeccompFilters(base.SeccompFilters, observed.SeccompFilters)
+	merged.UseReaper = base.UseReaper || observed.UseReaper
+	merged.ProcHardening = base.ProcHardening || observed.ProcHardening
+	merged.SubmountEnforce = base.SubmountEnforce || observed.SubmountEnforce
+	merged.DieWithParent = base.DieWithParent || observed.DieWithParent
+	merged.NewSession = base.NewSession || observed.NewSession
+	merged.SetUpDev = base.SetUpDev || observed.SetUpDev
+	merged.BindUseFd = base.BindUseFd || observed.BindUseFd
+	merged.AllowUserns = base.AllowUserns || observed.AllowUserns
+	merged.AllowChrootFallback = base.AllowChrootFallback && observed.AllowChrootFallback
+	merged.AllowEnvs = unionStrings(base.AllowEnvs, observed.AllowEnvs)
 
 	// HTTP access — union, deduplicated by (method, host, path) key.
 	merged.HTTPAccess = mergeHTTPAccess(base.HTTPAccess, observed.HTTPAccess)
@@ -137,6 +157,118 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	merged.Args = observed.Args
 
 	return merged
+}
+
+// mergeSeccompFilters unions two stacked-filter lists, deduplicating by the
+// kafel policy string (the only form the learner persists; base64 programs
+// and file paths are kept as-is and deduplicated verbatim).
+func mergeSeccompFilters(a, b []SeccompFilterSpec) []SeccompFilterSpec {
+	seen := make(map[string]bool)
+	var result []SeccompFilterSpec
+	for _, f := range append(a, b...) {
+		key := f.Policy
+		if key == "" {
+			key = "program:" + f.Program
+		}
+		if key == "" {
+			key = "path:" + f.Path
+		}
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, f)
+		}
+	}
+	if result == nil {
+		result = []SeccompFilterSpec{}
+	}
+	return result
+}
+
+// OverlayExecConfigToPolicy copies the hardening and isolation flags the run
+// was configured with onto a freshly learned policy so they survive the
+// Discover -> Refine -> Iterate -> Deploy loop: without this, `--learn`
+// output would silently drop controls like blockJIT or proxyEgress that the
+// observed run itself had enabled. Only opt-in (non-default-true) flags are
+// copied; boolean zero values are left untouched.
+func OverlayExecConfigToPolicy(cfg ExecConfig, policy *PolicyFile) *PolicyFile {
+	if policy == nil {
+		return policy
+	}
+	if cfg.BlockInterpreters {
+		policy.BlockInterpreters = true
+	}
+	if cfg.DenyPersistenceWrites {
+		policy.DenyPersistenceWrites = true
+	}
+	if cfg.BlockJIT {
+		policy.BlockJIT = true
+	}
+	if cfg.ProxyEgress {
+		policy.ProxyEgress = true
+	}
+	if cfg.TraceExec {
+		policy.TraceExec = true
+	}
+	if cfg.EnableAudit {
+		policy.EnableAudit = true
+	}
+	if cfg.UseReaper {
+		policy.UseReaper = true
+	}
+	if cfg.ProcHardening {
+		policy.ProcHardening = true
+	}
+	if cfg.SubmountEnforce {
+		policy.SubmountEnforce = true
+	}
+	if cfg.DieWithParent {
+		policy.DieWithParent = true
+	}
+	if cfg.NewSession {
+		policy.NewSession = true
+	}
+	if cfg.SetUpDev {
+		policy.SetUpDev = true
+	}
+	if cfg.BindUseFd {
+		policy.BindUseFd = true
+	}
+	if cfg.AllowUserns {
+		policy.AllowUserns = true
+	}
+	if cfg.AllowChrootFallback {
+		policy.AllowChrootFallback = true
+	}
+	if len(cfg.TmpOverlayPaths) > 0 {
+		policy.TmpOverlayPaths = unionStrings(policy.TmpOverlayPaths, cfg.TmpOverlayPaths)
+	}
+	if len(cfg.SeccompFilters) > 0 {
+		var fromCfg []SeccompFilterSpec
+		for _, f := range cfg.SeccompFilters {
+			// Persist only kafel policy strings — base64 blobs and host file
+			// paths are not portable across machines.
+			if f.Policy != "" {
+				fromCfg = append(fromCfg, SeccompFilterSpec{Policy: f.Policy})
+			}
+		}
+		policy.SeccompFilters = mergeSeccompFilters(policy.SeccompFilters, fromCfg)
+	}
+	if len(cfg.AllowEnvs) > 0 {
+		policy.AllowEnvs = unionStrings(policy.AllowEnvs, cfg.AllowEnvs)
+	}
+	if cfg.PrivateTmp {
+		policy.PrivateTmp = true
+	}
+	if cfg.MapToTargetUid {
+		policy.MapToTargetUid = true
+	}
+	if cfg.ProtectSystem != "" && cfg.ProtectSystem != "off" {
+		policy.ProtectSystem = cfg.ProtectSystem
+	}
+	if cfg.ProtectHome != "" && cfg.ProtectHome != "off" {
+		policy.ProtectHome = cfg.ProtectHome
+	}
+	return policy
 }
 
 // WritePolicyFile atomically writes a PolicyFile as JSON to the given path.

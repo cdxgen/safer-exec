@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -208,6 +209,40 @@ func run(cfg config.ExecConfig) error {
 	if cfg.EnableDiff && len(cfg.WritePaths) > 0 {
 		beforeSnap, _ = fsdiff.SnapshotPath(cfg.WritePaths...)
 	}
+
+	// Egress proxy: enforce the hostname allowlist at CONNECT time. Landlock
+	// NET rules are port-granular, so the proxy adds hostname-level control
+	// for proxy-aware clients. It needs the sandbox to share the host network
+	// namespace, so it is skipped when DisableNetwork created an isolated one.
+	if cfg.ProxyEgress {
+		if cfg.DisableNetwork {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: proxy egress requires a shared network namespace; skipping (network namespace isolation is stronger)\n")
+		} else if p, pErr := startEgressProxy(cfg); pErr != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: egress proxy unavailable (%v); continuing with Landlock port confinement only\n", pErr)
+		} else {
+			defer p.Close()
+			// Deferred flush prints proxy-violation audit entries to stderr
+			// before Close tears down the listener (defers run LIFO).
+			defer p.flushViolations()
+			p.injectEnv(&cfg)
+			// Landlock NET connect rules are port-only; whitelist the proxy
+			// port so the sandboxed process can reach 127.0.0.1:<port>.
+			//
+			// When AllowPorts was empty, this is also what makes the proxy
+			// enforcing: Landlock then restricts connect() to the proxy port
+			// alone, so nothing can reach the network except through the
+			// hostname allowlist. When the caller has already opened ports,
+			// Landlock keeps allowing them and a process that simply ignores
+			// HTTP(S)_PROXY can connect straight out — the proxy degrades to
+			// advisory. Say so rather than letting the stronger claim stand.
+			if len(cfg.AllowPorts) > 0 {
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: --proxy-egress combined with explicit allowed ports (%v) does not pin hostnames: Landlock still permits direct connections on those ports, so a client that ignores HTTP(S)_PROXY bypasses the allowlist. Drop the port allowlist for enforcing egress control.\n", cfg.AllowPorts)
+			}
+			cfg.AllowPorts = append(cfg.AllowPorts, p.port)
+			fmt.Fprintf(os.Stderr, "safer-exec: egress proxy listening on 127.0.0.1:%d; HTTP(S)_PROXY injected and hostname allowlist enforced at CONNECT time\n", p.port)
+		}
+	}
+
 	cfgJSON, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshaling config: %w", err)
@@ -926,6 +961,17 @@ func runLearn(cfg config.ExecConfig) error {
 		return fmt.Errorf("learning mode: %w", err)
 	}
 
+	// Preserve the hardening/isolation flags this run was configured with so
+	// the learned policy can be re-applied without silently dropping them.
+	// The learner already merged (and wrote) the on-disk policy file without
+	// these flags, so write the overlaid result back when merging was active.
+	policy = config.OverlayExecConfigToPolicy(cfg, policy)
+	if cfg.PolicyFilePath != "" {
+		if err := config.WritePolicyFile(cfg.PolicyFilePath, policy); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: write merged policy file: %v\n", err)
+		}
+	}
+
 	// Merge HTTP access entries into the learned policy.
 	if len(httpEntries) > 0 {
 		policy.HTTPAccess = deduplicateHTTPAccess(httpEntries)
@@ -959,6 +1005,10 @@ func runLearn(cfg config.ExecConfig) error {
 // runDryRun executes the command in dry-run mode on Linux: clears allow lists
 // so Landlock denies all filesystem and network operations, applies seccomp-bpf,
 // and returns synthetic exit 0. The --init-dryrun flag handles the child side.
+// When strace is available, the denied child runs under strace so every
+// attempted file/network/exec operation is captured into the DRYRUN report —
+// Landlock denials are silent (plain EACCES), so without the tracer there is
+// nothing to observe.
 func runDryRun(cfg config.ExecConfig) error {
 	cfgJSON, err := json.Marshal(cfg)
 	if err != nil {
@@ -970,8 +1020,30 @@ func runDryRun(cfg config.ExecConfig) error {
 		return fmt.Errorf("finding self: %w", err)
 	}
 
+	// Dry-run event capture via strace (best effort — needs ptrace permissions).
+	stracePath := ""
+	var straceFile string
+	if p, lookErr := exec.LookPath("strace"); lookErr == nil {
+		if f, ferr := os.CreateTemp("", "safer-exec-dryrun-strace-*.log"); ferr == nil {
+			stracePath = p
+			straceFile = f.Name()
+			f.Close()
+			defer os.Remove(straceFile)
+		}
+	}
+	if stracePath == "" {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: strace unavailable — dry-run cannot capture attempted operations; reporting an empty report (install strace or relax ptrace_scope)\n")
+	}
+
 	// Run self with --init-dryrun (applies Landlock deny-all + seccomp)
-	cmd := exec.Command(selfPath, "--init-dryrun")
+	var cmd *exec.Cmd
+	if stracePath != "" {
+		cmd = exec.Command(stracePath, "-f", "-qq", "-s", "4096",
+			"-e", "trace=%file,%network,%process", "-o", straceFile,
+			selfPath, "--init-dryrun")
+	} else {
+		cmd = exec.Command(selfPath, "--init-dryrun")
+	}
 	cmd.Env = append(config.BuildEnv(cfg.Env), "SAFER_EXEC_CONFIG="+string(cfgJSON))
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -982,14 +1054,145 @@ func runDryRun(cfg config.ExecConfig) error {
 
 	_ = cmd.Run() // ignore real exit code
 
-	result := &config.DryRunResult{
-		ExitCode: 0,
-		Events:   []config.DryRunEvent{},
-		Summary:  config.DryRunSummary{},
+	var events []config.DryRunEvent
+	if straceFile != "" {
+		events = parseStraceDryRunEvents(straceFile)
 	}
+	result := buildDryRunResult(events, cfg.Cmd, cfg.Args)
 	data, _ := json.Marshal(result)
 	writeStructured(cfg, "DRYRUN:", data)
 	return nil
+}
+
+// parseStraceDryRunEvents converts an strace log of the dry-run child into
+// DryRunEvents. Under the deny-all Landlock ruleset every effectful syscall
+// returns EACCES/EPERM, and those failures are exactly the operations the
+// report should list. Bootstrap reads of the explicitly allowed system trees
+// succeed and are not reported.
+func parseStraceDryRunEvents(path string) []config.DryRunEvent {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var events []config.DryRunEvent
+	const maxEvents = 2000
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() && len(events) < maxEvents {
+		line := scanner.Text()
+		// Strip the pid prefix ("1234  " or "[pid 1234] ") if present.
+		if ev, ok := straceLineToEvent(line); ok {
+			events = append(events, ev)
+		}
+	}
+	return events
+}
+
+// straceLineToEvent classifies a single strace line. It returns ok=false for
+// non-file/network/exec syscalls and for successful read-only opens (which
+// dry-run allows for bootstrap).
+func straceLineToEvent(line string) (config.DryRunEvent, bool) {
+	switch {
+	case strings.Contains(line, "openat(") || strings.Contains(line, " open(") || strings.HasPrefix(line, "open("):
+		return straceOpenEvent(line)
+	case strings.Contains(line, "execve(") || strings.Contains(line, "execveat("):
+		path := firstQuoted(line)
+		if path == "" {
+			return config.DryRunEvent{}, false
+		}
+		return config.DryRunEvent{Type: "process-exec", Path: path}, true
+	case strings.Contains(line, "connect("):
+		return straceConnectEvent(line)
+	case strings.Contains(line, "bind("):
+		return straceBindEvent(line)
+	default:
+		return config.DryRunEvent{}, false
+	}
+}
+
+func straceOpenEvent(line string) (config.DryRunEvent, bool) {
+	path := firstQuoted(line)
+	if path == "" {
+		return config.DryRunEvent{}, false
+	}
+	flagsStart := strings.Index(line, ", ")
+	if flagsStart == -1 {
+		return config.DryRunEvent{}, false
+	}
+	flags := line[flagsStart:]
+	if eq := strings.Index(flags, ") ="); eq >= 0 {
+		flags = flags[:eq]
+	}
+	denied := strings.Contains(line, "EACCES") || strings.Contains(line, "EPERM")
+	writeIntent := strings.Contains(flags, "O_WRONLY") || strings.Contains(flags, "O_RDWR") ||
+		strings.Contains(flags, "O_CREAT") || strings.Contains(flags, "O_TRUNC") ||
+		strings.Contains(flags, "O_APPEND") || strings.Contains(flags, "O_EXCL")
+	if writeIntent {
+		// Report every write attempt: dry-run denies them all, success is
+		// impossible for paths outside the bootstrap trees.
+		return config.DryRunEvent{Type: "file-write", Path: path}, true
+	}
+	if denied {
+		return config.DryRunEvent{Type: "file-read", Path: path}, true
+	}
+	return config.DryRunEvent{}, false
+}
+
+func straceConnectEvent(line string) (config.DryRunEvent, bool) {
+	ev := config.DryRunEvent{Type: "network-outbound"}
+	if idx := strings.Index(line, "inet_addr(\""); idx >= 0 {
+		rest := line[idx+len("inet_addr(\""):]
+		if end := strings.Index(rest, "\""); end >= 0 {
+			ev.Target = rest[:end]
+		}
+	} else if idx := strings.Index(line, "inet_pton("); idx >= 0 {
+		// inet_pton(AF_INET, "1.2.3.4", ...) — first quoted string after it.
+		rest := line[idx:]
+		if ip := firstQuoted(rest); ip != "" {
+			ev.Target = ip
+		}
+	} else if idx := strings.Index(line, "sun_path=\""); idx >= 0 {
+		rest := line[idx+len("sun_path=\""):]
+		if end := strings.Index(rest, "\""); end >= 0 {
+			ev.Target = rest[:end]
+			return ev, true
+		}
+	}
+	if idx := strings.Index(line, "htons("); idx >= 0 {
+		rest := line[idx+len("htons("):]
+		if end := strings.Index(rest, ")"); end >= 0 {
+			ev.Port, _ = strconv.Atoi(strings.TrimSpace(rest[:end]))
+		}
+	}
+	if ev.Target == "" && ev.Port == 0 {
+		return config.DryRunEvent{}, false
+	}
+	return ev, true
+}
+
+func straceBindEvent(line string) (config.DryRunEvent, bool) {
+	ev, ok := straceConnectEvent(line)
+	if !ok {
+		return config.DryRunEvent{}, false
+	}
+	ev.Type = "network-bind"
+	return ev, true
+}
+
+// firstQuoted returns the first double-quoted substring of s, or "".
+func firstQuoted(s string) string {
+	start := strings.Index(s, "\"")
+	if start == -1 {
+		return ""
+	}
+	rest := s[start+1:]
+	end := strings.Index(rest, "\"")
+	if end == -1 {
+		return ""
+	}
+	return rest[:end]
 }
 
 // deduplicateHTTPAccess removes duplicate (method, host, path) tuples,
@@ -1708,12 +1911,61 @@ func setupCgroupV2Internal(cfg config.ExecConfig) (string, error) {
 		if wbps == 0 {
 			wbps = -1
 		}
-		ioMax := fmt.Sprintf("%d:%d rbps=%d wbps=%d riops=%d wiops=%d\n", 8, 0, rbps, wbps, rio, wio)
+		var ioMax string
+		for _, dev := range ioLimitDevices(cfg) {
+			ioMax += fmt.Sprintf("%s rbps=%d wbps=%d riops=%d wiops=%d\n", dev, rbps, wbps, rio, wio)
+		}
 		if err := os.WriteFile(filepath.Join(cgroupPath, "io.max"), []byte(ioMax), 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: failed to set io.max: %v\n", err)
 		}
 	}
 	return cgroupPath, nil
+}
+
+// ioLimitDevices returns the "major:minor" identifiers of the block devices
+// backing the sandbox's write paths (plus the working directory), so io.max
+// lines target the devices the workload actually writes to. The historical
+// hardcode of "8:0" silently no-op'd IOPS/bandwidth limits on NVMe-era
+// systems (device 259:x) and virtio storage (254:x). Falls back to 8:0 when
+// no path resolves.
+func ioLimitDevices(cfg config.ExecConfig) []string {
+	candidates := make([]string, 0, len(cfg.WritePaths)+1)
+	candidates = append(candidates, cfg.WritePaths...)
+	if cfg.WorkingDir != "" {
+		candidates = append(candidates, cfg.WorkingDir)
+	} else if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, cwd)
+	}
+
+	seen := make(map[string]bool)
+	var devices []string
+	for _, path := range candidates {
+		var st syscall.Stat_t
+		if err := syscall.Stat(path, &st); err != nil {
+			continue
+		}
+		dev := fmt.Sprintf("%d:%d", unixMajor(st.Dev), unixMinor(st.Dev))
+		if dev == "0:0" || seen[dev] {
+			continue
+		}
+		seen[dev] = true
+		devices = append(devices, dev)
+	}
+	if len(devices) == 0 {
+		devices = append(devices, "8:0")
+	}
+	return devices
+}
+
+// unixMajor/unixMinor decode a Linux expanded-encoded dev_t into its
+// traditional major:minor pair. st_dev of a path carries the block device id
+// in this encoding.
+func unixMajor(dev uint64) uint64 {
+	return ((dev >> 8) & 0xfff) | ((dev >> 32) & ^uint64(0xfff))
+}
+
+func unixMinor(dev uint64) uint64 {
+	return (dev & 0xff) | ((dev >> 12) & ^uint64(0xff))
 }
 
 func setupCgroupV2(cfg config.ExecConfig) (string, error) {
@@ -1769,23 +2021,35 @@ func setupCgroupV1(cfg config.ExecConfig) ([]string, error) {
 		blkioPath := filepath.Join("/sys/fs/cgroup/blkio", name)
 		if err := os.Mkdir(blkioPath, 0755); err == nil {
 			cleanupPaths = append(cleanupPaths, blkioPath)
+			// Throttle the devices actually backing the write paths rather
+			// than a hardcoded 8:0 (see ioLimitDevices).
+			devices := ioLimitDevices(cfg)
 			if cfg.MaxReadBps > 0 {
-				os.WriteFile(filepath.Join(blkioPath, "blkio.throttle.read_bps_device"), []byte(fmt.Sprintf("8:0 %d\n", cfg.MaxReadBps)), 0644)
+				writeBlkioThrottle(blkioPath, "blkio.throttle.read_bps_device", devices, cfg.MaxReadBps)
 			}
 			if cfg.MaxWriteBps > 0 {
-				os.WriteFile(filepath.Join(blkioPath, "blkio.throttle.write_bps_device"), []byte(fmt.Sprintf("8:0 %d\n", cfg.MaxWriteBps)), 0644)
+				writeBlkioThrottle(blkioPath, "blkio.throttle.write_bps_device", devices, cfg.MaxWriteBps)
 			}
 			if cfg.MaxReadIOPS > 0 {
-				os.WriteFile(filepath.Join(blkioPath, "blkio.throttle.read_iops_device"), []byte(fmt.Sprintf("8:0 %d\n", cfg.MaxReadIOPS)), 0644)
+				writeBlkioThrottle(blkioPath, "blkio.throttle.read_iops_device", devices, int64(cfg.MaxReadIOPS))
 			}
 			if cfg.MaxWriteIOPS > 0 {
-				os.WriteFile(filepath.Join(blkioPath, "blkio.throttle.write_iops_device"), []byte(fmt.Sprintf("8:0 %d\n", cfg.MaxWriteIOPS)), 0644)
+				writeBlkioThrottle(blkioPath, "blkio.throttle.write_iops_device", devices, int64(cfg.MaxWriteIOPS))
 			}
 			os.WriteFile(filepath.Join(blkioPath, "tasks"), []byte(pidStr+"\n"), 0644)
 		}
 	}
 
 	return cleanupPaths, nil
+}
+
+// writeBlkioThrottle writes one cgroup v1 blkio throttle line per device.
+func writeBlkioThrottle(blkioPath, file string, devices []string, value int64) {
+	var lines string
+	for _, dev := range devices {
+		lines += fmt.Sprintf("%s %d\n", dev, value)
+	}
+	os.WriteFile(filepath.Join(blkioPath, file), []byte(lines), 0644)
 }
 
 func setupCgroup(cfg config.ExecConfig) (string, []string, error) {

@@ -412,4 +412,75 @@ describe('Next Improvements API', () => {
       strict.equal(config.mapToTargetUid, true);
     });
   });
+
+  describe('allowSecurityServices', () => {
+    it('should default to false so securityd stays unreachable', async () => {
+      strict.equal(new SaferExec()._allowSecurityServices, false);
+      const { config } = await new SaferExec()._buildConfig('true', []);
+      strict.ok(!config.allowSecurityServices);
+    });
+    it('should enable via method and option', async () => {
+      strict.equal(new SaferExec().allowSecurityServices()._allowSecurityServices, true);
+      const { config } = await new SaferExec({ allowSecurityServices: true })._buildConfig('true', []);
+      strict.equal(config.allowSecurityServices, true);
+    });
+    it('should be carried by the nuget policy and no other bundled policy', async () => {
+      const { config } = await new SaferExec().applyPolicy('nuget')._buildConfig('dotnet', ['restore']);
+      strict.equal(config.allowSecurityServices, true);
+      for (const name of ['npm', 'pypi', 'maven', 'cargo', 'gomod']) {
+        const other = await new SaferExec().applyPolicy(name)._buildConfig('true', []);
+        strict.ok(
+          !other.config.allowSecurityServices,
+          `policy ${name} must not reach securityd`,
+        );
+      }
+    });
+  });
+
+  describe('proxyEgress', () => {
+    it('should default to false', () => {
+      strict.equal(new SaferExec()._proxyEgress, false);
+    });
+    it('should enable via method and option', async () => {
+      strict.equal(new SaferExec().proxyEgress()._proxyEgress, true);
+      const { config } = await new SaferExec({ proxyEgress: true })._buildConfig('true', []);
+      strict.equal(config.proxyEgress, true);
+    });
+    it('should flow through _buildConfig into the engine config', async () => {
+      const { config } = await new SaferExec().proxyEgress()._buildConfig('true', []);
+      strict.equal(config.proxyEgress, true);
+    });
+    it('should be applied from a policy file', () => {
+      const path = `${tmpdir()}/safer-exec-proxy-policy-${Date.now()}.json`;
+      writeFileSync(path, JSON.stringify({
+        allowHosts: ['registry.npmjs.org'],
+        proxyEgress: true,
+        blockJIT: true,
+        useReaper: true,
+        submountEnforce: true,
+        procHardening: true,
+        allowEnvs: ['CI'],
+      }));
+      try {
+        const s = new SaferExec().applyPolicyFile(path);
+        strict.equal(s._proxyEgress, true);
+        strict.equal(s._blockJIT, true);
+        strict.equal(s._useReaper, true);
+        strict.equal(s._submountEnforce, true);
+        strict.equal(s._procHardening, true);
+        strict.ok(s._allowEnvs.includes('CI'));
+        strict.ok(s._allowHosts.includes('registry.npmjs.org'));
+      } finally {
+        try { unlinkSync(path); } catch {}
+      }
+    });
+    it('should run a command with the egress proxy enabled (allowed host)', async () => {
+      const result = await new SaferExec()
+        .proxyEgress()
+        .allowHosts('registry.npmjs.org')
+        .timeout(30000)
+        .run('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', '-m', '15', 'https://registry.npmjs.org/']);
+      strict.equal(result.stdout.trim(), '200');
+    }, { timeout: 60000 });
+  });
 });

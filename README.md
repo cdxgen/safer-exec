@@ -64,8 +64,11 @@ safer-exec --lock-file=/var/run/build.lock -- npm run build
 # Stack additional seccomp filters (Linux only)
 safer-exec --seccomp-filter=/etc/safer-exec/custom.bpf -- npm install
 
-# Disable fd-based bind mounts
-safer-exec --no-bind-fd -- npm install
+# Enable fd-based bind mounts for TOCTTOU safety (Linux only)
+safer-exec --bind-use-fd -- npm install
+
+# Hostname-pinned egress via the local proxy
+safer-exec --proxy-egress --allow-host=registry.npmjs.org -- npm install
 
 # Disable default /dev setup
 safer-exec --no-set-up-dev -- npm install
@@ -152,6 +155,7 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 | `blockInterpreters`      | `boolean`  | `false`         | Deny Apple-signed scripting engines / sampling tools that can load in-memory shellcode or unsigned dylibs (macOS only)                                                             |
 | `denyPersistenceWrites`  | `boolean`  | `false`         | Deny writes to LaunchAgents, plugin loaders, `/usr/local/bin`, preference stores and other persistence locations (enforced on macOS)                                               |
 | `allowWritableDylibLoad` | `boolean`  | `false`         | Permit loading `.dylib` from writable/temp dirs under `blockInterpreters` — for native-addon builds (macOS only)                                                                   |
+| `allowSecurityServices` | `boolean`  | `false`         | Permit `mach-lookup` to securityd and the user database (macOS only). Widens the sandbox to reach the keychain — TLS validation does **not** need it; .NET does                     |
 | `blockJIT`               | `boolean`  | `false`         | Block W^X / JIT syscalls (mprotect PROT_EXEC, mmap W+X, memfd_create). Breaks V8/JVM/LuaJIT; opt-in (Linux only)                                                                   |
 | `traceExec`              | `boolean`  | `false`         | Log every child process spawned                                                                                                                                                    |
 | `strict`                 | `boolean`  | `false`         | Treat sandbox setup warnings as errors                                                                                                                                             |
@@ -180,6 +184,7 @@ All methods return `this` for chaining except `.run()`.
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `.applyPolicy(name)`        | Apply a pre-defined policy. Throws if unknown.                                                                                                                                       |
 | `.allowHosts(...hosts)`     | Add hostnames to the network allow list                                                                                                                                              |
+| `.proxyEgress(enable?)`     | Route egress through the local hostname-pinning proxy (`HTTP(S)_PROXY` injection, CONNECT-time allowlist enforcement, `proxy-violation` audits; macOS confines all egress to the proxy port) |
 | `.allowUrls(...urls)`       | Add fine-grained URL rules — strings or `{host,protocol,path,methods,port}` objects (Linux only)                                                                                     |
 | `.readPaths(...paths)`      | Add filesystem read paths                                                                                                                                                            |
 | `.writePaths(...paths)`     | Add filesystem write paths                                                                                                                                                           |
@@ -199,6 +204,7 @@ All methods return `this` for chaining except `.run()`.
 | `.allowPorts(...ports)`     | Set allowed TCP ports                                                                                                                                                                |
 | `.enableDiff()`             | Enable filesystem mutation diffing                                                                                                                                                   |
 | `.enableLearn()`            | Enable behavioral auto-profiling                                                                                                                                                     |
+| `.enableDryRun()`           | Deny-all run returning a report of attempted operations (`result.dryRun`)                                                                                                            |
 | `.validateProfile()`        | Validate Seatbelt profile syntax without executing (macOS)                                                                                                                           |
 | `.allowExec(...cmds)`       | Restrict which executables can run                                                                                                                                                   |
 | `.blockExec(...cmds)`       | Block specific executables from running                                                                                                                                              |
@@ -206,6 +212,7 @@ All methods return `this` for chaining except `.run()`.
 | `.blockInterpreters()`      | Deny Apple-signed scripting engines / sampling tools that can load in-memory shellcode or unsigned dylibs (macOS)                                                                    |
 | `.denyPersistenceWrites()`  | Deny writes to LaunchAgents, plugin loaders, `/usr/local/bin` and other persistence locations (enforced on macOS)                                                                    |
 | `.allowWritableDylibLoad()` | Permit loading `.dylib` from writable/temp dirs under `.blockInterpreters()` — for native-addon builds (macOS)                                                                       |
+| `.allowSecurityServices()`  | Permit `mach-lookup` to securityd + the user database (macOS). Only for runtimes that need it (.NET); cert validation goes through trustd, always allowed                            |
 | `.blockJIT()`               | Block W^X / JIT syscalls (mprotect PROT_EXEC, mmap W+X, memfd_create). Breaks V8/JVM/LuaJIT; opt-in (Linux)                                                                          |
 | `.traceExec()`              | Log every child process spawned                                                                                                                                                      |
 | `.strict()`                 | Treat sandbox setup warnings as hard errors                                                                                                                                          |
@@ -248,21 +255,24 @@ All methods return `this` for chaining except `.run()`.
 | `.allowHosts(...)`                     |  Yes  |  Yes  |      No       | None                                                   | On Linux: DNS resolution to IP. On macOS: Seatbelt rules.                                                                                              |
 | `.allowListen(...)`                    |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | Blocks loopback port binding by default unless explicitly permitted.                                                                                   |
 | `.allowPorts(...)`                     |  Yes  |  Yes  |      No       | None                                                   | Restricts outbound ports. macOS uses Seatbelt; Linux uses Landlock.                                                                                    |
+| `.proxyEgress()`                       |  Yes  |  Yes  |      No       | None                                                   | Local CONNECT proxy + `HTTP(S)_PROXY` injection; hostname allowlist enforced at CONNECT time. macOS additionally confines all egress to the proxy port. |
 | `.allowUrls(...)`                      |  No   |  Yes  |      No       | `CAP_BPF`, `CAP_PERFMON`                               | Requires eBPF tracing engine.                                                                                                                          |
 | `.readPaths(...)` / `.writePaths(...)` |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | Restricts filesystem access. macOS uses Seatbelt; Linux uses Mount Namespaces.                                                                         |
 | `.disableNetwork()`                    |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS blocks outbound; Linux unshares Net Namespace.                                                                                                   |
 | `.maxMemory(...)`                      |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_AS`. Linux: cgroups v2 `memory.max`.                                                                                                    |
 | `.maxCPUCores(...)`                    |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_CPU`. Linux: cgroups v2 `cpu.max`.                                                                                                      |
 | `.maxProcesses(...)`                   |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_NPROC`. Linux: cgroups v2 `pids.max`.                                                                                                   |
-| `.maxReadIOPS(...)` etc.               |  No   |  Yes  |      No       | Cgroups write permission                               | Linux cgroups v2 `io.max` throttling.                                                                                                                  |
+| `.maxReadIOPS(...)` etc.               |  No   |  Yes  |      No       | Cgroups write permission                               | Linux cgroups v2 `io.max` throttling, applied to the devices actually backing your write paths (NVMe `259:x`, virtio `254:x`, ...), not a hardcoded SCSI id. |
 | `.enableAudit()`                       |  Yes  |  Yes  |      No       | None                                                   | macOS uses Seatbelt trace; Linux uses Seccomp-BPF trap.                                                                                                |
 | `.enableDiff()`                        |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS: Shadow dir snapshot. Linux: OverlayFS mount.                                                                                                    |
 | `.enableLearn()`                       |  Yes  |  Yes  |      No       | None (macOS), `SYS_PTRACE` or `ptrace_scope=0` (Linux) | macOS parses Seatbelt trace logs. Linux uses `strace` or fallback.                                                                                     |
+| `.enableDryRun()`                      |  Yes  |  Yes  |      No       | None (macOS), `strace` (Linux)                         | Deny-all run with an attempted-operations report (`result.dryRun`). macOS collects kernel sandbox reports via `log show`; Linux traces with `strace`.  |
 | `.allowExec(...)` / `.blockExec(...)`  |  Yes  |  Yes  |      No       | None                                                   | Restricts process execution. macOS uses Seatbelt; Linux uses Seccomp.                                                                                  |
 | `.blockFork()`                         |  Yes  |  Yes  |      No       | None                                                   | macOS uses Seatbelt; Linux uses Seccomp.                                                                                                               |
 | `.blockInterpreters()`                 |  Yes  |  n/a  |      No       | None                                                   | macOS-only. Denies tclsh/wish/perl/python/ruby/SamplingTools exec + starves Tcl/Tk/Ffidl reads. No-op elsewhere.                                       |
 | `.denyPersistenceWrites()`             |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS: Seatbelt write denies on LaunchAgents/plugins/`/usr/local/bin`. Linux: already deny-by-default via Landlock allowlist.                          |
 | `.allowWritableDylibLoad()`            |  Yes  |  n/a  |      No       | None                                                   | macOS-only. Relaxes the `.blockInterpreters()` writable-`.dylib` read deny.                                                                            |
+| `.allowSecurityServices()`             |  Yes  |  n/a  |      No       | None                                                   | macOS-only relaxation. `com.apple.SecurityServer` is the keychain endpoint, so a granted process can read items an unlocked login keychain hands over without a prompt. Off by default; the `nuget` policy opts in. |
 | `.blockJIT()`                          |  No   |  Yes  |      No       | None                                                   | Linux-only (Seccomp W^X). Denies mprotect PROT_EXEC, mmap W+X, memfd_create. Breaks V8/JVM/LuaJIT — opt-in. On macOS, Seatbelt cannot filter syscalls. |
 | `.traceExec()`                         |  Yes  |  Yes  |      No       | None                                                   | Logs child spawns. macOS: Seatbelt trace. Linux: Seccomp trap.                                                                                         |
 | `.allowGPU(...)`                       |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Bind mounts device nodes to sandbox.                                                                                                       |
@@ -523,13 +533,66 @@ Apply a hardened profile for common package managers. User-defined settings take
 const result = await new SaferExec().applyPolicy("npm").run("npm", ["install"]);
 ```
 
-Available policies: `npm`, `pnpm`, `yarn`, `pypi`, `maven`, `cargo`, `rubygems`, `composer`, `deno`, `gomod`, `bun`.
+Available policies: `npm`, `pnpm`, `yarn`, `pypi`, `maven`, `cargo`, `rubygems`, `composer`, `deno`, `gomod`, `bun`, `nuget`, `uv`, `pnpmInstall`, `poku`, `cdxgen`.
 
 Each policy is platform-aware. Paths are resolved at runtime based on the operating system. For example, the npm policy detects the Node binary directory, resolves SSL certificate paths for macOS versus Linux, and sets registry host allow lists for npm, Yarn, and JS CDN endpoints.
 
 Policies that cover JavaScript package managers include `blockFork: true` and `blockExec: ['*']` by default to prevent postinstall scripts from spawning subprocesses.
 
-All built-in policies set `denyPersistenceWrites: true`, so an install can never stage a LaunchAgent, a loader plugin, or a binary in `/usr/local/bin` (enforced on macOS; Linux is already deny-by-default for ungranted paths). The non-interpreter ecosystems (`npm`, `pnpm`, `yarn`, `bun`, `deno`, `maven`, `cargo`, `gomod`, `composer`) additionally set `blockInterpreters: true`, blocking the Apple-signed scripting engines and sampling tools that can load in-memory shellcode. The interpreter-driven ecosystems (`pypi`, `uv`, `rubygems`) deliberately leave `blockInterpreters` off, since their own runtime is one of those engines. `blockJIT` is never enabled by default — every ecosystem runs or can invoke a JIT (V8/Node, the JVM), so enable it only for workloads you know do not JIT.
+All built-in policies set `denyPersistenceWrites: true`, so an install can never stage a LaunchAgent, a loader plugin, or a binary in `/usr/local/bin` (enforced on macOS; Linux is already deny-by-default for ungranted paths). The non-interpreter ecosystems (`npm`, `pnpm`, `yarn`, `bun`, `deno`, `maven`, `cargo`, `gomod`, `composer`, `nuget`) additionally set `blockInterpreters: true`, blocking the Apple-signed scripting engines and sampling tools that can load in-memory shellcode. The interpreter-driven ecosystems (`pypi`, `uv`, `rubygems`) deliberately leave `blockInterpreters` off, since their own runtime is one of those engines. `blockJIT` is never enabled by default — every ecosystem runs or can invoke a JIT (V8/Node, the JVM), so enable it only for workloads you know do not JIT.
+
+The `nuget` policy covers the .NET SDK (`dotnet restore/build/publish`). It allowlists the NuGet v3 service index (`api.nuget.org`) **and** the package CDN (`globalcdn.nuget.org` — restore fails with NU1301 if the CDN is blocked), plus `builds.dotnet.microsoft.com` for SDK/runtime downloads (the legacy `dotnetcli.azureedge.net` CDN was retired in January 2025). Because MSBuild spawns worker nodes and the VBCSCompiler build server, the policy keeps `blockFork: false` and an empty `blockExec` list, and pins `DOTNET_CLI_TELEMETRY_OPTOUT=1` / `NUGET_XMLDOC_MODE=skip`.
+
+## Egress Proxy — Hostname-Pinned Network Egress (`--proxy-egress`)
+
+macOS Seatbelt cannot pin egress IPs (its network filters are port-only — the engine warns "any host is reachable on those ports"), and Linux Landlock NET rules are likewise port-granular. The egress proxy closes that gap:
+
+```bash
+safer-exec --proxy-egress --allow-host=registry.npmjs.org -- npm install
+```
+
+```js
+const result = await new SaferExec()
+  .allowHosts("registry.npmjs.org")
+  .proxyEgress()
+  .run("npm", ["install"]);
+```
+
+How it works:
+
+1. The Go engine starts an HTTP CONNECT + absolute-form proxy on `127.0.0.1:<ephemeral port>` in the parent process (which has unrestricted network) and injects `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` into the sandboxed process.
+2. Every `CONNECT host:port` (and plain-HTTP proxy request) is checked against the hostname allowlist (`allowHosts` plus `allowUrls` hosts) and the port allowlist. Matching is **exact or dot-boundary suffix only** — `evil-nuget.org.attacker.com` can never match `nuget.org` (the published bypass class against `endsWith()`-style allowlist checks).
+3. Allowed targets are tunneled; denied targets get `HTTP 403` and a `proxy-violation` audit entry (`{"type":"proxy-violation","target":"CONNECT example.com:443"}`).
+4. **Fail closed**: with an empty allowlist every target is denied. Ports default to 80/443 unless `allowPorts` narrows or widens them.
+
+Platform behavior:
+
+- **macOS**: the Seatbelt profile additionally confines **all** outbound traffic to the loopback proxy port (plus the local DNS resolver socket), so hostname enforcement applies to every TCP connection — not just proxy-aware clients. This turns macOS from "port-only confinement" into true hostname-level egress control.
+- **Linux**: the proxy port is added to the Landlock connect allowlist. Enforcement here depends on whether you also set `allowPorts`:
+  - **No `allowPorts`** (the bundled policies, and the recommended setup): adding the proxy port is what switches Landlock's connect gate on, so the sandboxed process can reach *only* the proxy — every connection goes through the hostname allowlist.
+  - **With `allowPorts`**: Landlock keeps permitting those ports, so a client that ignores `HTTP(S)_PROXY` can connect straight out and the proxy degrades to advisory. The engine prints a warning when it detects this combination. Drop the port allowlist if you want enforcing egress control.
+
+  Either way, raw TCP protocols that ignore the proxy variables are not hostname-filtered on Linux unless the connect gate confines them to the proxy port. The proxy is skipped with a warning when `disableNetwork()` created an isolated network namespace (a sandboxed loopback cannot reach a host-side proxy; netns isolation is the stronger setting there).
+
+Known limitation (shared with every proxy-based design, including Claude Code's sandbox): raw TCP protocols that ignore `HTTP(S)_PROXY` (e.g. SSH) are not hostname-filtered on Linux unless Landlock confines connects to the proxy port; on macOS they are blocked outright by the loopback-only Seatbelt rules.
+
+## Dry-Run Mode (`--dry-run`)
+
+Runs the command with **all effects denied** — filesystem writes, network connections, and non-bootstrap reads all fail — and returns a structured report of everything the command attempted. No side effects occur; the exit code is synthetic `0`.
+
+```bash
+safer-exec --dry-run --json -- curl -s https://registry.npmjs.org/
+```
+
+```js
+const result = await new SaferExec().enableDryRun().run("npm", ["install"]);
+console.log(result.dryRun.summary); // { fileReads, fileWrites, networkOutbound, execAttempts, ... }
+console.log(result.dryRun.events);  // [{ type: "file-write", path: "/proj/node_modules/..." }, ...]
+```
+
+- **macOS**: bootstrap reads (system libraries, `/dev`, dyld cache) stay allowed so the binary can start and walk its control flow; every denied operation is reported by the kernel to the unified log, which the engine collects via `log show` after the run. Attribution follows the sandboxed process tree.
+- **Linux**: the denied run is wrapped in `strace` (when available) so every attempted `openat`/`connect`/`execve` is captured — Landlock denials are silent `EACCES`, so the tracer is what makes them visible. Without `strace` (or ptrace permissions) the report is empty and a warning is emitted.
+- A command that aborts on its first denial (instead of handling the error) will only surface that first operation — this is inherent to deny-all dry runs. `--learn` is the permissive counterpart when you need the complete behavior profile.
 
 ## Fork and Exec Control
 
@@ -587,6 +650,10 @@ console.log(result.learnedPolicy);
 ```
 
 On Linux the learner uses strace to capture file opens, stat calls, and network connects. If strace is not available it falls back to pre/post filesystem snapshots and `/proc/net/tcp` scanning. On macOS it uses Seatbelt trace rules.
+
+### Policy file round-trip
+
+The learned policy file preserves the hardening and isolation controls the learned run was configured with — `blockJIT`, `proxyEgress`, `blockInterpreters`, `denyPersistenceWrites`, `useReaper`, `procHardening`, `submountEnforce`, `setUpDev`, `bindUseFd`, `tmpOverlayPaths`, kafel `seccompFilters` (policy strings only; base64 blobs and host paths are not portable), `allowEnvs`, `protectSystem`/`protectHome`/`privateTmp`/`mapToTargetUid` — and `applyPolicyFile()` applies them all back. Merging (`--learn --policy-file=...`) unions these fields across runs, so iterating on a policy no longer silently drops hardening.
 
 ## Audit Mode
 

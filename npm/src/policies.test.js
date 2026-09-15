@@ -23,6 +23,7 @@ import { gomodPolicy } from './policies/gomod.js';
 import { bunPolicy } from './policies/bun.js';
 import { pokuPolicy } from './policies/poku.js';
 import { cdxgenPolicy } from './policies/cdxgen.js';
+import { nugetPolicy } from './policies/nuget.js';
 import { getSslPaths } from './policies/sslhelper.js';
 
 const home = process.env.HOME || process.env.USERPROFILE || '';
@@ -331,6 +332,50 @@ describe('policies', () => {
     });
   });
 
+  describe('nugetPolicy', () => {
+    const policy = nugetPolicy();
+
+    it('should allow the NuGet service index and package CDN', () => {
+      strict.ok(policy.allowHosts.includes('api.nuget.org'), 'needs api.nuget.org for the v3 service index');
+      strict.ok(policy.allowHosts.includes('globalcdn.nuget.org'), 'needs globalcdn.nuget.org for package downloads (NU1301 otherwise)');
+    });
+
+    it('should use the current .NET download domain, not the retired azureedge CDN', () => {
+      strict.ok(policy.allowHosts.includes('builds.dotnet.microsoft.com'));
+      strict.equal(
+        policy.allowHosts.some(h => h.includes('azureedge.net')), false,
+        'dotnetcli.azureedge.net / dotnetbuilds.azureedge.net were retired in January 2025'
+      );
+    });
+
+    it('should allow MSBuild worker spawning (blockFork false, no wildcard exec block)', () => {
+      strict.equal(policy.blockFork, false, 'dotnet/MSBuild spawn worker nodes and VBCSCompiler');
+      strict.equal(policy.blockExec.length, 0);
+    });
+
+    it('should harden env (telemetry off, xmldoc skip)', () => {
+      strict.equal(policy.env.DOTNET_CLI_TELEMETRY_OPTOUT, '1');
+      strict.equal(policy.env.NUGET_XMLDOC_MODE, 'skip');
+    });
+
+    it('should deny persistence writes and block interpreters', () => {
+      strict.equal(policy.denyPersistenceWrites, true);
+      strict.equal(policy.blockInterpreters, true);
+    });
+
+    it('should write to obj/bin and the user NuGet package cache', () => {
+      strict.ok(policy.writePaths.some(p => p.endsWith('/obj')), 'obj dir');
+      strict.ok(policy.writePaths.some(p => p.endsWith('/bin')), 'bin dir');
+      strict.ok(policy.writePaths.some(p => p.includes('.nuget')), 'user package cache');
+    });
+
+    it('should register in the SaferExec policy map', async () => {
+      const { SaferExec } = await import('./index.js');
+      const sx = new SaferExec().applyPolicy('nuget');
+      strict.ok(sx._allowHosts.includes('api.nuget.org'));
+    });
+  });
+
   describe('sslhelper', () => {
     const paths = getSslPaths();
 
@@ -363,6 +408,7 @@ describe('policies', () => {
       bun: bunPolicy,
       poku: pokuPolicy,
       cdxgen: cdxgenPolicy,
+      nuget: nugetPolicy,
     };
 
     for (const [name, fn] of Object.entries(all)) {

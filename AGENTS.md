@@ -228,6 +228,18 @@ The following features were added as hardening measures. Some are now enabled by
 | ----------------- | ---------------- | ------------------------------------------------------------------------------------------ |
 | Multi-UID Mapping | `mapToTargetUid` | Map UID 0 inside namespace to caller's real UID. Reduces root-in-namespace attack surface. |
 
+#### Network Egress, Dry-Run & Round-trip (since v0.16.0)
+
+| Feature           | Config Field     | Description                                                                                                                                              |
+| ----------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Egress Proxy      | `proxyEgress`    | Local HTTP CONNECT proxy on 127.0.0.1 + `HTTP(S)_PROXY` injection; hostname allowlist enforced at CONNECT time (exact or dot-boundary suffix — no `endsWith` bypass). Fail-closed; `proxy-violation` audit entries. macOS: Seatbelt confines ALL egress to the proxy port. Linux: enforcing only when `allowPorts` is unset (Landlock then confines connects to the proxy port); with explicit ports it degrades to advisory and the engine warns. Skipped under `disableNetwork` netns. |
+| Dry-Run (macOS)   | `enableDryRun`   | Deny-all run collecting attempted operations from the kernel's unified sandbox reports (`log show`) — file reads/writes, network targets, exec attempts — into `result.dryRun`.                                             |
+| Dry-Run (Linux)   | `enableDryRun`   | Same report on Linux by tracing the denied run with `strace` (Landlock denials are silent EACCES). Empty report + warning when strace is unavailable.                                                                       |
+| Dynamic io.max    | N/A              | cgroup v2/v1 IOPS/bps limits target the real `major:minor` devices backing the write paths (NVMe/virtio) instead of hardcoded `8:0`.                                                                                        |
+| NuGet policy      | `--policy=nuget` | .NET SDK policy: api.nuget.org + globalcdn.nuget.org + builds.dotnet.microsoft.com (post-azureedge retirement), MSBuild-worker-friendly fork/exec, telemetry off.                                                           |
+| Security services | `allowSecurityServices` | macOS opt-in `mach-lookup` to securityd (`com.apple.SecurityServer`) + opendirectoryd/memberd. NOT in the baseline profile: securityd is the keychain endpoint. Cert validation uses trustd, which is always allowed. The `nuget` policy opts in (.NET SslStream + getpwuid). |
+| Policy round-trip | PolicyFile       | Learn output + `applyPolicyFile()` preserve `blockJIT`, `proxyEgress`, `useReaper`, `procHardening`, `submountEnforce`, `setUpDev`, `bindUseFd`, `allowUserns`, `tmpOverlayPaths`, kafel `seccompFilters`, `allowEnvs`, and isolation modes.                                                  |
+
 ---
 
 ## Coding Conventions

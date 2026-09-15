@@ -74,6 +74,7 @@ import { pokuPolicy } from './policies/poku.js';
 import { cdxgenPolicy } from './policies/cdxgen.js';
 import { pnpmInstallPolicy } from './policies/pnpmInstall.js';
 import { uvPolicy } from './policies/uv.js';
+import { nugetPolicy } from './policies/nuget.js';
 function findInPath(cmd) {
   if (cmd.includes('/') || cmd.includes('\\')) {
     return cmd;
@@ -112,6 +113,7 @@ const POLICIES = {
   cdxgen: cdxgenPolicy,
   pnpmInstall: pnpmInstallPolicy,
   uv: uvPolicy,
+  nuget: nugetPolicy,
 };
 
 /**
@@ -341,6 +343,7 @@ export class SaferExec extends EventEmitter {
 
     /** @type {boolean} Permit loading .dylib from writable/temp dirs under blockInterpreters (macOS) */
     this._allowWritableDylibLoad = options.allowWritableDylibLoad || false;
+    this._allowSecurityServices = options.allowSecurityServices || false;
 
     /** @type {boolean} Block JIT / W^X syscalls (mprotect PROT_EXEC, memfd_create, MAP_JIT) */
     this._blockJIT = options.blockJIT || false;
@@ -467,6 +470,14 @@ export class SaferExec extends EventEmitter {
      * isolation is never silently weakened. Linux only.
      */
     this._allowChrootFallback = options.allowChrootFallback || false;
+
+    /**
+     * @type {boolean} Route egress through a local hostname-pinning proxy.
+     * Starts an HTTP CONNECT proxy on 127.0.0.1, injects HTTP_PROXY/HTTPS_PROXY
+     * into the sandbox, and enforces allowHosts at CONNECT time. On macOS this
+     * additionally confines all outbound traffic to the proxy port.
+     */
+    this._proxyEgress = options.proxyEgress || false;
   }
 
   /**
@@ -519,6 +530,26 @@ export class SaferExec extends EventEmitter {
     }
     if (policy.resolveSymlinks) {
       this._resolveSymlinks = true;
+    }
+    // Hardening flags the policy object carries (denyPersistenceWrites,
+    // blockInterpreters, blockJIT, allowHidden) must propagate too —
+    // dropping them would silently run the "hardened" policy without its
+    // hardening. Only positive values are OR-ed in so explicit user
+    // overrides still win.
+    if (policy.denyPersistenceWrites) {
+      this._denyPersistenceWrites = true;
+    }
+    if (policy.blockInterpreters) {
+      this._blockInterpreters = true;
+    }
+    if (policy.blockJIT) {
+      this._blockJIT = true;
+    }
+    if (policy.allowSecurityServices) {
+      this._allowSecurityServices = true;
+    }
+    if (policy.allowHidden === true) {
+      this._allowHidden = true;
     }
 
     return this;
@@ -654,8 +685,26 @@ export class SaferExec extends EventEmitter {
     if (raw.allowWritableDylibLoad) {
       this.allowWritableDylibLoad();
     }
+    if (raw.allowSecurityServices) {
+      this.allowSecurityServices();
+    }
     if (raw.blockJIT) {
       this.blockJIT();
+    }
+    if (raw.proxyEgress) {
+      this.proxyEgress();
+    }
+    if (raw.useReaper) {
+      this.useReaper();
+    }
+    if (raw.procHardening) {
+      this.procHardening();
+    }
+    if (raw.submountEnforce) {
+      this.submountEnforce();
+    }
+    if (Array.isArray(raw.allowEnvs) && raw.allowEnvs.length > 0) {
+      this.allowEnvs(...raw.allowEnvs);
     }
 
     // Observability
@@ -906,6 +955,40 @@ export class SaferExec extends EventEmitter {
    */
   allowLoopback() {
     this._allowLoopback = true;
+    return this;
+  }
+
+  /**
+   * Route outbound traffic through a local hostname-pinning egress proxy.
+   *
+   * Starts an HTTP CONNECT + absolute-form proxy on 127.0.0.1 inside the Go
+   * engine (parent side, unrestricted network) and injects
+   * HTTP_PROXY/HTTPS_PROXY/NO_PROXY into the sandboxed process. The proxy
+   * checks every CONNECT / proxied request against the hostname allowlist
+   * (allowHosts plus allowUrls hosts, exact or dot-boundary suffix matching)
+   * and the port allowlist, returning HTTP 403 and a "proxy-violation" audit
+   * entry for denied targets. Fails closed: with an empty allowlist every
+   * target is denied.
+   *
+   * This closes the biggest network gap on macOS, where Seatbelt cannot pin
+   * egress IPs: the Seatbelt profile confines ALL outbound traffic to the
+   * loopback proxy port, so hostname enforcement applies to every TCP
+   * connection, not just proxy-aware clients. On Linux it complements
+   * Landlock's port-only rules; it is skipped (with a warning) when
+   * disableNetwork created an isolated network namespace, since the sandbox
+   * loopback could not reach the host-side proxy there.
+   *
+   * @param {boolean} [enable=true] - Whether to enable the egress proxy
+   * @returns {SaferExec} This instance for chaining
+   *
+   * @example
+   * new SaferExec()
+   *   .allowHosts('registry.npmjs.org')
+   *   .proxyEgress()
+   *   .run('npm', ['install']);
+   */
+  proxyEgress(enable = true) {
+    this._proxyEgress = enable;
     return this;
   }
 
@@ -1240,6 +1323,26 @@ export class SaferExec extends EventEmitter {
    */
   allowWritableDylibLoad() {
     this._allowWritableDylibLoad = true;
+    return this;
+  }
+
+  /**
+   * Grant the sandboxed process mach-lookup access to securityd
+   * (com.apple.SecurityServer) and the user-database services
+   * (opendirectoryd, memberd). macOS-only.
+   *
+   * This widens the sandbox: securityd is the keychain endpoint, so a process
+   * granted this can query items from an unlocked login keychain whose ACL
+   * does not force a prompt. TLS certificate validation does NOT need it —
+   * that goes through trustd, which every profile already allows. Enable it
+   * only for runtimes that genuinely require these services; .NET is the
+   * known case (its SslStream path talks to securityd, and it resolves the
+   * home directory via getpwuid() rather than $HOME).
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  allowSecurityServices() {
+    this._allowSecurityServices = true;
     return this;
   }
 
@@ -2140,6 +2243,7 @@ export class SaferExec extends EventEmitter {
       blockInterpreters: this._blockInterpreters,
       denyPersistenceWrites: this._denyPersistenceWrites,
       allowWritableDylibLoad: this._allowWritableDylibLoad,
+      allowSecurityServices: this._allowSecurityServices,
       blockJIT: this._blockJIT,
       allowHidden: this._allowHidden,
       allowListen: this._allowListen,
@@ -2160,6 +2264,7 @@ export class SaferExec extends EventEmitter {
       mapToTargetUid: this._mapToTargetUid,
       allowUserns: this._allowUserns,
       allowChrootFallback: this._allowChrootFallback,
+      proxyEgress: this._proxyEgress,
     };
 
     const effectiveTimeout = this._timeoutMs;

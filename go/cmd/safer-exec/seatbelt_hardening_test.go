@@ -26,7 +26,7 @@ func TestSeatbelt_HostPinningRestrictsToPorts(t *testing.T) {
 		Cmd:        "/bin/true",
 		AllowIPs:   []string{"1.2.3.4"},
 		AllowPorts: []int{443},
-	})
+	}, 0)
 	if !strings.Contains(profile, `(allow network-outbound (remote ip "*:443"))`) {
 		t.Errorf("profile missing port-confined egress rule\n%s", profile)
 	}
@@ -44,7 +44,7 @@ func TestSeatbelt_HostPinningWithoutPortsDefaultsToWebPorts(t *testing.T) {
 	profile := buildSeatbeltProfile(config.ExecConfig{
 		Cmd:      "/bin/true",
 		AllowIPs: []string{"1.2.3.4"},
-	})
+	}, 0)
 	for _, want := range []string{
 		`(allow network-outbound (remote ip "*:80"))`,
 		`(allow network-outbound (remote ip "*:443"))`,
@@ -62,29 +62,33 @@ func TestSeatbelt_PortWildcardFallbackWithoutIPs(t *testing.T) {
 	profile := buildSeatbeltProfile(config.ExecConfig{
 		Cmd:        "/bin/true",
 		AllowPorts: []int{443},
-	})
+	}, 0)
 	if !strings.Contains(profile, `(allow network-outbound (remote ip "*:443"))`) {
 		t.Errorf("profile missing port rule when no IPs pinned\n%s", profile)
 	}
 }
 
-func TestSeatbelt_DisableNetworkRestrictsToPorts(t *testing.T) {
+func TestSeatbelt_DisableNetworkIsAbsolute(t *testing.T) {
 	profile := buildSeatbeltProfile(config.ExecConfig{
 		Cmd:            "/bin/true",
 		DisableNetwork: true,
 		AllowIPs:       []string{"10.0.0.5"},
 		AllowPorts:     []int{443},
-	})
+	}, 0)
 	if !strings.Contains(profile, "(deny network-outbound)") {
 		t.Errorf("disableNetwork profile missing deny rule\n%s", profile)
 	}
-	if !strings.Contains(profile, `(allow network-outbound (remote ip "*:443"))`) {
-		t.Errorf("disableNetwork profile missing port re-allow rule\n%s", profile)
+	// Seatbelt cannot pin remote IPs, so re-allowing the requested ports under
+	// disableNetwork would open those ports to every host on the internet —
+	// the opposite of disabling the network. Nothing but loopback (when
+	// explicitly allowed) may be re-allowed.
+	if strings.Contains(profile, `(allow network-outbound (remote ip "*`) {
+		t.Errorf("disableNetwork must not re-allow remote egress\n%s", profile)
 	}
 }
 
 func TestSeatbelt_DeniesCredentialStores(t *testing.T) {
-	profile := buildSeatbeltProfile(config.ExecConfig{Cmd: "/bin/true"})
+	profile := buildSeatbeltProfile(config.ExecConfig{Cmd: "/bin/true"}, 0)
 	for _, p := range []string{"/Library/Keychains", "/private/var/db/dslocal"} {
 		want := `(deny file-read* (subpath "` + p + `"))`
 		if !strings.Contains(profile, want) {
@@ -101,7 +105,7 @@ func TestSeatbelt_ProfileValidForPinnedHosts(t *testing.T) {
 		Cmd:        "/bin/true",
 		AllowIPs:   []string{"93.184.216.34", "2606:4700::1111"},
 		AllowPorts: []int{80},
-	})
+	}, 0)
 	for _, line := range strings.Split(profile, "\n") {
 		if strings.Contains(line, "network-outbound") && strings.Contains(line, "remote ip") {
 			if !strings.Contains(line, `"*:`) && !strings.Contains(line, `"localhost:`) {
@@ -115,7 +119,7 @@ func TestSeatbelt_BlockInterpretersExecDenies(t *testing.T) {
 	profile := buildSeatbeltProfile(config.ExecConfig{
 		Cmd:               "/bin/true",
 		BlockInterpreters: true,
-	})
+	}, 0)
 	want := []string{
 		`(deny process-exec (literal "/usr/bin/tclsh"))`,
 		`(deny process-exec (literal "/usr/bin/perl"))`,
@@ -136,7 +140,7 @@ func TestSeatbelt_BlockInterpretersReadDeniesAfterSystemAllow(t *testing.T) {
 	profile := buildSeatbeltProfile(config.ExecConfig{
 		Cmd:               "/bin/true",
 		BlockInterpreters: true,
-	})
+	}, 0)
 	systemAllow := indexOf(profile, `(allow file-read* (subpath "/System"))`)
 	ffidlDeny := indexOf(profile, `(deny file-read* (subpath "/System/Library/Tcl"))`)
 	if systemAllow < 0 || ffidlDeny < 0 {
@@ -153,7 +157,7 @@ func TestSeatbelt_BlockInterpretersSelfCmdGuard(t *testing.T) {
 	profile := buildSeatbeltProfile(config.ExecConfig{
 		Cmd:               "/usr/bin/perl",
 		BlockInterpreters: true,
-	})
+	}, 0)
 	if strings.Contains(profile, `(deny process-exec (literal "/usr/bin/perl"))`) {
 		t.Errorf("self-cmd guard failed: perl denied its own exec\n%s", profile)
 	}
@@ -167,7 +171,7 @@ func TestSeatbelt_DenyPersistenceWrites(t *testing.T) {
 	profile := buildSeatbeltProfile(config.ExecConfig{
 		Cmd:                   "/bin/true",
 		DenyPersistenceWrites: true,
-	})
+	}, 0)
 	want := []string{
 		`(deny file-write* (subpath "/Library/LaunchAgents"))`,
 		`(deny file-write* (subpath "/Library/LaunchDaemons"))`,
@@ -188,7 +192,7 @@ func TestSeatbelt_DenyPersistenceWritesOptOut(t *testing.T) {
 		Cmd:                   "/bin/true",
 		DenyPersistenceWrites: true,
 		WritePaths:            []string{"/usr/local/bin"},
-	})
+	}, 0)
 	if strings.Contains(profile, `(deny file-write* (subpath "/usr/local/bin"))`) {
 		t.Errorf("explicitly-granted write path should not be denied\n%s", profile)
 	}
@@ -202,14 +206,22 @@ func TestSeatbelt_WritableDylibDeny(t *testing.T) {
 		Cmd:               "/bin/true",
 		BlockInterpreters: true,
 		WritePaths:        []string{"/work/build"},
-	})
+	}, 0)
+	// The deny must be anchored to the tree prefix AND the .dylib suffix in
+	// a single regex: on current macOS, combining (subpath X) with (regex Y)
+	// applies the regex system-wide, which would block loading every
+	// non-cached dylib on the host (dotnet, Homebrew, ...).
 	for _, w := range []string{
-		`(deny file-read* (subpath "/tmp") (regex #"\.dylib$"))`,
-		`(deny file-read* (subpath "/work/build") (regex #"\.dylib$"))`,
+		`(deny file-read* (regex #"^/tmp/.*\.dylib$"))`,
+		`(deny file-read* (regex #"^/work/build/.*\.dylib$"))`,
 	} {
 		if !strings.Contains(profile, w) {
-			t.Errorf("profile missing writable-dylib deny %q\n%s", w, profile)
+			t.Errorf("profile missing anchored writable-dylib deny %q\n%s", w, profile)
 		}
+	}
+	// The unanchored form must never appear — it is the system-wide bug.
+	if strings.Contains(profile, `(regex #"\.dylib$")`) {
+		t.Errorf("profile uses unanchored dylib regex (matches every .dylib on the host)\n%s", profile)
 	}
 }
 
@@ -219,7 +231,7 @@ func TestSeatbelt_WritableDylibDenyOptOut(t *testing.T) {
 		BlockInterpreters:      true,
 		AllowWritableDylibLoad: true,
 		WritePaths:             []string{"/work/build"},
-	})
+	}, 0)
 	if strings.Contains(profile, `(regex #"\.dylib$")`) {
 		t.Errorf("AllowWritableDylibLoad should suppress dylib read denies\n%s", profile)
 	}
@@ -240,7 +252,7 @@ func TestSeatbelt_HardenedProfileValidates(t *testing.T) {
 		DenyPersistenceWrites: true,
 		WritePaths:            []string{"/work/build"},
 		AllowPorts:            []int{443},
-	})
+	}, 0)
 	tmp, err := os.CreateTemp("", "safer-exec-test-*.sb")
 	if err != nil {
 		t.Fatal(err)
@@ -254,5 +266,38 @@ func TestSeatbelt_HardenedProfileValidates(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Errorf("sandbox-exec rejected/failed hardened profile: %v\n%s\n---profile---\n%s", err, out, profile)
+	}
+}
+
+// securityd (the keychain endpoint) and the user-database services must not
+// be reachable from a baseline sandbox: a build script that can talk to
+// com.apple.SecurityServer can ask an unlocked login keychain for items whose
+// ACL does not force a prompt. Certificate validation goes through trustd,
+// which stays in the baseline.
+func TestSeatbelt_SecurityServicesAreOptIn(t *testing.T) {
+	base := buildSeatbeltProfile(config.ExecConfig{Cmd: "/bin/true"}, 0)
+	for _, forbidden := range []string{
+		"com.apple.SecurityServer",
+		"com.apple.system.opendirectoryd",
+		"com.apple.memberd",
+	} {
+		if strings.Contains(base, forbidden) {
+			t.Errorf("baseline profile must not grant mach-lookup to %s\n%s", forbidden, base)
+		}
+	}
+	// Trust evaluation must still work without it.
+	if !strings.Contains(base, `(allow mach-lookup (global-name "com.apple.trustd"))`) {
+		t.Errorf("baseline profile should still allow trustd for cert validation\n%s", base)
+	}
+
+	optedIn := buildSeatbeltProfile(config.ExecConfig{Cmd: "/bin/true", AllowSecurityServices: true}, 0)
+	for _, want := range []string{
+		`(allow mach-lookup (global-name "com.apple.SecurityServer"))`,
+		`(allow mach-lookup (global-name "com.apple.system.opendirectoryd"))`,
+		`(allow mach-lookup (global-name "com.apple.memberd"))`,
+	} {
+		if !strings.Contains(optedIn, want) {
+			t.Errorf("allowSecurityServices profile missing %s\n%s", want, optedIn)
+		}
 	}
 }

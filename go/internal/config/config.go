@@ -333,6 +333,21 @@ type ExecConfig struct {
 	// and immediately dlopen a dynamic library from the build tree. macOS-only.
 	AllowWritableDylibLoad bool `json:"allowWritableDylibLoad,omitempty"`
 
+	// AllowSecurityServices, when true, grants the sandboxed process
+	// mach-lookup access to securityd (com.apple.SecurityServer) and to the
+	// user-database services (opendirectoryd, memberd). macOS-only, opt-in,
+	// and deliberately NOT part of the baseline profile: securityd is the
+	// keychain endpoint, so granting it lets the sandboxed process query
+	// keychain items that an unlocked login keychain would hand over without
+	// a prompt. Certificate validation does not need it — that runs through
+	// trustd, which the baseline profile already allows.
+	//
+	// Enable it only for runtimes that genuinely require these services: .NET
+	// resolves the home directory through getpwuid() (opendirectoryd) rather
+	// than $HOME, and its SslStream path talks to securityd. The bundled
+	// `nuget` policy sets it for that reason.
+	AllowSecurityServices bool `json:"allowSecurityServices,omitempty"`
+
 	// BlockJIT, when true, blocks the syscalls that turn writable memory into
 	// executable memory or execute anonymous files: mprotect/pkey_mprotect
 	// with PROT_EXEC on a writable mapping, mmap with PROT_WRITE|PROT_EXEC or
@@ -465,6 +480,22 @@ type ExecConfig struct {
 	// filesystem isolation. With the default, a pivot_root failure is fatal even
 	// outside --strict. Linux-only.
 	AllowChrootFallback bool `json:"allowChrootFallback,omitempty"`
+
+	// ProxyEgress, when true, starts a local egress proxy (HTTP CONNECT +
+	// absolute-form forwarding) on 127.0.0.1 and injects HTTP_PROXY/HTTPS_PROXY/
+	// NO_PROXY into the sandboxed process so proxy-aware clients route through it.
+	// The proxy enforces the hostname allowlist (AllowHosts / AllowURLRules hosts)
+	// at CONNECT time — hostname matching is exact or dot-boundary suffix, never
+	// a bare suffix — and fails closed when no hosts are allowed. Denied attempts
+	// return HTTP 403 and are recorded as "proxy-violation" audit entries.
+	//
+	// On macOS this is the only way to get hostname-level egress control: the
+	// Seatbelt profile additionally confines ALL outbound traffic to the loopback
+	// proxy port, so both proxy-aware and raw-socket egress is mediated. On Linux
+	// the proxy complements Landlock port rules (Landlock cannot pin IPs); it
+	// requires a shared network namespace, so it is skipped with a warning when
+	// DisableNetwork created a fresh netns.
+	ProxyEgress bool `json:"proxyEgress,omitempty"`
 }
 
 // SeccompFilterSpec describes an additional seccomp-bpf filter to stack.
@@ -728,10 +759,33 @@ type PolicyFile struct {
 	BlockInterpreters      bool `json:"blockInterpreters,omitempty"`
 	DenyPersistenceWrites  bool `json:"denyPersistenceWrites,omitempty"`
 	AllowWritableDylibLoad bool `json:"allowWritableDylibLoad,omitempty"`
+	AllowSecurityServices  bool `json:"allowSecurityServices,omitempty"`
 	BlockJIT               bool `json:"blockJIT,omitempty"`
 	GPUUsed                bool `json:"gpuUsed,omitempty"`
 	TPMUsed                bool `json:"tpmUsed,omitempty"`
 	AntiVMActive           bool `json:"antiVMActive,omitempty"`
+
+	// Network egress proxy (mirror of the ExecConfig field). When true, runs
+	// enforce with the local hostname-pinning egress proxy.
+	ProxyEgress bool `json:"proxyEgress,omitempty"`
+
+	// Linux hardening / isolation round-trip (mirror of the ExecConfig fields).
+	// Booleans are emitted only when true; defaults live in the engines.
+	TmpOverlayPaths     []string            `json:"tmpOverlayPaths,omitempty"`
+	SeccompFilters      []SeccompFilterSpec `json:"seccompFilters,omitempty"`
+	UseReaper           bool                `json:"useReaper,omitempty"`
+	ProcHardening       bool                `json:"procHardening,omitempty"`
+	SubmountEnforce     bool                `json:"submountEnforce,omitempty"`
+	DieWithParent       bool                `json:"dieWithParent,omitempty"`
+	NewSession          bool                `json:"newSession,omitempty"`
+	SetUpDev            bool                `json:"setUpDev,omitempty"`
+	BindUseFd           bool                `json:"bindUseFd,omitempty"`
+	AllowUserns         bool                `json:"allowUserns,omitempty"`
+	AllowChrootFallback bool                `json:"allowChrootFallback,omitempty"`
+
+	// AllowEnvs lists host environment variables that passed through the
+	// allow-list during the learned run and should be requested again.
+	AllowEnvs []string `json:"allowEnvs,omitempty"`
 
 	// HTTP access log — populated when --trace-http-urls is used with --learn
 	// or --audit. Records observed HTTP requests with method, host, and path.

@@ -78,7 +78,7 @@ func TestBuildSeatbeltProfile_Basic(t *testing.T) {
 		WritePaths:     []string{"/tmp"},
 		DisableNetwork: true,
 	}
-	profile := buildSeatbeltProfile(cfg)
+	profile := buildSeatbeltProfile(cfg, 0)
 
 	if !strings.Contains(profile, "(version 1)") {
 		t.Error("profile should contain version 1")
@@ -101,17 +101,19 @@ func TestBuildSeatbeltProfile_IPFiltering(t *testing.T) {
 		AllowPorts:     []int{80, 443},
 		DisableNetwork: true,
 	}
-	profile := buildSeatbeltProfile(cfg)
+	profile := buildSeatbeltProfile(cfg, 0)
 
-	// Seatbelt uses port-based filtering: "*:80", "*:443"
-	if !strings.Contains(profile, "*:80") {
-		t.Error("profile should contain port 80 rule")
+	// disableNetwork is absolute on macOS (matching the Linux netns
+	// semantics): no ports are re-allowed, because Seatbelt cannot pin IPs
+	// and re-allowing ports would make every host reachable on them.
+	if strings.Contains(profile, "*:80") || strings.Contains(profile, "*:443") {
+		t.Error("disableNetwork must not re-allow ports")
 	}
-	if !strings.Contains(profile, "*:443") {
-		t.Error("profile should contain port 443 rule")
+	if strings.Contains(profile, `(allow network-outbound (remote ip "*`) {
+		t.Error("disableNetwork must not re-allow any remote egress")
 	}
-	if !strings.Contains(profile, "(remote ip") {
-		t.Error("profile should use remote ip syntax")
+	if !strings.Contains(profile, "(deny network-outbound)") {
+		t.Error("profile should deny network-outbound")
 	}
 }
 

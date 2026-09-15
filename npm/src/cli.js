@@ -63,7 +63,8 @@ Usage:
 Options:
   -p, --policy=<name>        Apply a built-in policy preset
                              Available: npm, pypi, maven, cargo, rubygems,
-                                        composer, deno, gomod, bun
+                                        composer, deno, gomod, bun, pnpm,
+                                        pnpmInstall, poku, uv, nuget, cdxgen
   -m, --max-memory=<mb>      Memory limit in megabytes
   -c, --max-cpu=<cores>      CPU limit as fractional cores (e.g. 0.5)
       --max-processes=<n>    Max child processes (anti-fork bomb)
@@ -75,6 +76,7 @@ Options:
 
   -n, --disable-network      Disable all network access
       --allow-loopback       Allow localhost/loopback connections
+      --proxy-egress         Enforce hostname egress via local CONNECT proxy (HTTP_PROXY injection)
   -H, --allow-host=<host>    Allow network access to specific host (repeatable)
       --allow-url=<url>      Allow network access to specific URL/Pattern (Linux only, repeatable)
       --port=<port>          Allow network access to specific TCP port (repeatable)
@@ -90,6 +92,7 @@ Options:
   --block-interpreters       Deny Apple-signed scripting engines / sampling tools that can load in-memory shellcode (macOS)
   --deny-persistence-writes  Deny writes to LaunchAgents, plugin loaders, /usr/local/bin and other persistence locations
   --allow-writable-dylib-load Permit loading .dylib from writable/temp dirs under --block-interpreters (macOS)
+  --allow-security-services Permit mach-lookup to securityd + the user database (macOS; widens the sandbox to reach the keychain — .NET needs it, TLS validation does not)
   --block-jit                Block W^X / JIT syscalls (mprotect PROT_EXEC, memfd_create, MAP_JIT); breaks V8/JVM (Linux)
   --trace-exec               Log every child process spawned (fork + exec audit)
   --trace-libraries          Track dynamically loaded libraries at runtime
@@ -103,6 +106,7 @@ Options:
   -d, --diff                 Enable filesystem mutation diffing
   -l, --learn                Enable behavioral auto-profiling (learning mode)
       --learn-output=<file>  Write learned policy to file
+      --dry-run              Run with all operations denied; report what the command attempted (no side effects)
       --validate-profile     Validate Seatbelt profile syntax (macOS only)
   -a, --audit                Enable sandbox violation auditing
       --audit-output-file=<f> Write audit log to file (implies audit)
@@ -313,7 +317,13 @@ function parseCliArgs() {
       'allow-writable-dylib-load': {
         type: 'boolean',
       },
+      'allow-security-services': {
+        type: 'boolean',
+      },
       'block-jit': {
+        type: 'boolean',
+      },
+      'proxy-egress': {
         type: 'boolean',
       },
       'trace-exec': {
@@ -589,8 +599,14 @@ function buildExec(values, cmd, args) {
   if (values['allow-writable-dylib-load']) {
     exec.allowWritableDylibLoad();
   }
+  if (values['allow-security-services']) {
+    exec.allowSecurityServices();
+  }
   if (values['block-jit']) {
     exec.blockJIT();
+  }
+  if (values['proxy-egress']) {
+    exec.proxyEgress();
   }
   if (values['trace-exec']) {
     exec.traceExec();
