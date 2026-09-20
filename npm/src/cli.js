@@ -59,6 +59,28 @@ function printHelp() {
 Usage:
   safer-exec [OPTIONS] -- COMMAND [ARGS...]
   safer-exec diagnostics
+  safer-exec hook <pre|post|audit> [OPTIONS]
+  safer-exec harness <list|install|uninstall|import> [OPTIONS]
+
+Hook mode (agentic harness integration):
+  safer-exec hook pre               Read a PreToolUse payload from stdin, audit it
+                                    (JSONL trail), optionally enforce converted
+                                    permission rules / wrap Bash in the sandbox
+  safer-exec hook post              Audit a PostToolUse payload (file changes, results)
+  safer-exec hook audit [--tail=N] [--json] [--last=N]
+                                    Show the audit trail (default ~/.safer-exec/hooks-audit.jsonl)
+  Environment: SAFER_EXEC_HOOK_CONFIG, SAFER_EXEC_HOOK_MODE=enforce,
+               SAFER_EXEC_HOOK_WRAP=1, SAFER_EXEC_HOOK_POLICY,
+               SAFER_EXEC_HOOK_AUDIT_LOG, SAFER_EXEC_HOOK_HARNESS
+
+Harness mode (install / convert permissions):
+  safer-exec harness list                                   Detect harness configs
+  safer-exec harness install --harness=<id> [--scope=project|user]
+                              [--mode=audit|enforce] [--events=pre,post]
+                              [--wrap] [--timeout=<sec>] [--no-import]
+  safer-exec harness uninstall --harness=<id> [--scope=project|user]
+  safer-exec harness import --harness=<id> [--path=<file>] [--out=<policy.json>] [--print]
+  Harnesses: claude-code, zcode, codex, gemini, cursor, factory, copilot, opencode
 
 Options:
   -p, --policy=<name>        Apply a built-in policy preset
@@ -136,9 +158,7 @@ Options:
 
 Diagnostics:
   safer-exec diagnostics        Show OS capabilities and feature support
-  safer-exec bootstrap-apparmor Load AppArmor profile for user namespaces (Linux, requires sudo)
-
-Examples:
+  safer-exec bootstrap-apparmor Load AppArmor profile for user namespaces (Linux, requires sudo)Examples:
   # Run npm install with the NPM policy
   safer-exec --policy=npm -- npm install
 
@@ -884,9 +904,203 @@ async function runDiagnosticsAndPrint() {
 }
 
 /**
+ * Dispatch the `hook` subcommand.
+ *
+ * @param {string[]} rest arguments after `hook`
+ * @returns {Promise<number>} exit code
+ */
+async function runHookSubcommand(rest) {
+  const sub = rest[0];
+  const args = rest.slice(1);
+  if (sub !== 'pre' && sub !== 'post' && sub !== 'audit') {
+    process.stderr.write('[safer-exec] Usage: safer-exec hook <pre|post|audit> [--tail=N] [--json] [--last=N]\n');
+    return 1;
+  }
+  const { runHookCli, readAuditTrail, loadHookConfig } = await import('./hooks.js');
+  if (sub === 'pre' || sub === 'post') {
+    return runHookCli(sub);
+  }
+  // audit viewer
+  const flags = parseSimpleFlags(args);
+  const config = loadHookConfig();
+  const file = flags['file'] || config.auditLog;
+  const records = readAuditTrail(file, { last: Number(flags.tail || flags.last || 0) });
+  if (flags.json) {
+    process.stdout.write(JSON.stringify(records, null, 2) + '\n');
+    return 0;
+  }
+  if (records.length === 0) {
+    process.stdout.write(`No audit records in ${file}\n`);
+    return 0;
+  }
+  process.stdout.write(`safer-exec hook audit trail (${file}) — ${records.length} records\n`);
+  for (const r of records) {
+    const act = r.activity || {};
+    const target = act.command || act.path || act.url || act.query || act.server || act.type || '';
+    const line = String(target).replace(/\s+/g, ' ').slice(0, 100);
+    const decision = r.decision === 'passthrough' ? '' : ` [${r.decision}]`;
+    process.stdout.write(
+      `${(r.ts || '').slice(11, 19)} ${String(r.harness || '').padEnd(11)} ${(r.event || '').padEnd(12)} ` +
+      `${String(r.tool || '').padEnd(12)} ${line}${decision}${r.wrapped ? ' (sandboxed)' : ''}\n`
+    );
+  }
+  return 0;
+}
+
+/**
+ * Dispatch the `harness` subcommand (list / install / uninstall / import).
+ *
+ * @param {string[]} rest arguments after `harness`
+ * @returns {Promise<number>} exit code
+ */
+async function runHarnessSubcommand(rest) {
+  const sub = rest[0];
+  const args = rest.slice(1);
+  const flags = parseSimpleFlags(args);
+  const harnesses = await import('./harnesses/index.js');
+
+  if (sub === 'list') {
+    const found = harnesses.detectHarnesses();
+    process.stdout.write('Detected agentic harness configurations:\n');
+    for (const h of found) {
+      const existing = h.configs.filter((c) => c.exists).map((c) => c.path);
+      const mark = existing.length > 0 ? '\u2713' : ' ';
+      process.stdout.write(` ${mark} ${h.id.padEnd(11)} ${h.label.padEnd(18)} ${existing.length ? existing.join(', ') : '(no config found)'}\n`);
+    }
+    process.stdout.write('\nInstall hooks:      safer-exec harness install --harness=<id>\n');
+    process.stdout.write('Import permissions:  safer-exec harness import --harness=<id>\n');
+    return 0;
+  }
+
+  if (sub === 'import') {
+    const id = flags.harness;
+    if (!id) {
+      process.stderr.write('[safer-exec] --harness=<id> is required. See: safer-exec harness list\n');
+      return 1;
+    }
+    try {
+      const { policy, sources } = harnesses.importHarnessPolicy(id, { path: flags.path });
+      const out = flags.out;
+      if (out) {
+        writeFileSync(out, JSON.stringify(policy, null, 2) + '\n');
+        process.stderr.write(`[safer-exec] Policy written to ${out} (from ${sources.join(', ')})\n`);
+      }
+      if (flags.print || !out) {
+        process.stdout.write(JSON.stringify(policy, null, 2) + '\n');
+      }
+      return 0;
+    } catch (err) {
+      process.stderr.write(`[safer-exec] ${err.message}\n`);
+      return 1;
+    }
+  }
+
+  if (sub === 'install') {
+    const id = flags.harness;
+    if (!id) {
+      process.stderr.write('[safer-exec] --harness=<id> is required. See: safer-exec harness list\n');
+      return 1;
+    }
+    const events = String(flags.events || 'pre,post').split(',').map((s) => s.trim()).filter((s) => s === 'pre' || s === 'post');
+    try {
+      const result = harnesses.installHarnessHooks(id, {
+        scope: flags.scope || 'project',
+        mode: flags.mode === 'enforce' ? 'enforce' : 'audit',
+        events: events.length > 0 ? events : ['pre', 'post'],
+        wrap: Boolean(flags.wrap),
+        policyFile: flags['policy-file'] || '',
+        auditLog: flags['audit-log'] || '',
+        timeoutSec: flags.timeout ? parseInt(flags.timeout, 10) : 30,
+        skipPolicyImport: Boolean(flags['no-import']),
+      });
+      process.stdout.write(`Installed safer-exec hooks for ${result.harness} (scope: ${result.scope})\n`);
+      process.stdout.write(`  Hook config:    ${result.hookConfigFile}\n`);
+      process.stdout.write(`  Audit trail:    ${result.auditLog}\n`);
+      if (result.policyFile) {
+        process.stdout.write(`  Policy:         ${result.policyFile}`);
+        process.stdout.write(result.importedFrom.length ? ` (imported from ${result.importedFrom.join(', ')})\n` : '\n');
+      } else {
+        process.stdout.write('  Policy:         none (no harness permission config found — audit only)\n');
+      }
+      for (const f of result.hookSettingsFiles) {
+        process.stdout.write(`  Harness hooks:  ${f}\n`);
+      }
+      if (result.mode === 'enforce') {
+        process.stdout.write('  Mode:           enforce (deny rules block tools; allow rules auto-approve)\n');
+      } else {
+        process.stdout.write('  Mode:           audit (observes only). Switch with --mode=enforce\n');
+      }
+      if (result.wrap) {
+        process.stdout.write('  Wrapping:       Bash commands rewritten to run inside the safer-exec sandbox\n');
+      }
+      return 0;
+    } catch (err) {
+      process.stderr.write(`[safer-exec] ${err.message}\n`);
+      return 1;
+    }
+  }
+
+  if (sub === 'uninstall') {
+    const id = flags.harness;
+    if (!id) {
+      process.stderr.write('[safer-exec] --harness=<id> is required.\n');
+      return 1;
+    }
+    try {
+      const result = harnesses.uninstallHarnessHooks(id, { scope: flags.scope || 'project' });
+      if (result.removed.length === 0) {
+        process.stdout.write(`No safer-exec hooks found for ${id} (scope: ${flags.scope || 'project'})\n`);
+        return 0;
+      }
+      for (const f of result.removed) {
+        process.stdout.write(`Removed safer-exec hooks from ${f}\n`);
+      }
+      return 0;
+    } catch (err) {
+      process.stderr.write(`[safer-exec] ${err.message}\n`);
+      return 1;
+    }
+  }
+
+  process.stderr.write('[safer-exec] Usage: safer-exec harness <list|install|uninstall|import> [--harness=<id>] [options]\n');
+  return 1;
+}
+
+/**
+ * Minimal --key=value / --key flag parser for subcommands.
+ *
+ * @param {string[]} args
+ * @returns {Record<string, string|boolean>}
+ */
+function parseSimpleFlags(args) {
+  /** @type {Record<string, string|boolean>} */
+  const flags = {};
+  for (const arg of args) {
+    if (!arg.startsWith('--')) continue;
+    const eq = arg.indexOf('=');
+    if (eq > 0) {
+      flags[arg.slice(2, eq)] = arg.slice(eq + 1);
+    } else {
+      flags[arg.slice(2)] = true;
+    }
+  }
+  return flags;
+}
+
+/**
  * Main CLI entry point.
  */
 async function main() {
+  const argv = process.argv.slice(2);
+
+  // Subcommands with their own flag surface — dispatch before strict parsing
+  if (argv[0] === 'hook') {
+    process.exit(await runHookSubcommand(argv.slice(1)));
+  }
+  if (argv[0] === 'harness') {
+    process.exit(await runHarnessSubcommand(argv.slice(1)));
+  }
+
   const { values, positionals } = parseCliArgs();
 
   // Handle --version

@@ -101,6 +101,143 @@ safer-exec --bind-fd=3:/dev/host-tty:ro -- tty
 
 Full help: `safer-exec --help`.
 
+## Agentic Harness Hooks (Claude Code, Codex, ZCode, Gemini CLI, Cursor, droid, Copilot CLI, OpenCode)
+
+safer-exec can run as a **pre/post tool hook** inside agentic coding harnesses to
+track and audit every tool activity — file IO, network targets, command exec —
+and to actually **execute Bash commands inside the OS sandbox** with filesystem
+diffing and violation auditing. It also **imports each harness's own permission
+config** and converts it into a safer-exec policy, so an existing ruleset keeps
+working (and gets *stronger*: token gaps like `sh -c 'curl …'` slipping past
+`Bash(curl *)` are closed by the sandbox).
+
+Six of the eight supported harnesses share the Claude Code hook contract
+(JSON on stdin, exit 2 blocks, `permissionDecision` JSON on stdout), so one
+hook binary serves all of them:
+
+| Harness | Hook events used | Config imported |
+|---|---|---|
+| claude-code | `PreToolUse` / `PostToolUse` | `permissions.allow/ask/deny` tokens, `additionalDirectories` |
+| zcode | `PreToolUse` / `PostToolUse` | hooks only (no permission tokens) |
+| codex | `PreToolUse` / `PostToolUse` (TOML) | `sandbox_mode`, `[sandbox_workspace_write]`, beta `[permissions]` profiles, `.codex/rules.json` |
+| gemini | `BeforeTool` / `AfterTool` | `tools.core` allowlists, `~/.gemini/policies/*.toml` rules |
+| cursor | `pre-tool-use` / `post-tool-use` | `permissions` tokens (`Shell(git*)`, `Edit(src/**)`, `WebFetch(domain)`) |
+| factory (droid) | `PreToolUse` / `PostToolUse` | `commandAllowlist` / `commandDenylist` / `commandBlocklist` |
+| copilot | `preToolUse` / `postToolUse` | `--allow-tool`-style tokens, `allowedUrls` |
+| opencode | plugin shim (`tool.execute.before/after`) | `permission.bash/edit/read/webfetch` patterns |
+
+### Install the hook
+
+```bash
+# Detect which harness configs exist in the current project / $HOME
+safer-exec harness list
+
+# Register safer-exec as pre+post tool hook for a harness (project scope)
+safer-exec harness install --harness=claude-code
+
+# Audit + actually sandbox Bash commands (rewrites tool input; macOS+Linux)
+safer-exec harness install --harness=claude-code --wrap
+
+# Enforce the converted permission rules: deny blocks the tool (exit 2),
+# an explicit allow rule answers the permission prompt automatically
+safer-exec harness install --harness=claude-code --mode=enforce --wrap
+
+# User scope (every project): --scope=user
+safer-exec harness install --harness=zcode --scope=user
+
+# Remove (only safer-exec's entries; existing hooks are preserved)
+safer-exec harness uninstall --harness=claude-code
+```
+
+Install writes:
+
+- `<project>/.safer-exec/hook-config.json` — hook runtime config (mode, wrap, policy, audit log). Edit this file (or set `SAFER_EXEC_HOOK_MODE` / `SAFER_EXEC_HOOK_WRAP` env vars) to change behavior without reinstalling.
+- `<project>/.safer-exec/harness-policy.json` — your harness permissions converted to a safer-exec policy (when a permission config is found).
+- `<project>/.safer-exec/hooks-audit.jsonl` — the audit trail.
+- Hook entries in the harness's own settings (`.claude/settings.json`, `.zcode/config.json` `hooks.events` with `hooks.enabled: true`, `.codex/config.toml` `[[hooks.PreToolUse]]`, `.gemini/settings.json`, `.cursor/hooks.json`, `.factory/hooks.json`, `.github/hooks/safer-exec.json`, `.opencode/plugin/safer-exec-audit.ts`). A one-time `.safer-exec.bak` backup is kept next to modified files.
+
+### Convert permissions without installing
+
+```bash
+# Convert a harness's permission config into a safer-exec policy file
+safer-exec harness import --harness=claude-code --out=policy.json
+safer-exec harness import --harness=codex --path=~/.codex/config.toml --print
+
+# Then use it anywhere a policy file is accepted
+safer-exec --policy-file=policy.json -- npm install
+```
+
+Conversion rules: `WebFetch(domain:x)` allow → `allowHosts`; `Read`/`Edit`
+allow globs → `readPaths`/`writePaths`; deny rules with a leading executable
+→ `blockExec`; Codex `workspace-write` → `writePaths` = cwd + `writable_roots`;
+`network_access = false` → `disableNetwork`; Gemini policy-TOML deny prefixes →
+deny rules. The full rule set is preserved verbatim in the policy's
+`harnessRules` section, which the hook engine evaluates with the source
+harness's own semantics (Claude-style first-match deny>ask>allow, OpenCode's
+last-match-wins).
+
+### What the hook records
+
+Every tool event is appended as one JSON line:
+
+```json
+{"ts":"2026-09-20T10:11:12Z","harness":"claude-code","event":"PreToolUse",
+ "tool":"Bash","activity":{"type":"exec","command":"npm install"},
+ "sessionId":"…","cwd":"/repo","decision":"allow","reason":"allow rule Bash(npm *) [claude-code]"}
+```
+
+Activity types: `exec` (Bash/Execute/shell), `file-read` (Read/Grep/Glob),
+`file-write` (Write/Edit/apply_patch), `network-fetch` (WebFetch — URL + host),
+`network-search` (WebSearch), `mcp-call`, `agent`, `signal`. PostToolUse
+records add the response summary (`bashEditDiff.changedFiles`, output sizes,
+errors, duration).
+
+```bash
+# Inspect the trail
+safer-exec hook audit --tail=20
+safer-exec hook audit --json | jq '.[] | select(.decision=="deny")'
+```
+
+### Wrap mode — real OS sandboxing per Bash call
+
+With `--wrap`, the PreToolUse hook rewrites the Bash tool input
+(`updatedInput`) to run the command through safer-exec:
+
+```
+node …/cli.js --policy-file=.safer-exec/wrap-policy.json --diff --audit --trace-exec \
+  --audit-output-file=.safer-exec/hooks-audit.jsonl \
+  --env=SAFER_EXEC_WRAPPED_CMD=<base64> -- /bin/bash -c 'eval "$(printf %s "$SAFER_EXEC_WRAPPED_CMD" | base64 -d)"'
+```
+
+The original command travels base64-encoded in an env var (no quoting
+hazards). The derived wrap policy keeps harness semantics — reads stay open
+(audited, not confined), writes cover the workspace + `/tmp` + imported write
+roots, and `blockExec` / `allowHosts` / `disableNetwork` from the imported
+permissions are enforced by the OS sandbox. Filesystem mutations are reported
+back to the agent as an fsdiff summary, and sandbox violations + child execs
+land in the same audit JSONL.
+
+### Manual invocation (any harness, CI, homegrown agents)
+
+```bash
+echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"npm install"},"cwd":"."}' \
+  | safer-exec hook pre
+```
+
+Exit codes: `0` pass, `2` block (stderr = reason shown to the model). Payload
+shapes from all eight harnesses are auto-normalized (`BeforeTool`, kebab-case,
+camelCase `toolArgs`, …).
+
+### Library API
+
+```js
+import { handleHookEvent, normalizeHookPayload, extractActivity } from '@cdxgen/safer-exec/hooks';
+import { importHarnessPolicy, detectHarnesses } from '@cdxgen/safer-exec/harnesses';
+
+const { policy, sources } = importHarnessPolicy('codex');   // → PolicyFile JSON + source files
+const { exitCode, stdout, record } = handleHookEvent(payload, { config: { mode: 'enforce', policyFile } });
+```
+
 ## Fluent API
 
 ```js

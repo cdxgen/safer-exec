@@ -7,7 +7,9 @@
     "safer-exec": "src/cli.js"
   },
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./hooks": "./src/hooks.js",
+    "./harnesses": "./src/harnesses/index.js"
   },
   "files": [
     "src/"
