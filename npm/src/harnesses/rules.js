@@ -245,31 +245,34 @@ export function extractNestedCommands(command) {
 }
 
 /**
- * Normalize the first token of a command string for matching: strip
- * surrounding quotes and reduce a path-qualified executable
- * (`/usr/bin/curl`, `./node_modules/.bin/jest`) to its basename, so a deny
- * rule written as `curl *` also matches `/usr/bin/curl …`.
+ * Split a command string into its leading executable token (unquoted) and
+ * the remainder.
  *
  * @param {string} s
- * @returns {string}
+ * @returns {{exe: string, rest: string}}
  */
-function normalizeCommandToken(s) {
+function splitExecutable(s) {
   const sp = s.indexOf(' ');
   const first = sp === -1 ? s : s.slice(0, sp);
   const rest = sp === -1 ? '' : s.slice(sp);
-  let tok = first;
-  if (tok.length > 1 && ((tok[0] === '"' && tok.endsWith('"')) || (tok[0] === "'" && tok.endsWith("'")))) {
-    tok = tok.slice(1, -1);
+  let exe = first;
+  if (exe.length > 1 && ((exe[0] === '"' && exe.endsWith('"')) || (exe[0] === "'" && exe.endsWith("'")))) {
+    exe = exe.slice(1, -1);
   }
-  if (tok.includes('/')) tok = tok.slice(tok.lastIndexOf('/') + 1);
-  return tok + rest;
+  return { exe, rest };
 }
 
 /**
  * Match a command pattern (`prefix *` / exact / glued `prefix*`) against one
  * subcommand string. A space-separated `prefix *` requires a word boundary;
- * a glued `prefix*` (Cursor style) is a plain startswith. Path-qualified
- * executables on either side are reduced to their basename first.
+ * a glued `prefix*` (Cursor style) is a plain startswith.
+ *
+ * Executable spelling: when the pattern names a *bare* executable (`curl *`),
+ * a path-qualified invocation matches it (`/usr/bin/curl …`) — otherwise a
+ * deny rule is trivially evaded by spelling out the path. When the pattern is
+ * itself path-qualified (`./scripts/deploy.sh *`), both sides are compared
+ * literally: reducing the pattern to a basename would widen an allow rule to
+ * every same-named binary anywhere on the filesystem.
  *
  * @param {string} pattern e.g. "npm run *" or "git push" or "git*"
  * @param {string} subcommand
@@ -277,8 +280,14 @@ function normalizeCommandToken(s) {
  */
 export function matchCommandPattern(pattern, subcommand) {
   const norm = (s) => s.trim().replace(/\s+/g, ' ');
-  const p = normalizeCommandToken(norm(pattern));
-  const c = normalizeCommandToken(norm(subcommand));
+  const pat = splitExecutable(norm(pattern));
+  const sub = splitExecutable(norm(subcommand));
+  let subExe = sub.exe;
+  if (!pat.exe.includes('/') && subExe.includes('/')) {
+    subExe = subExe.slice(subExe.lastIndexOf('/') + 1);
+  }
+  const p = pat.exe + pat.rest;
+  const c = subExe + sub.rest;
   if (p === '*') return true;
   if (p.endsWith('*')) {
     const glued = /\S\*$/.test(p); // star attached to the prefix word
@@ -292,18 +301,25 @@ export function matchCommandPattern(pattern, subcommand) {
 /**
  * Resolve a tool-supplied file path against the session cwd. Harnesses
  * normally send absolute paths, but relative (`src/a.js`), dot-segment
- * (`/proj/./a.js`) and up-level (`/proj/sub/../a.js`) forms all occur; all
- * resolve to the same canonical absolute path here so path rules match.
+ * (`/proj/./a.js`), up-level (`/proj/sub/../a.js`) and home-relative
+ * (`~/.ssh/id_rsa`) forms all occur; all resolve to the same canonical
+ * absolute path here so path rules match.
  *
  * @param {string|undefined} p
  * @param {string} cwd
+ * @param {string} [home] home directory for `~` expansion
  * @returns {string|undefined}
  */
-export function resolveActivityPath(p, cwd) {
+export function resolveActivityPath(p, cwd, home) {
   if (typeof p !== 'string' || p === '') return p;
+  const homeDir = home || process.env.HOME || '';
+  let input = p;
+  if (homeDir && (input === '~' || input.startsWith('~/'))) {
+    input = input === '~' ? homeDir : `${homeDir}/${input.slice(2)}`;
+  }
   let abs;
   try {
-    abs = resolve(cwd || process.cwd(), p);
+    abs = resolve(cwd || process.cwd(), input);
   } catch {
     return p;
   }

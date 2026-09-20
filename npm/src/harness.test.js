@@ -14,6 +14,7 @@ import { parseTOML, stringifyTOML, TOMLError } from './harnesses/toml.js';
 import {
   parseClaudeToken,
   matchCommandPattern,
+  resolveActivityPath,
   matchDomainPattern,
   splitCompoundCommand,
   gitignoreGlobToRegExp,
@@ -152,6 +153,26 @@ describe('claude token parsing + matching', () => {
     assert.ok(matchCommandPattern('git*', 'git status'));
     assert.ok(matchCommandPattern('git push', 'git push'));
     assert.ok(!matchCommandPattern('git push', 'git push --force'));
+  });
+
+  test('bare pattern matches path-qualified exec, qualified pattern does not widen', () => {
+    // A bare-executable deny rule cannot be evaded by spelling out the path
+    assert.ok(matchCommandPattern('curl *', '/usr/bin/curl http://x'));
+    assert.ok(matchCommandPattern('curl *', './vendor/curl http://x'));
+    assert.ok(matchCommandPattern('curl *', '"/usr/bin/curl" http://x'));
+    // A path-qualified rule stays anchored to that path — reducing it to a
+    // basename would let an allow rule grant any same-named binary anywhere
+    assert.ok(!matchCommandPattern('./scripts/deploy.sh *', '/tmp/evil/deploy.sh --prod'));
+    assert.ok(!matchCommandPattern('/usr/local/bin/mytool *', '/tmp/mytool x'));
+    assert.ok(matchCommandPattern('/usr/local/bin/mytool *', '/usr/local/bin/mytool x'));
+  });
+
+  test('resolveActivityPath canonicalizes relative, dot-segment and tilde forms', () => {
+    assert.equal(resolveActivityPath('.env', '/proj'), '/proj/.env');
+    assert.equal(resolveActivityPath('/proj/./.env', '/proj'), '/proj/.env');
+    assert.equal(resolveActivityPath('/proj/sub/../.env', '/proj'), '/proj/.env');
+    assert.equal(resolveActivityPath('~/.ssh/id_rsa', '/proj', '/home/u'), '/home/u/.ssh/id_rsa');
+    assert.equal(resolveActivityPath('~', '/proj', '/home/u'), '/home/u');
   });
 
   test('splitCompoundCommand strips wrappers and env assignments', () => {

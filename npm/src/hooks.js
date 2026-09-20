@@ -191,9 +191,9 @@ export function extractActivity(norm) {
   let filePath;
   let realPath;
   if (typeof rawPath === 'string' && rawPath !== '') {
-    filePath = resolveActivityPath(rawPath, norm.cwd);
+    filePath = resolveActivityPath(rawPath, norm.cwd, process.env.HOME || '');
     try {
-      realPath = realpathSync.native(rawPath.startsWith('/') || rawPath.startsWith('~') ? rawPath : filePath);
+      realPath = realpathSync.native(filePath);
       if (process.platform === 'win32') realPath = realPath.replace(/\\/g, '/');
       if (realPath === filePath) realPath = undefined;
     } catch {
