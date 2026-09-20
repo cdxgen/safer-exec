@@ -17,6 +17,9 @@
  * @module rules
  */
 
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+
 /** Tools whose tool_input carries a shell command string. */
 export const SHELL_TOOLS = new Set([
   'Bash', 'bash', 'Execute', 'execute', 'Shell', 'shell', 'run_shell_command',
@@ -191,15 +194,18 @@ export function splitCompoundCommand(command) {
   const out = [];
   for (const part of parts) {
     let tokens = part.split(/\s+/);
-    // Strip leading VAR=value assignments
-    while (tokens.length > 1 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) {
-      tokens = tokens.slice(1);
-    }
-    // Strip wrapper commands (like `timeout 10 curl …`)
-    while (tokens.length > 1 && COMMAND_WRAPPERS.has(tokens[0])) {
-      tokens = tokens.slice(1);
-      // `timeout 10`, `nice -n 5` — drop the wrapper's numeric/flag argument
-      while (tokens.length > 1 && /^-?[0-9]/.test(tokens[0])) tokens = tokens.slice(1);
+    // Strip leading VAR=value assignments (run twice: `FOO=1 cmd` and
+    // `env FOO=1 cmd` both occur)
+    for (let round = 0; round < 2; round++) {
+      while (tokens.length > 1 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) {
+        tokens = tokens.slice(1);
+      }
+      // Strip wrapper commands (like `timeout 10 curl …`)
+      while (tokens.length > 1 && COMMAND_WRAPPERS.has(tokens[0])) {
+        tokens = tokens.slice(1);
+        // `timeout 10`, `nice -n 5` — drop the wrapper's numeric/flag argument
+        while (tokens.length > 1 && /^-?[0-9]/.test(tokens[0])) tokens = tokens.slice(1);
+      }
     }
     if (tokens.length > 0) out.push(tokens.join(' '));
   }
@@ -207,9 +213,63 @@ export function splitCompoundCommand(command) {
 }
 
 /**
+ * Extract commands nested inside the given shell command so deny rules can
+ * match them: `$( … )` and process substitutions, backtick substitution, and
+ * the payload of `sh|bash|… -c '<payload>'`. The payload is matched as a
+ * plain subcommand — it is the command the shell will actually run.
+ *
+ * Obfuscated payloads (built from variables, base64, concatenation) are NOT
+ * recovered — those remain a documented enforcement gap; wrap mode's OS
+ * sandbox is the backstop there.
+ *
+ * @param {string} command
+ * @returns {string[]}
+ */
+export function extractNestedCommands(command) {
+  /** @type {string[]} */
+  const out = [];
+  if (typeof command !== 'string' || command.length > 10000) return out;
+  let m;
+  const substitution = /\$\(([^()]{1,2000})\)/g;
+  while ((m = substitution.exec(command))) out.push(m[1]);
+  const procSub = /<\(([^()]{1,2000})\)/g;
+  while ((m = procSub.exec(command))) out.push(m[1]);
+  const backtick = /`([^`]{1,2000})`/g;
+  while ((m = backtick.exec(command))) out.push(m[1]);
+  const shellDashC = /(?:^|[\s;&|(])(?:[^\s'"]*\/)?(?:bash|zsh|dash|ksh|ash|sh|shell)\s+(?:(?:-{1,2}[^\s]+)\s+)*-c\s+(?:'([^']{0,2000})'|"([^"]{0,2000})"|(\S{1,2000}))/g;
+  while ((m = shellDashC.exec(command))) {
+    const payload = m[1] ?? m[2] ?? m[3];
+    if (payload) out.push(payload);
+  }
+  return out;
+}
+
+/**
+ * Normalize the first token of a command string for matching: strip
+ * surrounding quotes and reduce a path-qualified executable
+ * (`/usr/bin/curl`, `./node_modules/.bin/jest`) to its basename, so a deny
+ * rule written as `curl *` also matches `/usr/bin/curl …`.
+ *
+ * @param {string} s
+ * @returns {string}
+ */
+function normalizeCommandToken(s) {
+  const sp = s.indexOf(' ');
+  const first = sp === -1 ? s : s.slice(0, sp);
+  const rest = sp === -1 ? '' : s.slice(sp);
+  let tok = first;
+  if (tok.length > 1 && ((tok[0] === '"' && tok.endsWith('"')) || (tok[0] === "'" && tok.endsWith("'")))) {
+    tok = tok.slice(1, -1);
+  }
+  if (tok.includes('/')) tok = tok.slice(tok.lastIndexOf('/') + 1);
+  return tok + rest;
+}
+
+/**
  * Match a command pattern (`prefix *` / exact / glued `prefix*`) against one
  * subcommand string. A space-separated `prefix *` requires a word boundary;
- * a glued `prefix*` (Cursor style) is a plain startswith.
+ * a glued `prefix*` (Cursor style) is a plain startswith. Path-qualified
+ * executables on either side are reduced to their basename first.
  *
  * @param {string} pattern e.g. "npm run *" or "git push" or "git*"
  * @param {string} subcommand
@@ -217,8 +277,8 @@ export function splitCompoundCommand(command) {
  */
 export function matchCommandPattern(pattern, subcommand) {
   const norm = (s) => s.trim().replace(/\s+/g, ' ');
-  const p = norm(pattern);
-  const c = norm(subcommand);
+  const p = normalizeCommandToken(norm(pattern));
+  const c = normalizeCommandToken(norm(subcommand));
   if (p === '*') return true;
   if (p.endsWith('*')) {
     const glued = /\S\*$/.test(p); // star attached to the prefix word
@@ -227,6 +287,28 @@ export function matchCommandPattern(pattern, subcommand) {
     return glued ? c.startsWith(prefix) : (c === prefix || c.startsWith(`${prefix} `));
   }
   return c === p;
+}
+
+/**
+ * Resolve a tool-supplied file path against the session cwd. Harnesses
+ * normally send absolute paths, but relative (`src/a.js`), dot-segment
+ * (`/proj/./a.js`) and up-level (`/proj/sub/../a.js`) forms all occur; all
+ * resolve to the same canonical absolute path here so path rules match.
+ *
+ * @param {string|undefined} p
+ * @param {string} cwd
+ * @returns {string|undefined}
+ */
+export function resolveActivityPath(p, cwd) {
+  if (typeof p !== 'string' || p === '') return p;
+  let abs;
+  try {
+    abs = resolve(cwd || process.cwd(), p);
+  } catch {
+    return p;
+  }
+  if (process.platform === 'win32') abs = abs.replace(/\\/g, '/');
+  return abs;
 }
 
 /**
@@ -323,6 +405,43 @@ export function evaluateRules(rules, activity, ctx) {
 }
 
 /**
+ * Build the regex variants for a path rule. Each pattern form anchors on
+ * exactly one directory (`~/` → home, `/x` → baseDir, `./x` → cwd); when
+ * that anchor exists on disk and is a symlink (macOS `/var` →
+ * `/private/var`, symlinked project dirs), a second variant is built from
+ * the anchor's realpath so rules and activities written in either spelling
+ * match.
+ *
+ * @param {Object} rule
+ * @param {{cwd: string, home: string}} ctx
+ * @returns {{regex: RegExp, negated: boolean}[]}
+ */
+function pathRuleRegexVariants(rule, ctx) {
+  const home = rule.home === '~' || rule.home === undefined ? ctx.home : rule.home;
+  const build = (baseDir, cwd, homeDir) => pathRuleToRegExp(rule.pattern, { cwd, home: homeDir, baseDir });
+  const p = rule.pattern.startsWith('!') ? rule.pattern.slice(1) : rule.pattern;
+
+  let anchor = null;
+  if (p.startsWith('~/')) anchor = home;
+  else if (p.startsWith('/') && !p.startsWith('//')) anchor = rule.baseDir || null;
+  else if (p.startsWith('./')) anchor = ctx.cwd;
+
+  const variants = [build(rule.baseDir, ctx.cwd, home)];
+  if (anchor && anchor.startsWith('/')) {
+    let real = null;
+    try {
+      real = realpathSync.native(anchor);
+    } catch { /* anchor may not exist — lexical variant only */ }
+    if (real && real !== anchor) {
+      if (p.startsWith('~/')) variants.push(build(rule.baseDir, ctx.cwd, real));
+      else if (p.startsWith('/') && !p.startsWith('//')) variants.push(build(real, ctx.cwd, home));
+      else variants.push(build(rule.baseDir, real, home));
+    }
+  }
+  return variants;
+}
+
+/**
  * Does a single rule match the given activity?
  *
  * @param {Object} rule
@@ -350,8 +469,14 @@ function ruleMatchesActivity(rule, activity, ctx) {
       // droid `Shell(...)` vs Claude `Bash(...)` interop
       if (!(SHELL_TOOLS.has(tool) && SHELL_TOOLS.has(rule.tool))) return false;
     }
-    const subs = splitCompoundCommand(activity.command);
-    return subs.some((s) => matchCommandPattern(rule.pattern, s));
+    // Subcommands plus anything nested in substitutions / `sh -c` payloads —
+    // `echo $(curl …)`, `` x=`curl …` ``, `bash -c "curl …"` must all match
+    // a `Bash(curl *)` deny rule.
+    const candidates = splitCompoundCommand(activity.command);
+    for (const nested of extractNestedCommands(activity.command)) {
+      candidates.push(...splitCompoundCommand(nested));
+    }
+    return candidates.some((s) => matchCommandPattern(rule.pattern, s));
   }
 
   if (rule.kind === 'command-regex') {
@@ -364,17 +489,22 @@ function ruleMatchesActivity(rule, activity, ctx) {
   }
 
   if (rule.kind === 'path') {
-    if (!activity.path) return false;
+    if (!activity.path && !activity.realPath) return false;
     const applies =
       (rule.access === 'write' && (activity.type === 'file-write' || activity.type === 'file-edit')) ||
       (rule.access === 'read' && (activity.type === 'file-read' || activity.type === 'file-edit' || READ_TOOLS.has(tool)));
     if (!applies) return false;
-    const { regex, negated } = pathRuleToRegExp(rule.pattern, {
-      cwd: ctx.cwd,
-      home: rule.home === '~' ? ctx.home : rule.home,
-      baseDir: rule.baseDir,
-    });
-    return negated ? !regex.test(activity.path) : regex.test(activity.path);
+    // Match the lexically-resolved path (covers relative / dot-segment
+    // inputs) and, when the file exists, the symlink-resolved real path
+    // (covers a symlink standing in for the denied target), against the
+    // rule's anchor in both its lexical and realpath spellings.
+    const candidates = [];
+    if (activity.path) candidates.push(activity.path);
+    if (activity.realPath && activity.realPath !== activity.path) candidates.push(activity.realPath);
+    const variants = pathRuleRegexVariants(rule, ctx);
+    return candidates.some((p) =>
+      variants.some(({ regex, negated }) => (negated ? !regex.test(p) : regex.test(p)))
+    );
   }
 
   if (rule.kind === 'domain') {

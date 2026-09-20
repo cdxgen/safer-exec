@@ -6,17 +6,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import {
-  FETCH_TOOLS,
-  READ_TOOLS,
-  WRITE_TOOLS,
-  SHELL_TOOLS,
-  hostFromUrl,
-  leadingExecutable,
-  pathRuleToRegExp,
-  splitCompoundCommand,
-} from './rules.js';
+import { join, resolve } from 'node:path';
 
 /**
  * Read and parse a JSON file; throws with the file path in the message.
@@ -130,8 +120,8 @@ export function firstExisting(candidates) {
  *
  * Mapping decisions:
  * - allow path rules → readPaths/writePaths (deny-by-default sandbox)
- * - deny/ask stay in `harnessRules` for the hook engine; deny command rules
- *   additionally map to blockExec (leading executable)
+ * - deny/ask stay in `harnessRules` for the hook engine; deny rules that
+ *   block a bare executable additionally map to blockExec
  * - allow domain rules → allowHosts (+ 443); network denies are implicit
  * - additionalDirectories → readPaths
  *
@@ -149,12 +139,11 @@ export function policyFromRules(parsed, ctx) {
   const allowHosts = [];
   /** @type {string[]} */
   const blockExec = [];
-  const seen = (arr) => new Set(arr);
-
+  const seen = new Set();
   const push = (arr, v) => {
-    if (v && !seen(arr).has(v)) {
+    if (v && !seen.has(v)) {
+      seen.add(v);
       arr.push(v);
-      seen(arr).add(v);
     }
   };
 
@@ -169,7 +158,6 @@ export function policyFromRules(parsed, ctx) {
     if (dir !== '/' && dir !== ':workspace') push(readPaths, resolve(ctx.cwd, expandTilde(dir, ctx.home)));
   }
 
-  let domainAllowSeen = false;
   for (const rule of rules) {
     if (rule.kind === 'path' && rule.action === 'allow') {
       const abs = resolvePathRule(rule, ctx);
@@ -178,20 +166,17 @@ export function policyFromRules(parsed, ctx) {
       else push(readPaths, abs);
     }
     if (rule.kind === 'domain' && rule.action === 'allow') {
-      domainAllowSeen = true;
       push(allowHosts, domainToHostPattern(rule.pattern));
     }
+    // blockExec only for deny rules that block the executable itself
+    // (`Bash(npm *)`, `Bash(curl)`). A subcommand deny (`Bash(npm publish:*)`,
+    // `Bash(rm -rf *)`) must NOT become blockExec — the sandbox cannot
+    // express "block this subcommand" and would block every invocation of
+    // the executable; the hook decision layer enforces those instead.
     if (rule.kind === 'command' && rule.action === 'deny') {
-      const first = rule.pattern.replace(/\s*\*$/, '').trim().split(/\s+/)[0];
-      if (first && !first.includes('*')) push(blockExec, first);
+      const prefix = rule.pattern.replace(/\s*\*$/, '').trim();
+      if (prefix && !prefix.includes(' ') && !prefix.includes('*')) push(blockExec, prefix);
     }
-  }
-
-  // Sandbox mode hints (Codex-style)
-  if (meta.disableNetwork) {
-    // explicit network refusal wins
-  } else if (meta.enableNetwork) {
-    // leave network open unless domain rules imply confinement
   }
 
   /** @type {Record<string, unknown>} */
@@ -235,13 +220,8 @@ export function policyFromRules(parsed, ctx) {
  */
 function resolvePathRule(rule, ctx) {
   if (rule.pattern.startsWith('!')) return null;
-  const { regex } = pathRuleToRegExp(rule.pattern, {
-    cwd: ctx.cwd,
-    home: ctx.home,
-    baseDir: rule.baseDir,
-  });
   // Use the literal prefix of the pattern up to the first wildcard
-  let p = rule.pattern.startsWith('!') ? rule.pattern.slice(1) : rule.pattern;
+  const p = rule.pattern;
   let abs;
   if (p.startsWith('//')) abs = p.slice(1);
   else if (p.startsWith('~/')) abs = join(ctx.home, p.slice(2));
@@ -252,7 +232,7 @@ function resolvePathRule(rule, ctx) {
   const wildcard = abs.search(/[*?]/);
   const base = wildcard >= 0 ? abs.slice(0, wildcard) : abs;
   const trimmed = base.replace(/\/+$/, '');
-  return trimmed && regex !== undefined ? trimmed : null;
+  return trimmed || null;
 }
 
 /**
@@ -305,5 +285,3 @@ function safeExists(p) {
     return false;
   }
 }
-
-export { FETCH_TOOLS, READ_TOOLS, WRITE_TOOLS, SHELL_TOOLS, hostFromUrl, leadingExecutable, splitCompoundCommand, dirname };

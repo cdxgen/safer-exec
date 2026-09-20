@@ -5,7 +5,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -16,6 +16,7 @@ import {
   extractActivity,
   handleHookEvent,
   buildWrapCommand,
+  shellForWrap,
   summarizeResponse,
   readAuditTrail,
   loadHookConfig,
@@ -282,13 +283,206 @@ describe('handleHookEvent', () => {
   });
 });
 
+describe('path deny rules (relative / dot-segment / up-level / symlink)', () => {
+  function enforceConfig(dir, extraRules = []) {
+    const policyFile = join(dir, 'policy.json');
+    writeFileSync(policyFile, JSON.stringify({
+      harnessRules: [
+        {
+          tool: 'Read', kind: 'path', pattern: './.env', access: 'read', action: 'deny',
+          source: 'claude-code', baseDir: dir, home: join(dir, 'h'),
+        },
+        ...extraRules,
+      ],
+    }));
+    return {
+      config: { mode: 'enforce', wrap: false, policyFile, auditLog: join(dir, 'a.jsonl'), harness: 'claude-code' },
+    };
+  }
+
+  test('all path spellings of the same file are denied', () => {
+    const dir = tmp();
+    writeFileSync(join(dir, '.env'), 'SECRET=1\n');
+    mkdirSync(join(dir, 'sub'), { recursive: true });
+    const { config } = enforceConfig(dir);
+    for (const file_path of ['.env', './.env', `${dir}/.env`, `${dir}/./.env`, `${dir}/sub/../.env`]) {
+      const res = handleHookEvent({
+        session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+        tool_name: 'Read', tool_input: { file_path },
+      }, { config });
+      assert.equal(res.exitCode, 2, `expected deny for ${file_path}`);
+    }
+    // a different file is not denied
+    const ok = handleHookEvent({
+      session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+      tool_name: 'Read', tool_input: { file_path: `${dir}/src/app.js` },
+    }, { config });
+    assert.equal(ok.exitCode, 0);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('symlink to a denied file is denied via realPath', { skip: process.platform === 'win32' }, () => {
+    const dir = tmp();
+    writeFileSync(join(dir, '.env'), 'SECRET=1\n');
+    symlinkSync(join(dir, '.env'), join(dir, 'link.env'));
+    const { config } = enforceConfig(dir);
+    const res = handleHookEvent({
+      session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+      tool_name: 'Read', tool_input: { file_path: join(dir, 'link.env') },
+    }, { config });
+    assert.equal(res.exitCode, 2, 'symlinked path to denied target must be denied');
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('command deny rules (path-qualified and nested invocation)', () => {
+  function denyCurlConfig(dir) {
+    const policyFile = join(dir, 'policy.json');
+    writeFileSync(policyFile, JSON.stringify({
+      harnessRules: [
+        { tool: 'Bash', kind: 'command', pattern: 'curl *', action: 'deny', source: 'claude-code' },
+      ],
+    }));
+    return { mode: 'enforce', wrap: false, policyFile, auditLog: join(dir, 'a.jsonl'), harness: 'claude-code' };
+  }
+
+  const curlVariants = [
+    'curl https://evil.example.com',
+    '/usr/bin/curl https://evil.example.com',
+    'echo hi && /usr/bin/curl https://evil.example.com',
+    'echo $(curl https://evil.example.com)',
+    'out=`curl https://evil.example.com`',
+    'bash -c "curl https://evil.example.com"',
+    "sh -c 'curl https://evil.example.com'",
+    'diff <(curl https://evil.example.com) /dev/null',
+  ];
+
+  for (const command of curlVariants) {
+    test(`denied: ${command}`, () => {
+      const dir = tmp();
+      const res = handleHookEvent({
+        session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+        tool_name: 'Bash', tool_input: { command },
+      }, { config: denyCurlConfig(dir) });
+      assert.equal(res.exitCode, 2);
+      rmSync(dir, { recursive: true, force: true });
+    });
+  }
+
+  test('benign commands still pass', () => {
+    const dir = tmp();
+    const config = denyCurlConfig(dir);
+    for (const command of ['echo hello', 'git status && ls', 'echo "$(date)"']) {
+      const res = handleHookEvent({
+        session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+        tool_name: 'Bash', tool_input: { command },
+      }, { config });
+      assert.equal(res.exitCode, 0, command);
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('multi-word deny prefixes are not satisfied by the executable alone', () => {
+    const dir = tmp();
+    const policyFile = join(dir, 'policy.json');
+    writeFileSync(policyFile, JSON.stringify({
+      harnessRules: [
+        { tool: 'Bash', kind: 'command', pattern: 'git push *', action: 'deny', source: 'claude-code' },
+      ],
+    }));
+    const config = { mode: 'enforce', wrap: false, policyFile, auditLog: join(dir, 'a.jsonl'), harness: 'claude-code' };
+    const denied = handleHookEvent({
+      session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+      tool_name: 'Bash', tool_input: { command: '/usr/bin/git push origin main' },
+    }, { config });
+    assert.equal(denied.exitCode, 2, 'path-qualified git push matches the deny prefix');
+    const allowed = handleHookEvent({
+      session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+      tool_name: 'Bash', tool_input: { command: '/usr/bin/git status' },
+    }, { config });
+    assert.equal(allowed.exitCode, 0, 'git status must not match a git push deny');
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('enforce mode degradation warnings', () => {
+  const payload = (dir) => ({
+    session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+    tool_name: 'Bash', tool_input: { command: 'echo x' },
+  });
+
+  test('missing policy file warns loudly and fails open', () => {
+    const dir = tmp();
+    const res = handleHookEvent(payload(dir), {
+      config: { mode: 'enforce', wrap: false, policyFile: '', auditLog: join(dir, 'a.jsonl'), harness: 'claude-code' },
+    });
+    assert.equal(res.exitCode, 0);
+    assert.match(res.warning ?? '', /no policy file configured/);
+    assert.match(res.record.enforcementWarning, /no policy file configured/);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('corrupt policy file warns loudly', () => {
+    const dir = tmp();
+    const policyFile = join(dir, 'policy.json');
+    writeFileSync(policyFile, '{ this is not json');
+    const res = handleHookEvent(payload(dir), {
+      config: { mode: 'enforce', wrap: false, policyFile, auditLog: join(dir, 'a.jsonl'), harness: 'claude-code' },
+    });
+    assert.equal(res.exitCode, 0);
+    assert.match(res.warning ?? '', /invalid policy file/);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('rule-less policy warns', () => {
+    const dir = tmp();
+    const policyFile = join(dir, 'policy.json');
+    writeFileSync(policyFile, JSON.stringify({ harnessRules: [] }));
+    const res = handleHookEvent(payload(dir), {
+      config: { mode: 'enforce', wrap: false, policyFile, auditLog: join(dir, 'a.jsonl'), harness: 'claude-code' },
+    });
+    assert.equal(res.exitCode, 0);
+    assert.match(res.warning ?? '', /no rules to enforce/);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('audit mode never warns about policy state', () => {
+    const dir = tmp();
+    const res = handleHookEvent(payload(dir), {
+      config: { mode: 'audit', wrap: false, policyFile: '', auditLog: join(dir, 'a.jsonl'), harness: 'claude-code' },
+    });
+    assert.equal(res.exitCode, 0);
+    assert.equal(res.stderr, undefined);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe('buildWrapCommand', () => {
-  test('includes policy, audit log, and env transport', () => {
+  test('includes policy, audit log, and env transport (single-quoted)', () => {
     const cmd = buildWrapCommand('ls -la', { policyFile: '/p.json', auditLog: '/a.jsonl' });
-    assert.match(cmd, /--policy-file="\/p\.json"/);
-    assert.match(cmd, /--audit-output-file="\/a\.jsonl"/);
-    assert.match(cmd, /-- \/bin\/bash -c/);
+    assert.match(cmd, /--policy-file='\/p\.json'/);
+    assert.match(cmd, /--audit-output-file='\/a\.jsonl'/);
+    assert.match(cmd, new RegExp(`-- '${shellForWrap()}' -c`));
     assert.ok(!cmd.includes('ls -la'), 'original command must not appear verbatim (quoting hazards)');
+  });
+
+  test('shell metacharacters in interpolated paths are inert', () => {
+    const hostile = '/tmp/pr"$(id > /tmp/safer-exec-pwned)oj/p.json';
+    const cmd = buildWrapCommand('echo ok', { policyFile: hostile, auditLog: hostile });
+    const start = cmd.indexOf('--policy-file=') + '--policy-file='.length;
+    const quoted = cmd.slice(start, cmd.indexOf(' --diff', start));
+    // Have a real shell evaluate the token: single-quote escaping must
+    // reproduce the literal path, and the $(…) must never execute
+    const ev = spawnSync('/bin/sh', ['-c', `printf %s ${quoted}`], { encoding: 'utf8' });
+    assert.equal(ev.status, 0, ev.stderr);
+    assert.equal(ev.stdout, hostile);
+    assert.ok(!existsSync('/tmp/safer-exec-pwned'), 'command substitution executed despite quoting');
+  });
+
+  test('shellForWrap returns an existing shell', () => {
+    const shell = shellForWrap();
+    assert.ok(['/bin/bash', '/usr/bin/bash', '/bin/sh'].includes(shell));
+    assert.ok(existsSync(shell));
   });
 });
 
@@ -364,7 +558,7 @@ describe('hook CLI end-to-end', () => {
     const out = JSON.parse(r.stdout);
     const cmd = out.hookSpecificOutput.updatedInput.command;
     // Simulate the harness running the rewritten command
-    const run = spawnSync('/bin/bash', ['-c', cmd], { encoding: 'utf8', cwd: dir });
+    const run = spawnSync(shellForWrap(), ['-c', cmd], { encoding: 'utf8', cwd: dir });
     assert.equal(run.status, 0, `wrapped command failed: ${run.stderr}`);
     assert.equal(readFileSync(join(dir, 'out.txt'), 'utf8').trim(), 'wrapped-e2e-ok');
     rmSync(dir, { recursive: true, force: true });

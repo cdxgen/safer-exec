@@ -28,6 +28,7 @@ import {
   WRITE_TOOLS,
   evaluateRules,
   hostFromUrl,
+  resolveActivityPath,
 } from './harnesses/rules.js';
 
 const CLI_PATH = fileURLToPath(new URL('./cli.js', import.meta.url));
@@ -172,15 +173,33 @@ function detectHarness(raw, event) {
 /**
  * Extract the tracked activity from a normalized payload.
  *
- * @param {{toolName: string, toolInput: Object, event: string, harness: string}} norm
- * @returns {{type: string, command?: string, path?: string, url?: string, host?: string, query?: string, tool: string}}
+ * File paths are canonically resolved against the payload cwd (relative,
+ * dot-segment and up-level forms all normalize to one absolute path), and a
+ * symlink-resolved `realPath` is added when it differs — both are matched
+ * against path rules so neither form bypasses a deny rule.
+ *
+ * @param {{toolName: string, toolInput: Object, event: string, harness: string, cwd: string}} norm
+ * @returns {{type: string, command?: string, path?: string, realPath?: string, url?: string, host?: string, query?: string, tool: string}}
  */
 export function extractActivity(norm) {
   const tool = norm.toolName;
   const input = norm.toolInput || {};
   const command = input.command ?? input.cmd ?? (typeof input.script === 'string' ? input.script : undefined);
-  const filePath = input.file_path ?? input.filePath ?? input.path ?? input.filename ?? undefined;
+  const rawPath = input.file_path ?? input.filePath ?? input.path ?? input.filename ?? undefined;
   const url = input.url ?? input.URI ?? undefined;
+
+  let filePath;
+  let realPath;
+  if (typeof rawPath === 'string' && rawPath !== '') {
+    filePath = resolveActivityPath(rawPath, norm.cwd);
+    try {
+      realPath = realpathSync.native(rawPath.startsWith('/') || rawPath.startsWith('~') ? rawPath : filePath);
+      if (process.platform === 'win32') realPath = realPath.replace(/\\/g, '/');
+      if (realPath === filePath) realPath = undefined;
+    } catch {
+      realPath = undefined; // file may not exist yet (Write) — lexical path only
+    }
+  }
 
   /** @type {{type: string, tool: string}} */
   let activity = { type: 'other', tool };
@@ -191,12 +210,13 @@ export function extractActivity(norm) {
   } else if (SEARCH_TOOLS.has(tool) && typeof input.query === 'string') {
     activity = { type: 'network-search', tool, query: input.query, host: 'search' };
   } else if (WRITE_TOOLS.has(tool) && typeof filePath === 'string') {
-    activity = { type: 'file-write', tool, path: filePath };
+    activity = realPath ? { type: 'file-write', tool, path: filePath, realPath } : { type: 'file-write', tool, path: filePath };
   } else if (READ_TOOLS.has(tool)) {
     activity = {
       type: 'file-read',
       tool,
-      path: typeof filePath === 'string' ? filePath : undefined,
+      path: filePath,
+      ...(realPath ? { realPath } : {}),
       pattern: typeof input.pattern === 'string' ? input.pattern : undefined,
     };
   } else if (/^mcp__/i.test(tool)) {
@@ -214,29 +234,77 @@ export function extractActivity(norm) {
 
 /**
  * Load the harnessRules + evaluation mode from the configured policy file.
+ * Failures are reported (not thrown) so the caller can warn loudly in
+ * enforce mode — a silent empty rule set would turn enforcement off.
  *
  * @param {string} policyFile
- * @returns {{rules: Object[], lastMatchWins: boolean, raw: Object|null}}
+ * @returns {{rules: Object[], lastMatchWins: boolean, raw: Object|null, error: string|null}}
  */
 function loadPolicyRules(policyFile) {
-  if (!policyFile || !existsSync(policyFile)) return { rules: [], lastMatchWins: false, raw: null };
+  if (!policyFile) {
+    return { rules: [], lastMatchWins: false, raw: null, error: 'no policy file configured' };
+  }
+  if (!existsSync(policyFile)) {
+    return { rules: [], lastMatchWins: false, raw: null, error: `policy file not found: ${policyFile}` };
+  }
   try {
     const raw = JSON.parse(readFileSync(policyFile, 'utf-8'));
     return {
       rules: Array.isArray(raw.harnessRules) ? raw.harnessRules : [],
       lastMatchWins: raw.harnessRuleEvaluation === 'last-match',
       raw,
+      error: null,
     };
-  } catch {
-    return { rules: [], lastMatchWins: false, raw: null };
+  } catch (err) {
+    return { rules: [], lastMatchWins: false, raw: null, error: `invalid policy file ${policyFile}: ${err.message}` };
   }
+}
+
+/**
+ * Single-quote a value for a POSIX shell. Every character between the quotes
+ * is literal — this is the only quoting style without exceptions, so
+ * interpolated paths (policy file, audit log — both derived from the
+ * workspace directory name, which we do not control) cannot break out or
+ * trigger expansions.
+ *
+ * @param {string} s
+ * @returns {string}
+ */
+function shQuote(s) {
+  return `'${String(s).replace(/'/g, "'\\''")}'`;
+}
+
+/** Cached POSIX shell used for wrapped commands (bash preferred, sh fallback). */
+let wrapShell;
+
+/**
+ * Pick the shell for wrapped commands. `/bin/bash` is preferred (harness
+ * semantics are bash-flavored); images without bash (Alpine/musl and other
+ * minimal containers) fall back to `/bin/sh`, which supports the
+ * `eval "$(printf %s "$VAR" | base64 -d)"` transport equally.
+ *
+ * @returns {string}
+ */
+export function shellForWrap() {
+  if (wrapShell) return wrapShell;
+  for (const candidate of ['/bin/bash', '/usr/bin/bash', '/bin/sh']) {
+    try {
+      if (existsSync(candidate)) {
+        wrapShell = candidate;
+        return wrapShell;
+      }
+    } catch { /* try next */ }
+  }
+  wrapShell = '/bin/sh';
+  return wrapShell;
 }
 
 /**
  * Build the wrapped safer-exec command for a Bash tool input.
  *
  * The original command travels base64-encoded in an env var (avoids all
- * quoting hazards); the sandbox passes it to `bash -c` verbatim.
+ * quoting hazards); the sandbox passes it to the shell verbatim. Every
+ * interpolated path is single-quote escaped.
  *
  * @param {string} command
  * @param {{policyFile?: string, auditLog?: string, cwd?: string, sessionId?: string}} [opts]
@@ -246,17 +314,17 @@ export function buildWrapCommand(command, opts = {}) {
   const policyFile = opts.policyFile || '';
   const auditLog = opts.auditLog || '';
   const parts = [
-    `"${process.execPath}"`,
-    `"${CLI_PATH}"`,
+    shQuote(process.execPath),
+    shQuote(CLI_PATH),
   ];
-  if (policyFile) parts.push(`--policy-file="${policyFile}"`);
+  if (policyFile) parts.push(`--policy-file=${shQuote(policyFile)}`);
   parts.push('--diff', '--audit', '--trace-exec');
-  if (auditLog) parts.push(`--audit-output-file="${auditLog}"`);
+  if (auditLog) parts.push(`--audit-output-file=${shQuote(auditLog)}`);
   const b64 = Buffer.from(command, 'utf8').toString('base64');
-  parts.push(`--env=SAFER_EXEC_WRAPPED_CMD=${b64}`);
-  // Decode inside the sandbox — avoids all quoting hazards between the
-  // harness shell, our CLI, and the sandboxed bash
-  parts.push('--', '/bin/bash', '-c', "'eval \"$(printf %s \"$SAFER_EXEC_WRAPPED_CMD\" | base64 -d)\"'");
+  parts.push(`--env=${shQuote(`SAFER_EXEC_WRAPPED_CMD=${b64}`)}`);
+  // Decode inside the sandbox — the eval payload is a fixed literal and the
+  // transported command never touches the outer quoting layer
+  parts.push('--', shQuote(shellForWrap()), '-c', `'eval "$(printf %s "$SAFER_EXEC_WRAPPED_CMD" | base64 -d)"'`);
   return parts.join(' ');
 }
 
@@ -334,9 +402,14 @@ export function handleHookEvent(raw, opts = {}) {
   // ---- Decision (enforce mode) ----
   let decision = null;
   let decisionReason = '';
-  if (phase === 'pre' && config.mode === 'enforce' && config.policyFile) {
-    const { rules, lastMatchWins } = loadPolicyRules(config.policyFile);
-    if (rules.length > 0) {
+  let enforcementWarning = null;
+  if (phase === 'pre' && config.mode === 'enforce') {
+    const { rules, lastMatchWins, error } = loadPolicyRules(config.policyFile);
+    if (error) {
+      enforcementWarning = `enforce mode is NOT enforcing rules — ${error}`;
+    } else if (rules.length === 0) {
+      enforcementWarning = `enforce mode has no rules to enforce (policy ${config.policyFile} carries no harnessRules)`;
+    } else {
       const result = evaluateRules(rules, activity, { cwd: norm.cwd, home: process.env.HOME || '', lastMatchWins });
       decision = result.action;
       if (result.rule) {
@@ -368,6 +441,7 @@ export function handleHookEvent(raw, opts = {}) {
   // ---- Audit record ----
   if (decision) record.decision = decision;
   if (decisionReason) record.reason = decisionReason;
+  if (enforcementWarning) record.enforcementWarning = enforcementWarning;
   if (wrappedCommand) record.wrapped = true;
   if (phase === 'post') {
     record.response = summarizeResponse(norm.toolResponse);
@@ -379,6 +453,7 @@ export function handleHookEvent(raw, opts = {}) {
     return {
       exitCode: 2,
       stderr: `[safer-exec] Blocked by ${norm.harness} permission rule: ${decisionReason || 'denied'}\n`,
+      warning: enforcementWarning,
       record,
     };
   }
@@ -401,16 +476,11 @@ export function handleHookEvent(raw, opts = {}) {
     }
   } else if (phase === 'pre' && decision === 'allow' && !wrappedCommand) {
     if (norm.harness === 'gemini') {
-      stdout = JSON.stringify({ decision: 'allow' });
-    } else if (norm.harness === 'zcode') {
-      stdout = JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          permissionDecision: 'allow',
-          permissionDecisionReason: decisionReason || 'allowed by converted permission rules',
-        },
-      });
+      // Gemini's output schema uses a top-level decision
+      stdout = JSON.stringify({ decision: 'allow', reason: decisionReason || 'allowed by converted permission rules' });
     } else {
+      // Claude-lineage harnesses and ZCode all accept this decision shape
+      // (ZCode's output schema also allows hookSpecificOutput.permissionDecision)
       stdout = JSON.stringify({
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
@@ -432,7 +502,7 @@ export function handleHookEvent(raw, opts = {}) {
     // gemini/zcode: stay silent — the harness's default flow already asks
   }
 
-  return { exitCode: 0, stdout, record };
+  return { exitCode: 0, stdout, warning: enforcementWarning, record };
 }
 
 /**
@@ -542,9 +612,12 @@ export async function runHookCli(phase) {
   if (!payload || typeof payload !== 'object') return 0;
 
   try {
-    const { exitCode, stdout, stderr } = handleHookEvent(payload, { phase });
+    const { exitCode, stdout, stderr, warning } = handleHookEvent(payload, { phase });
     if (stdout) process.stdout.write(stdout + '\n');
     if (stderr) process.stderr.write(stderr);
+    // Loud signal when enforce mode is degraded — a silent empty rule set
+    // would look like enforcement while allowing everything.
+    if (warning) process.stderr.write(`[safer-exec] WARNING: ${warning}\n`);
     return exitCode;
   } catch (err) {
     // Fail-open: an audit hook must never break the agent

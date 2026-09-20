@@ -18,6 +18,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { shellForWrap } from '../npm/src/hooks.js';
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'npm', 'src', 'cli.js');
 
@@ -160,8 +161,9 @@ describe('harness hook integration', () => {
     strict.match(wrapped, /safer-exec|cli\.js/);
     strict.match(wrapped, /base64 -d/);
 
-    // Simulate the harness executing the rewritten command
-    const run = spawnSync('/bin/bash', ['-c', wrapped], { encoding: 'utf8', cwd: dir, timeout: 60000 });
+    // Simulate the harness executing the rewritten command (shell that the
+    // wrap transport itself would pick on this platform)
+    const run = spawnSync(shellForWrap(), ['-c', wrapped], { encoding: 'utf8', cwd: dir, timeout: 60000 });
     strict.equal(run.status, 0, `wrapped command failed: ${run.stderr}`);
     strict.equal(readFileSync(join(dir, 'wrapped.txt'), 'utf8').trim(), 'wrapped-itest');
     // fsdiff summary reaches the harness as stderr — unless the runtime blocks
@@ -201,5 +203,93 @@ writable_roots = ["/tmp/codex-shared"]
     strict.deepEqual(policy.allowHosts, ['api.openai.com']);
     strict.ok(policy.writePaths.includes('/tmp/codex-shared'));
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('denies relative, dot-segment, and up-level reads of a denied file', () => {
+    const dir = mkProject();
+    const install = runCli(['harness', 'install', '--harness=claude-code', '--mode=enforce'], { cwd: dir });
+    strict.equal(install.status, 0, install.stderr);
+    writeFileSync(join(dir, '.env'), 'SECRET=1\n');
+    mkdirSync(join(dir, 'sub'), { recursive: true });
+
+    for (const file_path of ['.env', './.env', `${dir}/./.env`, `${dir}/sub/../.env`]) {
+      const r = runCli(['hook', 'pre'], {
+        cwd: dir,
+        input: JSON.stringify({
+          session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+          tool_name: 'Read', tool_input: { file_path },
+        }),
+      });
+      strict.equal(r.status, 2, `expected exit 2 for ${file_path}, got ${r.status}`);
+      strict.match(r.stderr, /\.env/);
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('denies path-qualified and nested invocations of a denied executable', () => {
+    const dir = mkProject();
+    const install = runCli(['harness', 'install', '--harness=claude-code', '--mode=enforce'], { cwd: dir });
+    strict.equal(install.status, 0, install.stderr);
+    const config = JSON.parse(readFileSync(join(dir, '.safer-exec', 'hook-config.json'), 'utf8'));
+    strict.equal(config.mode, 'enforce');
+
+    for (const command of [
+      '/usr/bin/curl https://evil.example.com',
+      'echo $(curl https://evil.example.com)',
+      'bash -c "curl https://evil.example.com"',
+    ]) {
+      const r = runCli(['hook', 'pre'], {
+        cwd: dir,
+        input: JSON.stringify({
+          session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+          tool_name: 'Bash', tool_input: { command },
+        }),
+      });
+      strict.equal(r.status, 2, `expected exit 2 for ${command}, got ${r.status}`);
+    }
+
+    // npm publish deny must NOT become blockExec: npm is still allowed
+    const policy = JSON.parse(readFileSync(join(dir, '.safer-exec', 'harness-policy.json'), 'utf8'));
+    strict.deepEqual(policy.blockExec, ['curl'], 'subcommand denies must not map to blockExec');
+    const npm = runCli(['hook', 'pre'], {
+      cwd: dir,
+      input: JSON.stringify({
+        session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+        tool_name: 'Bash', tool_input: { command: 'npm run build' },
+      }),
+    });
+    strict.equal(npm.status, 0);
+    strict.equal(JSON.parse(npm.stdout).hookSpecificOutput.permissionDecision, 'allow');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('wrap commands are injection-safe when the workspace directory contains shell metacharacters', () => {
+    const base = mkdtempSync(join(tmpdir(), 'safer-exec-inject-'));
+    // Directory name carries a double quote and a command substitution —
+    // unquoted interpolation would run `id` and write pwned
+    const dir = join(base, 'pr"$(id > pwned)oj');
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    writeFileSync(join(dir, '.claude', 'settings.json'), JSON.stringify({
+      permissions: { allow: ['Bash(echo *)'] },
+    }));
+
+    const install = runCli(['harness', 'install', '--harness=claude-code', '--wrap'], { cwd: dir });
+    strict.equal(install.status, 0, install.stderr);
+
+    const pre = runCli(['hook', 'pre'], {
+      cwd: dir,
+      input: JSON.stringify({
+        session_id: 's', cwd: dir, hook_event_name: 'PreToolUse',
+        tool_name: 'Bash', tool_input: { command: 'echo injection-safe > out.txt' },
+      }),
+    });
+    strict.equal(pre.status, 0, pre.stderr);
+    const wrapped = JSON.parse(pre.stdout).hookSpecificOutput.updatedInput.command;
+
+    const run = spawnSync(shellForWrap(), ['-c', wrapped], { encoding: 'utf8', cwd: dir, timeout: 60000 });
+    strict.equal(run.status, 0, `wrapped command failed: ${run.stderr}`);
+    strict.equal(readFileSync(join(dir, 'out.txt'), 'utf8').trim(), 'injection-safe');
+    strict.ok(!existsSync(join(dir, 'pwned')), 'command substitution executed despite quoting');
+    rmSync(base, { recursive: true, force: true });
   });
 });

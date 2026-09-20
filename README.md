@@ -210,23 +210,52 @@ node …/cli.js --policy-file=.safer-exec/wrap-policy.json --diff --audit --trac
 ```
 
 The original command travels base64-encoded in an env var (no quoting
-hazards). The derived wrap policy keeps harness semantics — reads stay open
-(audited, not confined), writes cover the workspace + `/tmp` + imported write
-roots, and `blockExec` / `allowHosts` / `disableNetwork` from the imported
+hazards; every interpolated path is single-quote escaped, so workspace
+directory names with shell metacharacters cannot inject into the rewritten
+command). The derived wrap policy keeps harness semantics — reads stay open
+(audited, not confined), writes cover the workspace + imported write roots,
+and `blockExec` / `allowHosts` / `disableNetwork` from the imported
 permissions are enforced by the OS sandbox. Filesystem mutations are reported
 back to the agent as an fsdiff summary, and sandbox violations + child execs
 land in the same audit JSONL.
 
-Platform note: per-executable `blockExec` denials (e.g. the converted
-`Bash(curl *)` deny rule) are enforced for *child* processes on macOS via
-Seatbelt `process-exec` rules. On Linux, stateless seccomp cannot distinguish
-the launcher's own exec from a child's, so per-executable blocking applies to
-the top-level command only — use `--mode=enforce` alongside `--wrap` so denied
-commands are blocked at the hook decision layer (exit 2) before the sandbox
-runs. In restricted containers (default Docker seccomp blocks user namespaces)
-the engine degrades to reduced isolation (seccomp + Landlock) and fsdiff is
-skipped; run containers with `--security-opt seccomp=unconfined` for full
-namespace isolation.
+### Enforcement scope and known gaps
+
+What enforce mode reliably catches:
+
+- File rules match relative (`src/a.js`), dot-segment (`/proj/./a.js`),
+  up-level (`/proj/sub/../a.js`), and absolute forms — all are resolved
+  against the session cwd before matching — plus the symlink-resolved real
+  path when the file exists (a symlink standing in for a denied target does
+  not bypass the rule).
+- Command rules match each subcommand of compound commands, strip
+  `VAR=value` prefixes and wrappers (`timeout`, `nice`, `env`, `nohup`, …),
+  reduce path-qualified executables to their basename (`/usr/bin/curl` matches
+  `Bash(curl *)`), and inspect command substitution (`echo $(curl …)`),
+  backticks, process substitutions, and `sh`/`bash` `-c` payloads.
+
+Residual gaps in command deny rules — use `--wrap` (OS sandbox) as the
+backstop when these matter:
+
+- Indirect or obfuscated execution: commands assembled from variables or
+  concatenation, decoded on the fly (`eval "$(echo Y3VybA==|base64 -d)"`),
+  or run through a renamed/copied binary (`cp /usr/bin/curl ./c; ./c …`).
+- Arbitrary interpreters beyond `-c` probing: `python -c`, `node -e`, and
+  similar embed their own language; their payloads are not parsed.
+- Enforce mode fails open by design (a broken hook must not brick the agent),
+  but never silently: a missing, unparsable, or rule-less policy in enforce
+  mode emits a loud `WARNING` on stderr and records
+  `enforcementWarning` in the audit trail.
+
+Platform note: per-executable `blockExec` denials are enforced for *child*
+processes on macOS via Seatbelt `process-exec` rules. On Linux, stateless
+seccomp cannot distinguish the launcher's own exec from a child's, so
+per-executable blocking applies to the top-level command only — pair `--wrap`
+with `--mode=enforce` so denied commands are blocked at the hook decision
+layer (exit 2) before the sandbox runs. In restricted containers (default
+Docker seccomp blocks user namespaces) the engine degrades to reduced
+isolation (seccomp + Landlock) and fsdiff is skipped; run containers with
+`--security-opt seccomp=unconfined` for full namespace isolation.
 
 ### Manual invocation (any harness, CI, homegrown agents)
 

@@ -232,6 +232,23 @@ describe('claude-code import', () => {
     assert.equal(denyEnv.pattern, './.env');
     rmSync(dir, { recursive: true, force: true });
   });
+
+  test('blockExec only for bare-executable deny patterns (no subcommand over-blocking)', () => {
+    const dir = tmp();
+    const f = w(dir, '.claude/settings.json', JSON.stringify({
+      permissions: {
+        deny: ['Bash(npm publish:*)', 'Bash(npm *)', 'Bash(rm -rf *)', 'Bash(curl *)'],
+      },
+    }));
+    const { policy } = importHarnessPolicy('claude-code', { path: f, cwd: dir, home: join(dir, 'h') });
+    // Only `npm *` and `curl *` deny the executable itself; `npm publish:*`
+    // and `rm -rf *` are subcommand rules the hook layer enforces instead
+    assert.deepEqual(policy.blockExec, ['npm', 'curl']);
+    const patterns = policy.harnessRules.filter((r) => r.kind === 'command').map((r) => r.pattern);
+    assert.ok(patterns.includes('npm publish *'));
+    assert.ok(patterns.includes('rm -rf *'));
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
 
 describe('codex import', () => {

@@ -107,7 +107,8 @@ export function importHarnessPolicy(harnessId, opts = {}) {
     const parsed = adapter.parse(file, { cwd, home });
     rules = rules.concat(parsed.rules);
     Object.assign(meta, mergeMeta(meta, parsed.meta));
-  }  meta.files = files;
+  }
+  meta.files = files;
   if (adapter.lastMatchWins) meta.evaluation = 'last-match';
 
   const policy = policyFromRules({ rules, meta }, { cwd, home, harness: harnessId });
