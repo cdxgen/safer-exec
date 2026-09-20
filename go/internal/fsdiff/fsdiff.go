@@ -136,9 +136,19 @@ func sortFSDiffEntries(entries []config.FSDiffEntry) {
 	})
 }
 
+// maxHashSize bounds the per-file content hash. Files larger than this are
+// compared by size and mode only: snapshotting a writable root that contains
+// multi-gigabyte artifacts (build caches, container layers) would otherwise
+// read the entire tree twice per run.
+const maxHashSize = 64 << 20 // 64 MiB
+
 // fileHash computes the SHA-256 hash of a file's contents.
-// Returns empty string if the file can't be read.
+// Returns empty string if the file can't be read or exceeds maxHashSize.
 func fileHash(path string) string {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() > maxHashSize {
+		return ""
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""

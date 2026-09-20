@@ -350,6 +350,7 @@ export function handleHookEvent(raw, opts = {}) {
   const supportsUpdatedInput = ['claude-code', 'cursor', 'factory', 'copilot', 'gemini'].includes(norm.harness);
   if (
     phase === 'pre' &&
+    decision !== 'deny' &&
     config.wrap &&
     supportsUpdatedInput &&
     activity.type === 'exec' &&
@@ -398,7 +399,7 @@ export function handleHookEvent(raw, opts = {}) {
       }
       stdout = JSON.stringify({ hookSpecificOutput });
     }
-  } else if (phase === 'pre' && decision === 'allow' && !config.wrap) {
+  } else if (phase === 'pre' && decision === 'allow' && !wrappedCommand) {
     if (norm.harness === 'gemini') {
       stdout = JSON.stringify({ decision: 'allow' });
     } else if (norm.harness === 'zcode') {
@@ -478,9 +479,9 @@ function buildWrapPolicy(config, cwd) {
   let policy = {
     name: 'safer-exec-wrap-default',
     version: '1',
-    description: 'Permissive wrap policy (audit + fsdiff). No harness permission config was found.',
+    description: 'Permissive wrap policy (audit + fsdiff over the workspace). No harness permission config was found.',
     readPaths: ['/'],
-    writePaths: [realCwd, '/tmp', '/private/tmp'],
+    writePaths: [realCwd],
     allowLoopback: true,
   };
   const imported = loadPolicyRules(config.policyFile).raw;
@@ -492,8 +493,6 @@ function buildWrapPolicy(config, cwd) {
       readPaths: ['/'],
       writePaths: [...new Set([
         realCwd,
-        '/tmp',
-        ...(process.platform === 'darwin' ? ['/private/tmp'] : []),
         ...(Array.isArray(imported.writePaths) ? imported.writePaths : []),
       ])],
     };
