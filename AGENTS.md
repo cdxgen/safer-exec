@@ -54,9 +54,19 @@ npm/
   package.json                — npm package definition (@cdxgen/safer-exec)
   src/
     index.js                  — SaferExec class (fluent API, public interface)
-    cli.js                    — CLI entry point (shebang, argument parsing)
+    cli.js                    — CLI entry point (shebang, argument parsing, hook/harness subcommands)
     runner.js                 — Go binary spawner, I/O piping, output parsing
     net.js                    — DNS resolution (hostname → IP)
+    hooks.js                  — Agentic-harness hook engine (payload normalization,
+                                activity audit JSONL, enforce decisions, Bash wrapping)
+    harnesses/                — Harness adapters (config discovery + permission import)
+      index.js                — Registry: detectHarnesses, importHarnessPolicy,
+                                installHarnessHooks, uninstallHarnessHooks
+      rules.js                — Unified permission-rule model + evaluation engine
+      common.js               — Shared conversion (unified rules → PolicyFile)
+      toml.js                 — Zero-dependency TOML parser/serializer (Codex, Gemini)
+      claude-code.js, zcode.js, codex.js, gemini.js, cursor.js,
+      factory.js, copilot.js, opencode.js — Per-harness adapters
     policies/                 — Pre-built hardened policies per ecosystem
       npm.js, pnpm.js, yarn.js, pypi.js, maven.js, cargo.js,
       rubygems.js, composer.js, deno.js, gomod.js, bun.js
@@ -65,6 +75,7 @@ tests/
   integration.test.js         — Full pipeline tests (policy → DNS → Go → sandbox)
   security.test.js            — Boundary tests (isolation, env leakage, limits)
   exhaustion.test.js          — Resource exhaustion tests (memory bombs, fork bombs)
+  hooks.test.js               — Harness hook integration (install → audit/enforce/wrap → uninstall)
   benchmark.js                — Performance benchmarks vs child_process.exec
 ```
 
@@ -117,6 +128,9 @@ node npm/src/cli.js --diff --write-path=/tmp -- npm install
 node npm/src/cli.js --learn -- npm install
 node npm/src/cli.js --trace-crypto --cbom-output=cbom.json -- npm install
 node npm/src/cli.js diagnostics
+node npm/src/cli.js harness list
+node npm/src/cli.js harness install --harness=claude-code --wrap
+node npm/src/cli.js harness import --harness=codex --print
 ```
 
 ---
@@ -239,6 +253,27 @@ The following features were added as hardening measures. Some are now enabled by
 | NuGet policy      | `--policy=nuget` | .NET SDK policy: api.nuget.org + globalcdn.nuget.org + builds.dotnet.microsoft.com (post-azureedge retirement), MSBuild-worker-friendly fork/exec, telemetry off.                                                           |
 | Security services | `allowSecurityServices` | macOS opt-in `mach-lookup` to securityd (`com.apple.SecurityServer`) + opendirectoryd/memberd. NOT in the baseline profile: securityd is the keychain endpoint. Cert validation uses trustd, which is always allowed. The `nuget` policy opts in (.NET SslStream + getpwuid). |
 | Policy round-trip | PolicyFile       | Learn output + `applyPolicyFile()` preserve `blockJIT`, `proxyEgress`, `useReaper`, `procHardening`, `submountEnforce`, `setUpDev`, `bindUseFd`, `allowUserns`, `tmpOverlayPaths`, kafel `seccompFilters`, `allowEnvs`, and isolation modes.                                                  |
+
+### Agentic Harness Hooks (feat/harness-hooks)
+
+`safer-exec` acts as a **pre/post tool hook** in agentic harnesses
+(claude-code, zcode, codex, gemini, cursor, factory droid, copilot, opencode)
+to audit every tool activity and optionally enforce converted permissions or
+run Bash commands inside the real OS sandbox.
+
+| Feature           | CLI                           | Description                                                                                                                                                                                                                 |
+| ----------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hook engine       | `safer-exec hook pre\|post`   | Reads the harness payload from stdin (all eight shapes auto-normalized), appends an audit JSONL record (activity type: exec / file-read / file-write / network-fetch / network-search / mcp-call / agent), exit 2 blocks.   |
+| Enforce mode      | `--mode=enforce` / env        | Evaluates the converted `harnessRules` with the source harness's semantics (Claude first-match deny>ask>allow; OpenCode last-match-wins). deny → exit 2; allow → `permissionDecision: allow` JSON; ask → `ask`.              |
+| Wrap mode         | `--wrap`                      | PreToolUse rewrites Bash `tool_input.command` via `updatedInput` to execute inside safer-exec (`--diff --audit --trace-exec`), original command base64-transported in `SAFER_EXEC_WRAPPED_CMD` (single-quote-escaped argv; bash with /bin/sh fallback); derived wrap policy at `.safer-exec/wrap-policy.json` (reads open, writes = workspace + imported write roots, blockExec/allowHosts enforced). |
+| Harness install   | `safer-exec harness install <id> [--scope=project\|user] [--policy-file=<f>]` | Registers hooks in the harness's own settings (claude `.claude/settings.json`; zcode `.zcode/config.json` `hooks.events` + `enabled: true`; codex TOML `[[hooks.*]]`; gemini `BeforeTool/AfterTool` ms timeouts; cursor kebab events; droid `.factory/hooks.json`; copilot `.github/hooks/`; opencode plugin shim). Idempotent; preserves existing hooks; one-time `.safer-exec.bak` backup. |
+| Permission import | `safer-exec harness import --harness=<id> [--path] [--out]` | Converts harness permissions to a PolicyFile: `WebFetch(domain:)` → allowHosts, Read/Edit globs → read/writePaths, bare-executable deny rules (`Bash(npm *)`) → blockExec (subcommand denies stay hook-enforced), codex workspace-write → writePaths, `network_access=false` → disableNetwork, gemini policy TOML → rules. Original rules preserved in `harnessRules`. |
+| Audit viewer      | `safer-exec hook audit [--tail=N] [--json]` | Reads the JSONL trail (`.safer-exec/hooks-audit.jsonl`).                                                                                                                                                                    |
+
+Key files: `npm/src/hooks.js` (engine), `npm/src/harnesses/` (adapters + TOML
+subset parser + unified rule model). Runtime config: `.safer-exec/hook-config.json`,
+env overrides `SAFER_EXEC_HOOK_{CONFIG,MODE,WRAP,POLICY,AUDIT_LOG,HARNESS}`.
+Tests: `npm/src/hooks.test.js`, `npm/src/harness.test.js`, `tests/hooks.test.js`.
 
 ---
 

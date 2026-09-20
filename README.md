@@ -101,6 +101,217 @@ safer-exec --bind-fd=3:/dev/host-tty:ro -- tty
 
 Full help: `safer-exec --help`.
 
+## Agentic Harness Hooks (Claude Code, Codex, ZCode, Gemini CLI, Cursor, droid, Copilot CLI, OpenCode)
+
+safer-exec can run as a **pre/post tool hook** inside agentic coding harnesses to
+track and audit every tool activity — file IO, network targets, command exec —
+and to actually **execute Bash commands inside the OS sandbox** with filesystem
+diffing and violation auditing. It also **imports each harness's own permission
+config** and converts it into a safer-exec policy, so an existing ruleset keeps
+working (and gets *stronger*: token gaps like `sh -c 'curl …'` slipping past
+`Bash(curl *)` are closed by the sandbox).
+
+Seven of the eight supported harnesses share the Claude Code hook contract
+(JSON on stdin, exit 2 blocks, `permissionDecision` JSON on stdout), so one
+hook binary serves all of them. The **Wrap** column says whether the harness
+applies `hookSpecificOutput.updatedInput`, which is what lets safer-exec
+re-route a Bash command through the OS sandbox; Codex and OpenCode ignore it,
+so `--wrap` is a no-op there and the install says so.
+
+| Harness | Hook events used | Config imported | Wrap |
+|---|---|---|---|
+| claude-code | `PreToolUse` / `PostToolUse` | `permissions.allow/ask/deny` tokens, `additionalDirectories` | yes |
+| zcode | `PreToolUse` / `PostToolUse` | hooks only (no permission tokens — author rules yourself) | yes |
+| codex | `PreToolUse` / `PostToolUse` (TOML) | `sandbox_mode`, `[sandbox_workspace_write]`, beta `[permissions]` profiles, `.codex/rules.json` | no |
+| gemini | `BeforeTool` / `AfterTool` | `tools.core` allowlists, `~/.gemini/policies/*.toml` rules | yes |
+| cursor | `pre-tool-use` / `post-tool-use` | `permissions` tokens (`Shell(git*)`, `Edit(src/**)`, `WebFetch(domain)`) | yes |
+| factory (droid) | `PreToolUse` / `PostToolUse` | `commandAllowlist` / `commandDenylist` / `commandBlocklist` | yes |
+| copilot | `preToolUse` / `postToolUse` | `--allow-tool`-style tokens, `allowedUrls` | yes |
+| opencode | plugin shim (`tool.execute.before/after`) | `permission.bash/edit/read/webfetch` patterns | no |
+
+### Install the hook
+
+```bash
+# Detect which harness configs exist in the current project / $HOME
+safer-exec harness list
+
+# Register safer-exec as pre+post tool hook for a harness (project scope)
+safer-exec harness install --harness=claude-code
+
+# Audit + actually sandbox Bash commands (rewrites tool input; macOS+Linux)
+safer-exec harness install --harness=claude-code --wrap
+
+# Enforce the converted permission rules: deny blocks the tool (exit 2),
+# an explicit allow rule answers the permission prompt automatically
+safer-exec harness install --harness=claude-code --mode=enforce --wrap
+
+# User scope (every project): --scope=user
+safer-exec harness install --harness=zcode --scope=user
+
+# Remove (only safer-exec's entries; existing hooks are preserved)
+safer-exec harness uninstall --harness=claude-code
+```
+
+The harness id may be positional (`safer-exec harness install zcode`) or a
+flag (`--harness=zcode`).
+
+#### Harnesses with no permission config (ZCode)
+
+ZCode has hooks but no permission-token syntax, so there is nothing to import:
+`harness import zcode` succeeds but yields `"harnessRules": []`, and enforce
+mode with that policy enforces nothing (the install and every hook run say so
+loudly). Author the rules yourself and pass them explicitly — an explicit
+`--policy-file` is never overwritten by auto-import:
+
+```jsonc
+// .safer-exec/policy.json
+{
+  "name": "my-rules",
+  "version": "1",
+  "harnessRules": [
+    { "tool": "Bash", "kind": "command", "pattern": "curl *", "action": "deny", "source": "manual" },
+    { "tool": "Bash", "kind": "command", "pattern": "git push *", "action": "ask", "source": "manual" },
+    { "tool": "Read", "kind": "path", "pattern": "./.env", "access": "read", "action": "deny", "source": "manual" }
+  ]
+}
+```
+
+```bash
+safer-exec harness install zcode --mode=enforce --policy-file=.safer-exec/policy.json --wrap
+
+# watch decisions as they happen
+safer-exec hook audit --follow
+```
+
+Install writes:
+
+- `<project>/.safer-exec/hook-config.json` — hook runtime config (mode, wrap, policy, audit log). Edit this file (or set `SAFER_EXEC_HOOK_MODE` / `SAFER_EXEC_HOOK_WRAP` env vars) to change behavior without reinstalling.
+- `<project>/.safer-exec/harness-policy.json` — your harness permissions converted to a safer-exec policy (when a permission config is found).
+- `<project>/.safer-exec/hooks-audit.jsonl` — the audit trail (project-scope installs keep it in the project, not `$HOME`). View it with `safer-exec hook audit [--last=N] [--follow]`, run from the project directory so it picks up the project's hook config.
+- Hook entries in the harness's own settings (`.claude/settings.json`, `.zcode/config.json` `hooks.events` with `hooks.enabled: true`, `.codex/config.toml` `[[hooks.PreToolUse]]`, `.gemini/settings.json`, `.cursor/hooks.json`, `.factory/hooks.json`, `.github/hooks/safer-exec.json`, `.opencode/plugin/safer-exec-audit.ts`). A one-time `.safer-exec.bak` backup is kept next to modified files.
+
+### Convert permissions without installing
+
+```bash
+# Convert a harness's permission config into a safer-exec policy file
+safer-exec harness import --harness=claude-code --out=policy.json
+safer-exec harness import --harness=codex --path=~/.codex/config.toml --print
+
+# Then use it anywhere a policy file is accepted
+safer-exec --policy-file=policy.json -- npm install
+```
+
+Conversion rules: `WebFetch(domain:x)` allow → `allowHosts`; `Read`/`Edit`
+allow globs → `readPaths`/`writePaths`; deny rules with a leading executable
+→ `blockExec`; Codex `workspace-write` → `writePaths` = cwd + `writable_roots`;
+`network_access = false` → `disableNetwork`; Gemini policy-TOML deny prefixes →
+deny rules. The full rule set is preserved verbatim in the policy's
+`harnessRules` section, which the hook engine evaluates with the source
+harness's own semantics (Claude-style first-match deny>ask>allow, OpenCode's
+last-match-wins).
+
+### What the hook records
+
+Every tool event is appended as one JSON line:
+
+```json
+{"ts":"2026-09-20T10:11:12Z","harness":"claude-code","event":"PreToolUse",
+ "tool":"Bash","activity":{"type":"exec","command":"npm install"},
+ "sessionId":"…","cwd":"/repo","decision":"allow","reason":"allow rule Bash(npm *) [claude-code]"}
+```
+
+Activity types: `exec` (Bash/Execute/shell), `file-read` (Read/Grep/Glob),
+`file-write` (Write/Edit/apply_patch), `network-fetch` (WebFetch — URL + host),
+`network-search` (WebSearch), `mcp-call`, `agent`, `signal`. PostToolUse
+records add the response summary (`bashEditDiff.changedFiles`, output sizes,
+errors, duration).
+
+```bash
+# Inspect the trail
+safer-exec hook audit --tail=20
+safer-exec hook audit --json | jq '.[] | select(.decision=="deny")'
+```
+
+### Wrap mode — real OS sandboxing per Bash call
+
+With `--wrap`, the PreToolUse hook rewrites the Bash tool input
+(`updatedInput`) to run the command through safer-exec:
+
+```
+node …/cli.js --policy-file=.safer-exec/wrap-policy.json --diff --audit --trace-exec \
+  --audit-output-file=.safer-exec/hooks-audit.jsonl \
+  --env=SAFER_EXEC_WRAPPED_CMD=<base64> -- /bin/bash -c 'eval "$(printf %s "$SAFER_EXEC_WRAPPED_CMD" | base64 -d)"'
+```
+
+The original command travels base64-encoded in an env var (no quoting
+hazards; every interpolated path is single-quote escaped, so workspace
+directory names with shell metacharacters cannot inject into the rewritten
+command). The derived wrap policy keeps harness semantics — reads stay open
+(audited, not confined), writes cover the workspace + imported write roots,
+and `blockExec` / `allowHosts` / `disableNetwork` from the imported
+permissions are enforced by the OS sandbox. Filesystem mutations are reported
+back to the agent as an fsdiff summary, and sandbox violations + child execs
+land in the same audit JSONL.
+
+### Enforcement scope and known gaps
+
+What enforce mode reliably catches:
+
+- File rules match relative (`src/a.js`), dot-segment (`/proj/./a.js`),
+  up-level (`/proj/sub/../a.js`), and absolute forms — all are resolved
+  against the session cwd before matching — plus the symlink-resolved real
+  path when the file exists (a symlink standing in for a denied target does
+  not bypass the rule).
+- Command rules match each subcommand of compound commands, strip
+  `VAR=value` prefixes and wrappers (`timeout`, `nice`, `env`, `nohup`, …),
+  reduce path-qualified executables to their basename (`/usr/bin/curl` matches
+  `Bash(curl *)`), and inspect command substitution (`echo $(curl …)`),
+  backticks, process substitutions, and `sh`/`bash` `-c` payloads.
+
+Residual gaps in command deny rules — use `--wrap` (OS sandbox) as the
+backstop when these matter:
+
+- Indirect or obfuscated execution: commands assembled from variables or
+  concatenation, decoded on the fly (`eval "$(echo Y3VybA==|base64 -d)"`),
+  or run through a renamed/copied binary (`cp /usr/bin/curl ./c; ./c …`).
+- Arbitrary interpreters beyond `-c` probing: `python -c`, `node -e`, and
+  similar embed their own language; their payloads are not parsed.
+- Enforce mode fails open by design (a broken hook must not brick the agent),
+  but never silently: a missing, unparsable, or rule-less policy in enforce
+  mode emits a loud `WARNING` on stderr and records
+  `enforcementWarning` in the audit trail.
+
+Platform note: per-executable `blockExec` denials are enforced for *child*
+processes on macOS via Seatbelt `process-exec` rules. On Linux, stateless
+seccomp cannot distinguish the launcher's own exec from a child's, so
+per-executable blocking applies to the top-level command only — pair `--wrap`
+with `--mode=enforce` so denied commands are blocked at the hook decision
+layer (exit 2) before the sandbox runs. In restricted containers (default
+Docker seccomp blocks user namespaces) the engine degrades to reduced
+isolation (seccomp + Landlock) and fsdiff is skipped; run containers with
+`--security-opt seccomp=unconfined` for full namespace isolation.
+
+### Manual invocation (any harness, CI, homegrown agents)
+
+```bash
+echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"npm install"},"cwd":"."}' \
+  | safer-exec hook pre
+```
+
+Exit codes: `0` pass, `2` block (stderr = reason shown to the model). Payload
+shapes from all eight harnesses are auto-normalized (`BeforeTool`, kebab-case,
+camelCase `toolArgs`, …).
+
+### Library API
+
+```js
+import { handleHookEvent, normalizeHookPayload, extractActivity } from '@cdxgen/safer-exec/hooks';
+import { importHarnessPolicy, detectHarnesses } from '@cdxgen/safer-exec/harnesses';
+
+const { policy, sources } = importHarnessPolicy('codex');   // → PolicyFile JSON + source files
+const { exitCode, stdout, record } = handleHookEvent(payload, { config: { mode: 'enforce', policyFile } });
+```
+
 ## Fluent API
 
 ```js

@@ -21,6 +21,9 @@ type SnapshotEntry struct {
 	Size  int64
 	IsDir bool
 	Hash  string // content hash for regular files
+	// ModTime (nanoseconds) backs change detection for files whose content
+	// hash is unavailable — over maxHashSize or unreadable.
+	ModTime int64
 }
 
 // Snapshot represents a point-in-time view of a directory tree.
@@ -64,11 +67,12 @@ func SnapshotPath(roots ...string) (Snapshot, error) {
 			}
 
 			snap[rel] = SnapshotEntry{
-				Path:  path,
-				Mode:  uint32(info.Mode()),
-				Size:  info.Size(),
-				IsDir: info.IsDir(),
-				Hash:  hash,
+				Path:    path,
+				Mode:    uint32(info.Mode()),
+				Size:    info.Size(),
+				IsDir:   info.IsDir(),
+				Hash:    hash,
+				ModTime: info.ModTime().UnixNano(),
 			}
 
 			return nil
@@ -89,10 +93,21 @@ func Diff(before, after Snapshot) config.FSDiff {
 	// Find added and modified files
 	for rel, afterEntry := range after {
 		if beforeEntry, exists := before[rel]; exists {
-			// Check if modified: different hash, size, or mode
-			if afterEntry.Hash != beforeEntry.Hash ||
+			// Modified when the content hash, size, or mode differs. When the
+			// hash is unavailable on both sides (over the size cap, or
+			// unreadable), mtime is the fallback signal for regular files —
+			// the cap then costs hash precision, not change detection.
+			// Directories keep mode/size comparison: their mtime tracks entry
+			// churn, which would report every directory containing an add or
+			// delete as "modified".
+			modified := afterEntry.Hash != beforeEntry.Hash ||
 				afterEntry.Size != beforeEntry.Size ||
-				afterEntry.Mode != beforeEntry.Mode {
+				afterEntry.Mode != beforeEntry.Mode
+			if !modified && !afterEntry.IsDir &&
+				afterEntry.Hash == "" && beforeEntry.Hash == "" {
+				modified = afterEntry.ModTime != beforeEntry.ModTime
+			}
+			if modified {
 				diff.Modified = append(diff.Modified, config.FSDiffEntry{
 					Path:  afterEntry.Path,
 					Mode:  afterEntry.Mode,
@@ -136,9 +151,19 @@ func sortFSDiffEntries(entries []config.FSDiffEntry) {
 	})
 }
 
+// maxHashSize bounds the per-file content hash. Files larger than this are
+// compared by size, mode, and mtime: snapshotting a writable root that
+// contains multi-gigabyte artifacts (build caches, container layers) would
+// otherwise read the entire tree twice per run. Overridable in tests.
+var maxHashSize int64 = 64 << 20 // 64 MiB
+
 // fileHash computes the SHA-256 hash of a file's contents.
-// Returns empty string if the file can't be read.
+// Returns empty string if the file can't be read or exceeds maxHashSize.
 func fileHash(path string) string {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() > maxHashSize {
+		return ""
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
