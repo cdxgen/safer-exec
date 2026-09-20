@@ -217,6 +217,17 @@ permissions are enforced by the OS sandbox. Filesystem mutations are reported
 back to the agent as an fsdiff summary, and sandbox violations + child execs
 land in the same audit JSONL.
 
+Platform note: per-executable `blockExec` denials (e.g. the converted
+`Bash(curl *)` deny rule) are enforced for *child* processes on macOS via
+Seatbelt `process-exec` rules. On Linux, stateless seccomp cannot distinguish
+the launcher's own exec from a child's, so per-executable blocking applies to
+the top-level command only — use `--mode=enforce` alongside `--wrap` so denied
+commands are blocked at the hook decision layer (exit 2) before the sandbox
+runs. In restricted containers (default Docker seccomp blocks user namespaces)
+the engine degrades to reduced isolation (seccomp + Landlock) and fsdiff is
+skipped; run containers with `--security-opt seccomp=unconfined` for full
+namespace isolation.
+
 ### Manual invocation (any harness, CI, homegrown agents)
 
 ```bash

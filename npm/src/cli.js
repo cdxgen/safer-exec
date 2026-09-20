@@ -935,12 +935,21 @@ async function runHookSubcommand(rest) {
   }
   process.stdout.write(`safer-exec hook audit trail (${file}) — ${records.length} records\n`);
   for (const r of records) {
+    // Engine entries (from wrapped runs) carry type/target; hook records carry event/activity
+    const isEngine = !r.event && r.type;
     const act = r.activity || {};
-    const target = act.command || act.path || act.url || act.query || act.server || act.type || '';
+    const target = act.command || act.path || act.url || act.query || act.server ||
+      r.target || r.details || '';
     const line = String(target).replace(/\s+/g, ' ').slice(0, 100);
-    const decision = r.decision === 'passthrough' ? '' : ` [${r.decision}]`;
+    const decision = r.decision && r.decision !== 'passthrough' ? ` [${r.decision}]` : '';
+    const when = (r.ts || '').slice(11, 19);
+    if (isEngine) {
+      const note = r.details && r.details !== r.target ? ` — ${String(r.details).slice(0, 40)}` : '';
+      process.stdout.write(`${when || '  (rt)  '} (safer-exec-rt) ${String(r.type).padEnd(18)} ${line}${note}\n`);
+      continue;
+    }
     process.stdout.write(
-      `${(r.ts || '').slice(11, 19)} ${String(r.harness || '').padEnd(11)} ${(r.event || '').padEnd(12)} ` +
+      `${when} ${String(r.harness || '').padEnd(11)} ${(r.event || '').padEnd(12)} ` +
       `${String(r.tool || '').padEnd(12)} ${line}${decision}${r.wrapped ? ' (sandboxed)' : ''}\n`
     );
   }
