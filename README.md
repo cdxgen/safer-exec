@@ -111,20 +111,23 @@ config** and converts it into a safer-exec policy, so an existing ruleset keeps
 working (and gets *stronger*: token gaps like `sh -c 'curl …'` slipping past
 `Bash(curl *)` are closed by the sandbox).
 
-Six of the eight supported harnesses share the Claude Code hook contract
+Seven of the eight supported harnesses share the Claude Code hook contract
 (JSON on stdin, exit 2 blocks, `permissionDecision` JSON on stdout), so one
-hook binary serves all of them:
+hook binary serves all of them. The **Wrap** column says whether the harness
+applies `hookSpecificOutput.updatedInput`, which is what lets safer-exec
+re-route a Bash command through the OS sandbox; Codex and OpenCode ignore it,
+so `--wrap` is a no-op there and the install says so.
 
-| Harness | Hook events used | Config imported |
-|---|---|---|
-| claude-code | `PreToolUse` / `PostToolUse` | `permissions.allow/ask/deny` tokens, `additionalDirectories` |
-| zcode | `PreToolUse` / `PostToolUse` | hooks only (no permission tokens) |
-| codex | `PreToolUse` / `PostToolUse` (TOML) | `sandbox_mode`, `[sandbox_workspace_write]`, beta `[permissions]` profiles, `.codex/rules.json` |
-| gemini | `BeforeTool` / `AfterTool` | `tools.core` allowlists, `~/.gemini/policies/*.toml` rules |
-| cursor | `pre-tool-use` / `post-tool-use` | `permissions` tokens (`Shell(git*)`, `Edit(src/**)`, `WebFetch(domain)`) |
-| factory (droid) | `PreToolUse` / `PostToolUse` | `commandAllowlist` / `commandDenylist` / `commandBlocklist` |
-| copilot | `preToolUse` / `postToolUse` | `--allow-tool`-style tokens, `allowedUrls` |
-| opencode | plugin shim (`tool.execute.before/after`) | `permission.bash/edit/read/webfetch` patterns |
+| Harness | Hook events used | Config imported | Wrap |
+|---|---|---|---|
+| claude-code | `PreToolUse` / `PostToolUse` | `permissions.allow/ask/deny` tokens, `additionalDirectories` | yes |
+| zcode | `PreToolUse` / `PostToolUse` | hooks only (no permission tokens — author rules yourself) | yes |
+| codex | `PreToolUse` / `PostToolUse` (TOML) | `sandbox_mode`, `[sandbox_workspace_write]`, beta `[permissions]` profiles, `.codex/rules.json` | no |
+| gemini | `BeforeTool` / `AfterTool` | `tools.core` allowlists, `~/.gemini/policies/*.toml` rules | yes |
+| cursor | `pre-tool-use` / `post-tool-use` | `permissions` tokens (`Shell(git*)`, `Edit(src/**)`, `WebFetch(domain)`) | yes |
+| factory (droid) | `PreToolUse` / `PostToolUse` | `commandAllowlist` / `commandDenylist` / `commandBlocklist` | yes |
+| copilot | `preToolUse` / `postToolUse` | `--allow-tool`-style tokens, `allowedUrls` | yes |
+| opencode | plugin shim (`tool.execute.before/after`) | `permission.bash/edit/read/webfetch` patterns | no |
 
 ### Install the hook
 
@@ -149,11 +152,42 @@ safer-exec harness install --harness=zcode --scope=user
 safer-exec harness uninstall --harness=claude-code
 ```
 
+The harness id may be positional (`safer-exec harness install zcode`) or a
+flag (`--harness=zcode`).
+
+#### Harnesses with no permission config (ZCode)
+
+ZCode has hooks but no permission-token syntax, so there is nothing to import:
+`harness import zcode` succeeds but yields `"harnessRules": []`, and enforce
+mode with that policy enforces nothing (the install and every hook run say so
+loudly). Author the rules yourself and pass them explicitly — an explicit
+`--policy-file` is never overwritten by auto-import:
+
+```jsonc
+// .safer-exec/policy.json
+{
+  "name": "my-rules",
+  "version": "1",
+  "harnessRules": [
+    { "tool": "Bash", "kind": "command", "pattern": "curl *", "action": "deny", "source": "manual" },
+    { "tool": "Bash", "kind": "command", "pattern": "git push *", "action": "ask", "source": "manual" },
+    { "tool": "Read", "kind": "path", "pattern": "./.env", "access": "read", "action": "deny", "source": "manual" }
+  ]
+}
+```
+
+```bash
+safer-exec harness install zcode --mode=enforce --policy-file=.safer-exec/policy.json --wrap
+
+# watch decisions as they happen
+safer-exec hook audit --follow
+```
+
 Install writes:
 
 - `<project>/.safer-exec/hook-config.json` — hook runtime config (mode, wrap, policy, audit log). Edit this file (or set `SAFER_EXEC_HOOK_MODE` / `SAFER_EXEC_HOOK_WRAP` env vars) to change behavior without reinstalling.
 - `<project>/.safer-exec/harness-policy.json` — your harness permissions converted to a safer-exec policy (when a permission config is found).
-- `<project>/.safer-exec/hooks-audit.jsonl` — the audit trail.
+- `<project>/.safer-exec/hooks-audit.jsonl` — the audit trail (project-scope installs keep it in the project, not `$HOME`). View it with `safer-exec hook audit [--last=N] [--follow]`, run from the project directory so it picks up the project's hook config.
 - Hook entries in the harness's own settings (`.claude/settings.json`, `.zcode/config.json` `hooks.events` with `hooks.enabled: true`, `.codex/config.toml` `[[hooks.PreToolUse]]`, `.gemini/settings.json`, `.cursor/hooks.json`, `.factory/hooks.json`, `.github/hooks/safer-exec.json`, `.opencode/plugin/safer-exec-audit.ts`). A one-time `.safer-exec.bak` backup is kept next to modified files.
 
 ### Convert permissions without installing

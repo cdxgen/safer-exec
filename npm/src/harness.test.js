@@ -129,6 +129,46 @@ timeout = 30
 
 /* ------------------------------------------------------------------ rules */
 
+describe('install policy + wrap capability', () => {
+  test('explicit policyFile is never overwritten by auto-import', () => {
+    const dir = tmp();
+    const mine = join(dir, 'mine.json');
+    writeFileSync(mine, JSON.stringify({
+      harnessRules: [{ tool: 'Bash', kind: 'command', pattern: 'curl *', action: 'deny', source: 'manual' }],
+    }));
+    // ZCode has no importable permission model: auto-import yields an empty
+    // rule set, which must not replace the user's own policy
+    const res = installHarnessHooks('zcode', {
+      cwd: dir, home: dir, scope: 'project', mode: 'enforce', policyFile: mine,
+    });
+    assert.equal(res.policyFile, mine);
+    assert.equal(res.warning, '');
+    const cfg = JSON.parse(readFileSync(join(dir, '.safer-exec', 'hook-config.json'), 'utf-8'));
+    assert.equal(cfg.policyFile, mine);
+    assert.equal(JSON.parse(readFileSync(mine, 'utf-8')).harnessRules.length, 1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('enforce install without rules warns instead of silently allowing', () => {
+    const dir = tmp();
+    const res = installHarnessHooks('zcode', {
+      cwd: dir, home: dir, scope: 'project', mode: 'enforce', skipPolicyImport: true,
+    });
+    assert.match(res.warning, /nothing will be enforced/);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('adapters declare wrap support; zcode applies updatedInput', () => {
+    assert.equal(HARNESSES.zcode.supportsUpdatedInput, true);
+    assert.equal(HARNESSES['claude-code'].supportsUpdatedInput, true);
+    assert.equal(HARNESSES.codex.supportsUpdatedInput, false);
+    const dir = tmp();
+    const res = installHarnessHooks('zcode', { cwd: dir, home: dir, scope: 'project', wrap: true });
+    assert.equal(res.supportsWrap, true);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe('claude token parsing + matching', () => {
   test('parseClaudeToken forms', () => {
     assert.deepEqual(parseClaudeToken('Bash', 'deny', 'claude-code', '/b', '/h').rule, {

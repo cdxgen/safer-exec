@@ -67,7 +67,7 @@ Hook mode (agentic harness integration):
                                     (JSONL trail), optionally enforce converted
                                     permission rules / wrap Bash in the sandbox
   safer-exec hook post              Audit a PostToolUse payload (file changes, results)
-  safer-exec hook audit [--tail=N] [--json] [--last=N]
+  safer-exec hook audit [--tail=N] [--json] [--last=N] [--follow]
                                     Show the audit trail (default ~/.safer-exec/hooks-audit.jsonl)
   Environment: SAFER_EXEC_HOOK_CONFIG, SAFER_EXEC_HOOK_MODE=enforce,
                SAFER_EXEC_HOOK_WRAP=1, SAFER_EXEC_HOOK_POLICY,
@@ -75,11 +75,13 @@ Hook mode (agentic harness integration):
 
 Harness mode (install / convert permissions):
   safer-exec harness list                                   Detect harness configs
-  safer-exec harness install --harness=<id> [--scope=project|user]
-                              [--mode=audit|enforce] [--events=pre,post]
-                              [--wrap] [--timeout=<sec>] [--no-import]
-  safer-exec harness uninstall --harness=<id> [--scope=project|user]
-  safer-exec harness import --harness=<id> [--path=<file>] [--out=<policy.json>] [--print]
+  safer-exec harness install <id> [--scope=project|user]
+                              [--mode=audit|enforce] [--policy-file=<file>]
+                              [--events=pre,post] [--wrap] [--timeout=<sec>]
+                              [--no-import]
+  safer-exec harness uninstall <id> [--scope=project|user]
+  safer-exec harness import <id> [--path=<file>] [--out=<policy.json>] [--print]
+  (the harness id may also be given as --harness=<id>)
   Harnesses: claude-code, zcode, codex, gemini, cursor, factory, copilot, opencode
 
 Options:
@@ -913,7 +915,7 @@ async function runHookSubcommand(rest) {
   const sub = rest[0];
   const args = rest.slice(1);
   if (sub !== 'pre' && sub !== 'post' && sub !== 'audit') {
-    process.stderr.write('[safer-exec] Usage: safer-exec hook <pre|post|audit> [--tail=N] [--json] [--last=N]\n');
+    process.stderr.write('[safer-exec] Usage: safer-exec hook <pre|post|audit> [--tail=N] [--json] [--last=N] [--follow]\n');
     return 1;
   }
   const { runHookCli, readAuditTrail, loadHookConfig } = await import('./hooks.js');
@@ -924,35 +926,82 @@ async function runHookSubcommand(rest) {
   const flags = parseSimpleFlags(args);
   const config = loadHookConfig();
   const file = flags['file'] || config.auditLog;
-  const records = readAuditTrail(file, { last: Number(flags.tail || flags.last || 0) });
+  const follow = Boolean(flags.follow || flags.f);
+  const records = readAuditTrail(file, { last: Number(flags.tail || flags.last || (follow ? 10 : 0)) });
   if (flags.json) {
     process.stdout.write(JSON.stringify(records, null, 2) + '\n');
     return 0;
   }
-  if (records.length === 0) {
+  if (records.length === 0 && !follow) {
     process.stdout.write(`No audit records in ${file}\n`);
     return 0;
   }
-  process.stdout.write(`safer-exec hook audit trail (${file}) — ${records.length} records\n`);
-  for (const r of records) {
-    // Engine entries (from wrapped runs) carry type/target; hook records carry event/activity
-    const isEngine = !r.event && r.type;
-    const act = r.activity || {};
-    const target = act.command || act.path || act.url || act.query || act.server ||
-      r.target || r.details || '';
-    const line = String(target).replace(/\s+/g, ' ').slice(0, 100);
-    const decision = r.decision && r.decision !== 'passthrough' ? ` [${r.decision}]` : '';
-    const when = (r.ts || '').slice(11, 19);
-    if (isEngine) {
-      const note = r.details && r.details !== r.target ? ` — ${String(r.details).slice(0, 40)}` : '';
-      process.stdout.write(`${when || '  (rt)  '} (safer-exec-rt) ${String(r.type).padEnd(18)} ${line}${note}\n`);
-      continue;
-    }
-    process.stdout.write(
-      `${when} ${String(r.harness || '').padEnd(11)} ${(r.event || '').padEnd(12)} ` +
-      `${String(r.tool || '').padEnd(12)} ${line}${decision}${r.wrapped ? ' (sandboxed)' : ''}\n`
-    );
+  process.stdout.write(
+    `safer-exec hook audit trail (${file}) — ${records.length} records${follow ? ', following (Ctrl-C to stop)' : ''}\n`
+  );
+  for (const r of records) process.stdout.write(formatAuditRecord(r));
+  if (follow) return followAuditTrail(file, readAuditTrail(file, {}).length);
+  return 0;
+}
+
+/**
+ * Render one audit record as a trail line.
+ *
+ * @param {Object} r
+ * @returns {string}
+ */
+function formatAuditRecord(r) {
+  // Engine entries (from wrapped runs) carry type/target; hook records carry event/activity
+  const isEngine = !r.event && r.type;
+  const act = r.activity || {};
+  const target = act.command || act.path || act.url || act.query || act.server ||
+    r.target || r.details || '';
+  const line = String(target).replace(/\s+/g, ' ').slice(0, 100);
+  const decision = r.decision && r.decision !== 'passthrough' ? ` [${r.decision}]` : '';
+  const when = (r.ts || '').slice(11, 19);
+  if (isEngine) {
+    const note = r.details && r.details !== r.target ? ` — ${String(r.details).slice(0, 40)}` : '';
+    return `${when || '  (rt)  '} (safer-exec-rt) ${String(r.type).padEnd(18)} ${line}${note}\n`;
   }
+  const warn = r.enforcementWarning ? `  !! ${r.enforcementWarning}` : '';
+  return `${when} ${String(r.harness || '').padEnd(11)} ${(r.event || '').padEnd(12)} ` +
+    `${String(r.tool || '').padEnd(12)} ${line}${decision}${r.wrapped ? ' (sandboxed)' : ''}${warn}\n`;
+}
+
+/**
+ * Follow an audit trail like `tail -f`: poll for appended records and render
+ * each new one. Runs until interrupted.
+ *
+ * Polling (not fs.watch) because the hook appends from a short-lived process
+ * per tool call, and watch events for appends are unreliable across platforms
+ * and network filesystems.
+ *
+ * @param {string} file audit trail path
+ * @param {number} shown number of records already rendered
+ * @returns {Promise<number>}
+ */
+async function followAuditTrail(file, shown) {
+  const { readAuditTrail } = await import('./hooks.js');
+  let seen = shown;
+  await new Promise((resolve) => {
+    const timer = setInterval(() => {
+      let all;
+      try {
+        all = readAuditTrail(file, {});
+      } catch {
+        return; // trail not written yet, or momentarily unreadable
+      }
+      if (all.length < seen) seen = 0; // truncated or rotated — re-render
+      for (const r of all.slice(seen)) process.stdout.write(formatAuditRecord(r));
+      seen = all.length;
+    }, 500);
+    const stop = () => {
+      clearInterval(timer);
+      resolve(undefined);
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+  });
   return 0;
 }
 
@@ -966,6 +1015,10 @@ async function runHarnessSubcommand(rest) {
   const sub = rest[0];
   const args = rest.slice(1);
   const flags = parseSimpleFlags(args);
+  // The harness id may be given positionally (`harness install zcode`) or as
+  // a flag (`--harness=zcode`); the flag wins when both are present.
+  const positionalId = args.find((a) => !a.startsWith('-'));
+  const harnessId = flags.harness || positionalId || '';
   const harnesses = await import('./harnesses/index.js');
 
   if (sub === 'list') {
@@ -982,7 +1035,7 @@ async function runHarnessSubcommand(rest) {
   }
 
   if (sub === 'import') {
-    const id = flags.harness;
+    const id = harnessId;
     if (!id) {
       process.stderr.write('[safer-exec] --harness=<id> is required. See: safer-exec harness list\n');
       return 1;
@@ -1005,7 +1058,7 @@ async function runHarnessSubcommand(rest) {
   }
 
   if (sub === 'install') {
-    const id = flags.harness;
+    const id = harnessId;
     if (!id) {
       process.stderr.write('[safer-exec] --harness=<id> is required. See: safer-exec harness list\n');
       return 1;
@@ -1040,7 +1093,16 @@ async function runHarnessSubcommand(rest) {
         process.stdout.write('  Mode:           audit (observes only). Switch with --mode=enforce\n');
       }
       if (result.wrap) {
-        process.stdout.write('  Wrapping:       Bash commands rewritten to run inside the safer-exec sandbox\n');
+        if (result.supportsWrap) {
+          process.stdout.write('  Wrapping:       Bash commands rewritten to run inside the safer-exec sandbox\n');
+        } else {
+          process.stdout.write(
+            `  Wrapping:       requested but ${result.harness} ignores hook "updatedInput" — commands run unwrapped\n`
+          );
+        }
+      }
+      if (result.warning) {
+        process.stderr.write(`[safer-exec] WARNING: ${result.warning}\n`);
       }
       return 0;
     } catch (err) {
@@ -1050,7 +1112,7 @@ async function runHarnessSubcommand(rest) {
   }
 
   if (sub === 'uninstall') {
-    const id = flags.harness;
+    const id = harnessId;
     if (!id) {
       process.stderr.write('[safer-exec] --harness=<id> is required.\n');
       return 1;

@@ -4,7 +4,8 @@
  * Contract (Claude-lineage, adopted by Claude Code, ZCode, Cursor, Factory
  * droid, Copilot CLI, Gemini CLI): one JSON payload on stdin; exit 0 passes,
  * exit 2 blocks (stderr = reason); optional structured JSON on stdout for
- * permission decisions and Bash command rewriting.
+ * permission decisions and Bash command rewriting. Whether a harness honours
+ * the `updatedInput` rewrite is declared by its adapter, not assumed here.
  *
  * Modes:
  *  - audit (default): append every tool activity (file IO / network / exec)
@@ -30,6 +31,7 @@ import {
   hostFromUrl,
   resolveActivityPath,
 } from './harnesses/rules.js';
+import { HARNESSES as HARNESS_ADAPTERS } from './harnesses/index.js';
 
 const CLI_PATH = fileURLToPath(new URL('./cli.js', import.meta.url));
 
@@ -300,6 +302,23 @@ export function shellForWrap() {
 }
 
 /**
+ * Does this harness apply `hookSpecificOutput.updatedInput` from a PreToolUse
+ * hook? Answered by the adapter's own declaration rather than a list kept
+ * here, so a harness gaining (or losing) the capability is a one-line change
+ * in its adapter and cannot drift out of sync with wrapping.
+ *
+ * Unknown harness ids answer false — wrapping a harness that ignores
+ * `updatedInput` would report commands as sandboxed while they ran outside it.
+ *
+ * @param {string} harnessId
+ * @returns {boolean}
+ */
+export function harnessSupportsUpdatedInput(harnessId) {
+  const adapter = HARNESS_ADAPTERS[harnessId];
+  return Boolean(adapter && adapter.supportsUpdatedInput);
+}
+
+/**
  * Build the wrapped safer-exec command for a Bash tool input.
  *
  * The original command travels base64-encoded in an env var (avoids all
@@ -420,7 +439,7 @@ export function handleHookEvent(raw, opts = {}) {
 
   // ---- Wrapping (Bash exec activities on supporting harnesses) ----
   let wrappedCommand = null;
-  const supportsUpdatedInput = ['claude-code', 'cursor', 'factory', 'copilot', 'gemini'].includes(norm.harness);
+  const supportsUpdatedInput = harnessSupportsUpdatedInput(norm.harness);
   if (
     phase === 'pre' &&
     decision !== 'deny' &&
@@ -468,9 +487,17 @@ export function handleHookEvent(raw, opts = {}) {
         hookEventName: 'PreToolUse',
         updatedInput,
       };
+      // Carry the decision alongside the rewrite. An `ask` must survive
+      // wrapping: dropping it would turn a rule that demands confirmation
+      // into a silent auto-run of the same command inside the sandbox.
       if (decision === 'allow') {
         hookSpecificOutput.permissionDecision = 'allow';
         hookSpecificOutput.permissionDecisionReason = 'allowed by converted permission rules; wrapped in safer-exec sandbox';
+      } else if (decision === 'ask') {
+        hookSpecificOutput.permissionDecision = 'ask';
+        hookSpecificOutput.permissionDecisionReason = decisionReason
+          ? `${decisionReason}; wrapped in safer-exec sandbox`
+          : 'requires confirmation (ask rule); wrapped in safer-exec sandbox';
       }
       stdout = JSON.stringify({ hookSpecificOutput });
     }
@@ -490,7 +517,9 @@ export function handleHookEvent(raw, opts = {}) {
       });
     }
   } else if (phase === 'pre' && decision === 'ask') {
-    if (norm.harness !== 'gemini' && norm.harness !== 'zcode') {
+    if (norm.harness !== 'gemini') {
+      // ZCode included: its PreToolUse schema takes permissionDecision "ask"
+      // and raises the prompt even when the tool would otherwise auto-approve.
       stdout = JSON.stringify({
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
@@ -499,7 +528,8 @@ export function handleHookEvent(raw, opts = {}) {
         },
       });
     }
-    // gemini/zcode: stay silent — the harness's default flow already asks
+    // gemini: stay silent — its schema has no "ask" decision, and the
+    // harness's default flow already prompts
   }
 
   return { exitCode: 0, stdout, warning: enforcementWarning, record };

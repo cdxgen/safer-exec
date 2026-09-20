@@ -15,6 +15,7 @@ import {
   normalizeHookPayload,
   extractActivity,
   handleHookEvent,
+  harnessSupportsUpdatedInput,
   buildWrapCommand,
   shellForWrap,
   summarizeResponse,
@@ -254,11 +255,58 @@ describe('handleHookEvent', () => {
     };
     const cfg = { mode: 'audit', wrap: true, policyFile: '', auditLog: '/dev/null', harness: 'claude-code' };
     assert.equal(handleHookEvent(base, { config: cfg }).stdout, undefined);
-    const zcodeCfg = { ...cfg, harness: 'zcode' };
+    // Codex applies no updatedInput — wrapping it would report commands as
+    // sandboxed while they ran outside the sandbox
+    const codexCfg = { ...cfg, harness: 'codex' };
     assert.equal(
-      handleHookEvent({ ...base, tool_input: { command: 'sleep 10' } }, { config: zcodeCfg }).stdout,
+      handleHookEvent({ ...base, tool_input: { command: 'sleep 10' } }, { config: codexCfg }).stdout,
       undefined
     );
+  });
+
+  test('wrap support is read from the adapter, not a hardcoded list', () => {
+    // ZCode's PreToolUse schema carries updatedInput, so it wraps like Claude
+    assert.equal(harnessSupportsUpdatedInput('zcode'), true);
+    assert.equal(harnessSupportsUpdatedInput('claude-code'), true);
+    assert.equal(harnessSupportsUpdatedInput('codex'), false);
+    assert.equal(harnessSupportsUpdatedInput('opencode'), false);
+    assert.equal(harnessSupportsUpdatedInput('not-a-harness'), false);
+  });
+
+  test('zcode wrap emits a schema-valid hookSpecificOutput', () => {
+    const dir = tmp();
+    const res = handleHookEvent({
+      session_id: 's1', cwd: dir, hook_event_name: 'PreToolUse',
+      tool_name: 'Bash', tool_input: { command: 'echo hi' },
+    }, { config: { mode: 'audit', wrap: true, policyFile: '', auditLog: join(dir, 'a.jsonl'), harness: 'zcode' } });
+    const out = JSON.parse(res.stdout);
+    const hso = out.hookSpecificOutput;
+    assert.equal(hso.hookEventName, 'PreToolUse');
+    assert.ok(hso.updatedInput.command.includes('cli.js'));
+    // ZCode's HookSpecificOutputSchema permits exactly these PreToolUse keys
+    const allowed = new Set([
+      'hookEventName', 'permissionDecision', 'permissionDecisionReason',
+      'updatedInput', 'additionalContext',
+    ]);
+    for (const key of Object.keys(hso)) assert.ok(allowed.has(key), `unexpected key ${key}`);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('ask decision survives wrapping', () => {
+    const dir = tmp();
+    const policyFile = join(dir, 'p.json');
+    writeFileSync(policyFile, JSON.stringify({
+      harnessRules: [{ tool: 'Bash', kind: 'command', pattern: 'git push *', action: 'ask', source: 't' }],
+    }));
+    const res = handleHookEvent({
+      session_id: 's1', cwd: dir, hook_event_name: 'PreToolUse',
+      tool_name: 'Bash', tool_input: { command: 'git push origin main' },
+    }, { config: { mode: 'enforce', wrap: true, policyFile, auditLog: join(dir, 'a.jsonl'), harness: 'zcode' } });
+    const hso = JSON.parse(res.stdout).hookSpecificOutput;
+    // Wrapping must not silently auto-run a command a rule says to confirm
+    assert.equal(hso.permissionDecision, 'ask');
+    assert.ok(hso.updatedInput.command.includes('cli.js'));
+    rmSync(dir, { recursive: true, force: true });
   });
 
   test('gemini wrap output uses tool_input merge shape', () => {

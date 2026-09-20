@@ -19,7 +19,11 @@ export const zcode = {
   events: { pre: 'PreToolUse', post: 'PostToolUse' },
   matchAll: '', // omitted matcher matches everything
   timeoutUnit: 'ms',
-  supportsUpdatedInput: false, // strict output schema — exit codes only
+  // ZCode's PreToolUse hookSpecificOutput schema carries `updatedInput`
+  // (alongside permissionDecision / permissionDecisionReason /
+  // additionalContext) and applies it to the tool input before execution —
+  // the same contract as Claude Code, so Bash commands can be wrapped.
+  supportsUpdatedInput: true,
   hookStyle: 'zcode-events',
 
   settingsPaths({ scope, cwd, home }) {

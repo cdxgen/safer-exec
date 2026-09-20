@@ -18,7 +18,7 @@ import {
   writeFileSync,
   copyFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { claudeCode } from './claude-code.js';
@@ -168,9 +168,13 @@ export function installHarnessHooks(harnessId, opts = {}) {
   mkdirSync(configDir, { recursive: true });
 
   // 2. Import harness permissions → policy file used for decisions + wrapping
-  let policyFile = opts.policyFile || '';
+  // An explicitly supplied policy is the user's own authoring and always wins:
+  // auto-import must never overwrite it (harnesses with no permission model,
+  // such as ZCode, import to an empty rule set, which would silently disarm
+  // enforce mode).
+  let policyFile = opts.policyFile ? resolve(cwd, opts.policyFile) : '';
   let imported = [];
-  if (!opts.skipPolicyImport) {
+  if (!opts.skipPolicyImport && !policyFile) {
     try {
       const { policy, sources } = importHarnessPolicy(harnessId, { cwd, home });
       const pf = join(configDir, 'harness-policy.json');
@@ -179,6 +183,20 @@ export function installHarnessHooks(harnessId, opts = {}) {
       imported = sources;
     } catch {
       // No permission config found — audit mode still works without rules
+    }
+  }
+
+  // Enforce mode is only meaningful with rules to enforce. Say so at install
+  // time rather than letting every later tool call print the runtime warning.
+  let enforceWarning = '';
+  if (enforce) {
+    const ruleCount = countHarnessRules(policyFile);
+    if (ruleCount === 0) {
+      enforceWarning = policyFile
+        ? `enforce mode selected but ${policyFile} carries no harnessRules — nothing will be enforced. ` +
+          `${adapter.label} exposes no importable permission config; author rules yourself and pass --policy-file=<file>.`
+        : `enforce mode selected but no policy file was found or supplied — nothing will be enforced. ` +
+          `Author rules and pass --policy-file=<file>.`;
     }
   }
 
@@ -238,7 +256,25 @@ export function installHarnessHooks(harnessId, opts = {}) {
     importedFrom: imported,
     hookSettingsFiles: [...new Set(written)],
     auditLog: hookConfig.auditLog,
+    supportsWrap: Boolean(adapter.supportsUpdatedInput),
+    warning: enforceWarning,
   };
+}
+
+/**
+ * Count the harnessRules in a policy file (0 when missing or unreadable).
+ *
+ * @param {string} policyFile
+ * @returns {number}
+ */
+function countHarnessRules(policyFile) {
+  if (!policyFile || !safeExists(policyFile)) return 0;
+  try {
+    const parsed = JSON.parse(readFileSync(policyFile, 'utf-8'));
+    return Array.isArray(parsed.harnessRules) ? parsed.harnessRules.length : 0;
+  } catch {
+    return 0;
+  }
 }
 
 /**
