@@ -48,8 +48,13 @@ type egressProxy struct {
 	mu         sync.Mutex
 	conns      map[net.Conn]struct{}
 	violations []config.AuditEntry
+	connected  map[string]bool // host:port targets already recorded as proxy-connect
 	closed     bool
 }
+
+// maxProxyConnectEntries caps distinct proxy-connect audit entries so a
+// command that fans out to many hosts cannot grow the audit log unbounded.
+const maxProxyConnectEntries = 4096
 
 // startEgressProxy binds the proxy to an ephemeral loopback port and compiles
 // the allowlist from cfg (AllowHosts, AllowIPs, AllowURLRules hosts,
@@ -65,6 +70,8 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 		exact: make(map[string]bool),
 		ips:   make(map[string]bool),
 		conns: make(map[net.Conn]struct{}),
+
+		connected: make(map[string]bool),
 	}
 
 	addHost := func(h string) {
@@ -191,9 +198,9 @@ func (p *egressProxy) violationsSnapshot() []config.AuditEntry {
 	return v
 }
 
-// flushViolations emits collected proxy-violation audit entries to stderr as
-// one JSON object per line — the same protocol the Node runner's
-// parseAuditLog consumes for the Linux audit pipe.
+// flushViolations emits collected proxy-violation and proxy-connect audit
+// entries to stderr as one JSON object per line — the same protocol the Node
+// runner's parseAuditLog consumes for the Linux audit pipe.
 func (p *egressProxy) flushViolations() {
 	for _, v := range p.violationsSnapshot() {
 		entry := map[string]string{
@@ -267,6 +274,33 @@ func (p *egressProxy) recordViolation(subject string) {
 	p.mu.Unlock()
 }
 
+// recordConnect records an allowed egress target once per host:port as a
+// "proxy-connect" audit entry. Only the authority is kept: request paths and
+// query strings can carry credentials. This is the egress inventory the proxy
+// can see on every platform, including macOS where eBPF URL tracing is absent.
+func (p *egressProxy) recordConnect(hostPort, kind string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.connected[hostPort] || len(p.connected) >= maxProxyConnectEntries {
+		return
+	}
+	p.connected[hostPort] = true
+	p.violations = append(p.violations, config.AuditEntry{
+		Type:   "proxy-connect",
+		Target: hostPort,
+		Detail: kind,
+	})
+}
+
+// redactRequestTarget drops the query string and fragment from an
+// absolute-form request target before it is written to the audit log.
+func redactRequestTarget(target string) string {
+	if i := strings.IndexAny(target, "?#"); i >= 0 {
+		return target[:i]
+	}
+	return target
+}
+
 func (p *egressProxy) deny(conn net.Conn, subject string) {
 	p.recordViolation(subject)
 	fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\nX-Safer-Exec: egress-denied\r\n\r\n")
@@ -313,6 +347,7 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 			return
 		}
 		defer upstream.Close()
+		p.recordConnect(net.JoinHostPort(strings.ToLower(host), portStr), "connect")
 		_ = conn.SetDeadline(time.Time{})
 		fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 		// Tunnel from `reader`, not `conn`: a client that pipelines its first
@@ -344,7 +379,7 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 		}
 		port, _ := strconv.Atoi(portStr)
 		if !p.targetAllowed(host, port) {
-			p.deny(conn, parts[0]+" "+parts[1])
+			p.deny(conn, parts[0]+" "+redactRequestTarget(parts[1]))
 			return
 		}
 		upstream, dialErr := p.dialTarget(host, portStr)
@@ -353,6 +388,7 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 			return
 		}
 		defer upstream.Close()
+		p.recordConnect(net.JoinHostPort(strings.ToLower(host), portStr), "http")
 		_ = conn.SetDeadline(time.Time{})
 		// Rewrite the request line to origin-form; the headers and body follow
 		// untouched (the Host header the client sent is preserved) — they are

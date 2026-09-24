@@ -395,7 +395,7 @@ All methods return `this` for chaining except `.run()`.
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `.applyPolicy(name)`        | Apply a pre-defined policy. Throws if unknown.                                                                                                                                       |
 | `.allowHosts(...hosts)`     | Add hostnames to the network allow list                                                                                                                                              |
-| `.proxyEgress(enable?)`     | Route egress through the local hostname-pinning proxy (`HTTP(S)_PROXY` injection, CONNECT-time allowlist enforcement, `proxy-violation` audits; macOS confines all egress to the proxy port) |
+| `.proxyEgress(enable?)`     | Route egress through the local hostname-pinning proxy (`HTTP(S)_PROXY` injection, CONNECT-time allowlist enforcement, `proxy-violation` and `proxy-connect` audits; macOS confines all egress to the proxy port) |
 | `.allowUrls(...urls)`       | Add fine-grained URL rules — strings or `{host,protocol,path,methods,port}` objects (Linux only)                                                                                     |
 | `.readPaths(...paths)`      | Add filesystem read paths                                                                                                                                                            |
 | `.writePaths(...paths)`     | Add filesystem write paths                                                                                                                                                           |
@@ -773,7 +773,7 @@ How it works:
 
 1. The Go engine starts an HTTP CONNECT + absolute-form proxy on `127.0.0.1:<ephemeral port>` in the parent process (which has unrestricted network) and injects `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` into the sandboxed process.
 2. Every `CONNECT host:port` (and plain-HTTP proxy request) is checked against the hostname allowlist (`allowHosts` plus `allowUrls` hosts) and the port allowlist. Matching is **exact or dot-boundary suffix only** — `evil-nuget.org.attacker.com` can never match `nuget.org` (the published bypass class against `endsWith()`-style allowlist checks).
-3. Allowed targets are tunneled; denied targets get `HTTP 403` and a `proxy-violation` audit entry (`{"type":"proxy-violation","target":"CONNECT example.com:443"}`).
+3. Allowed targets are tunneled and recorded once per `host:port` as a `proxy-connect` audit entry (`{"type":"proxy-connect","target":"registry.npmjs.org:443","details":"connect"}`; `details` is `http` for plain-HTTP proxy requests). Request paths and queries are never recorded. Denied targets get `HTTP 403` and a `proxy-violation` audit entry (`{"type":"proxy-violation","target":"CONNECT example.com:443"}`); query strings are stripped from denied absolute-form targets.
 4. **Fail closed**: with an empty allowlist every target is denied. Ports default to 80/443 unless `allowPorts` narrows or widens them.
 
 Platform behavior:

@@ -157,12 +157,49 @@ func TestEgressProxyConnectRoundTrip(t *testing.T) {
 		t.Fatalf("expected 403 for denied host, got %q", resp)
 	}
 
-	violations := p.violationsSnapshot()
-	if len(violations) != 1 || violations[0].Type != "proxy-violation" {
+	var violations, connects []config.AuditEntry
+	for _, e := range p.violationsSnapshot() {
+		switch e.Type {
+		case "proxy-violation":
+			violations = append(violations, e)
+		case "proxy-connect":
+			connects = append(connects, e)
+		}
+	}
+	if len(violations) != 1 {
 		t.Fatalf("expected one proxy-violation entry, got %v", violations)
 	}
 	if !strings.Contains(violations[0].Target, "evil.example.com") {
 		t.Fatalf("violation target must name the denied host: %+v", violations[0])
+	}
+	want := fmt.Sprintf("127.0.0.1:%d", port)
+	if len(connects) != 1 || connects[0].Target != want || connects[0].Detail != "connect" {
+		t.Fatalf("expected one proxy-connect entry for %s, got %v", want, connects)
+	}
+}
+
+// Allowed targets are recorded once per host:port, without the request path
+// or query, and a denied absolute-form request is logged without its query.
+func TestEgressProxyRecordsConnectsAndRedactsQueries(t *testing.T) {
+	p, err := startEgressProxy(config.ExecConfig{AllowHosts: []string{"registry.example.org"}})
+	if err != nil {
+		t.Fatalf("start proxy: %v", err)
+	}
+	defer p.Close()
+	p.recordConnect("registry.example.org:443", "connect")
+	p.recordConnect("registry.example.org:443", "connect")
+	p.recordConnect("registry.example.org:80", "http")
+	if got := redactRequestTarget("http://evil.example.com/p?token=secret#f"); got != "http://evil.example.com/p" {
+		t.Fatalf("query not redacted: %q", got)
+	}
+	entries := p.violationsSnapshot()
+	if len(entries) != 2 {
+		t.Fatalf("expected two deduplicated proxy-connect entries, got %v", entries)
+	}
+	for _, e := range entries {
+		if e.Type != "proxy-connect" || strings.ContainsAny(e.Target, "/?") {
+			t.Fatalf("unexpected entry %+v", e)
+		}
 	}
 }
 
