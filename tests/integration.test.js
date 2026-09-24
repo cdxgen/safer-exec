@@ -120,6 +120,17 @@ describe('Integration Tests', () => {
     });
   });
 
+  describe('Device nodes', () => {
+    it('should allow writing and redirecting to /dev/null', async () => {
+      const result = await new SaferExec()
+        .disableNetwork()
+        .run('/bin/sh', ['-c', 'echo x > /dev/null && echo y >> /dev/null && echo z 2>/dev/null && head -c 4 /dev/zero | wc -c']);
+      strict.equal(result.exitCode, 0, `stderr: ${result.stderr}`);
+      strict.ok(result.stdout.includes('z'), `stdout: ${result.stdout}`);
+      strict.ok(result.stdout.trim().endsWith('4'), `expected 4 bytes from /dev/zero, got: ${result.stdout}`);
+    });
+  });
+
   describe('Environment isolation', () => {
     it('should pass environment variables to sandbox', async () => {
       const result = await new SaferExec()
@@ -335,6 +346,30 @@ describe('Integration Tests', () => {
       strict.ok(
         hasLibc,
         `expected libc.so or musl to be in the tracked library loads, got: ${JSON.stringify(libLoads.map(e => e.target))}`
+      );
+    });
+
+    it('should keep lib-load events out of a redirected stderr and still capture them', async () => {
+      if (process.platform !== 'linux') {
+        return; // LD_AUDIT is Linux-only
+      }
+      const outFile = join(FIXTURE_OUTPUT, 'redirected-stderr.txt');
+      rmSync(outFile, { force: true });
+      const result = await new SaferExec()
+        .traceLibraries()
+        .suppressLibLoadStderr(true)
+        .enableAudit()
+        .writePaths([FIXTURE_OUTPUT])
+        .run('/bin/sh', ['-c', `ls /safer-exec-no-such-path > ${outFile} 2>&1`]);
+
+      const redirected = readFileSync(outFile, 'utf-8');
+      strict.ok(!redirected.includes('lib-load'), `lib-load events leaked into the program's stderr: ${redirected}`);
+      strict.ok(redirected.includes('safer-exec-no-such-path'), `expected the ls error in the file, got: ${redirected}`);
+      // ls runs after the shell redirected fd 2; its loads must still arrive.
+      const libLoads = (result.auditLog || []).filter(e => e.type === 'lib-load');
+      strict.ok(
+        libLoads.some(e => e.target && e.target.includes('libc.so')),
+        `expected libc.so lib-load events, got: ${JSON.stringify(libLoads.map(e => e.target))}`
       );
     });
 

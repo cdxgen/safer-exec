@@ -645,7 +645,16 @@ func TestSetupDev(t *testing.T) {
 	// may fail with EINVAL or EPERM. Both are acceptable.
 	if err != nil {
 		t.Logf("setupDev error (expected outside namespace): %v", err)
+		return
 	}
+	// When it succeeds (e.g. as root in a privileged container) the new /dev
+	// must carry working device nodes. Earlier versions mounted an empty
+	// tmpfs over /dev before checking the host nodes, leaving no /dev/null.
+	f, err := os.OpenFile("/dev/null", os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		t.Fatalf("setupDev left no usable /dev/null: %v", err)
+	}
+	f.Close()
 }
 
 // TestMountPropagation_MS_SLAVE verifies MS_SLAVE on root is set without

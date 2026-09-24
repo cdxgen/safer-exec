@@ -1766,6 +1766,9 @@ func prepareExecEnv(cfg config.ExecConfig) (cmdPath string, argv []string, env [
 			if soPath != "" {
 				if _, statErr := os.Stat(soPath); statErr == nil {
 					env = append(env, fmt.Sprintf("LD_AUDIT=%s", soPath))
+					if fd := dupLibLoadFd(); fd >= 0 {
+						env = append(env, fmt.Sprintf("SAFER_EXEC_LIBLOAD_FD=%d", fd))
+					}
 					auditCleanup = soPath
 				} else {
 					fmt.Fprintf(os.Stderr, "safer-exec: trace-libraries: precompiled .so not found, skipping injection\n")
@@ -1777,6 +1780,10 @@ func prepareExecEnv(cfg config.ExecConfig) (cmdPath string, argv []string, env [
 		if auditCleanup != "" {
 			os.RemoveAll(filepath.Dir(auditCleanup))
 		}
+		if libLoadFd >= 0 {
+			syscall.Close(libLoadFd)
+			libLoadFd = -1
+		}
 	}
 	argv = append([]string{cfg.Cmd}, cfg.Args...)
 	// Only genuine setup failures (e.g. a blockExec match, handled above) are
@@ -1784,9 +1791,35 @@ func prepareExecEnv(cfg config.ExecConfig) (cmdPath string, argv []string, env [
 	return cmdPath, argv, env, cleanup, nil
 }
 
+// libLoadFd is the descriptor the LD_AUDIT helper writes lib-load events to
+// (-1 when library tracing is off). It is a duplicate of the engine's stderr,
+// taken before the target runs, so the events reach the engine even when the
+// traced program redirects its own stderr to a file or pipe.
+var libLoadFd = -1
+
+// libLoadFdMin keeps the descriptor clear of the low numbers programs use
+// for their own files and redirections.
+const libLoadFdMin = 100
+
+// dupLibLoadFd duplicates stderr to the lowest free descriptor at or above
+// libLoadFdMin, without close-on-exec so it survives into the target and its
+// children. Returns -1 when duplication fails (events then fall back to the
+// helper's own handling).
+func dupLibLoadFd() int {
+	if libLoadFd >= 0 {
+		return libLoadFd
+	}
+	fd, _, errno := syscall.Syscall(syscall.SYS_FCNTL, 2, syscall.F_DUPFD, libLoadFdMin)
+	if errno != 0 {
+		return -1
+	}
+	libLoadFd = int(fd)
+	return libLoadFd
+}
+
 // closeChildFds closes all file descriptors above stderr (fd 2) using only
-// raw syscalls. Must be called only in a forked child where the Go runtime
-// is undefined.
+// raw syscalls, except the lib-load descriptor handed to the LD_AUDIT helper.
+// Must be called only in a forked child where the Go runtime is undefined.
 func closeChildFds() {
 	var rlim syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlim); err != nil {
@@ -1796,8 +1829,11 @@ func closeChildFds() {
 	if maxFd > 4096 {
 		maxFd = 4096
 	}
+	keep := libLoadFd
 	for fd := 3; fd < maxFd; fd++ {
-		syscall.Close(fd)
+		if fd != keep {
+			syscall.Close(fd)
+		}
 	}
 }
 
@@ -2564,37 +2600,63 @@ func finalizeFilesystem(newRoot string, cfg config.ExecConfig) error {
 
 // setupDev creates a minimal /dev inside the sandbox with essential device
 // nodes (/dev/null, /dev/zero, /dev/full, /dev/random, /dev/urandom, /dev/tty),
-// /dev/pts, /dev/shm, and stdio symlinks. Device nodes are bind-mounted from
-// the host; only those that exist on the host are created.
+// /dev/shm, and stdio symlinks. Device nodes are bind-mounted from the host;
+// only those that exist on the host are created.
+//
+// The new /dev is assembled on a staging tmpfs while the host /dev is still
+// visible, then moved over /dev. Mounting the tmpfs on /dev first (as earlier
+// versions did) hid the host nodes before they were checked, so no device was
+// ever created: every "cmd > /dev/null" failed with EACCES and the Landlock
+// /dev/null rule was silently skipped.
 func setupDev(cfg config.ExecConfig) error {
+	essentialDevices := []string{"null", "zero", "full", "random", "urandom", "tty"}
+	var present []string
+	for _, devName := range essentialDevices {
+		if _, err := os.Stat("/dev/" + devName); err == nil {
+			present = append(present, devName)
+		}
+	}
+
+	staging, err := os.MkdirTemp("", "safer-exec-dev-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(staging)
+	if err := syscall.Mount("tmpfs", staging, "tmpfs", syscall.MS_NOSUID|syscall.MS_NOEXEC|syscall.MS_NODEV, "size=2m,mode=0755"); err != nil {
+		return err
+	}
+	moved := false
+	defer func() {
+		if !moved {
+			syscall.Unmount(staging, syscall.MNT_DETACH)
+		}
+	}()
+
+	for _, devName := range present {
+		target := filepath.Join(staging, devName)
+		f, _ := os.Create(target)
+		if f != nil {
+			f.Close()
+		}
+		// The bind mount carries the host mount's flags, so the node stays
+		// usable even though the staging tmpfs is MS_NODEV.
+		syscall.Mount("/dev/"+devName, target, "", syscall.MS_BIND, "")
+	}
+
+	os.Symlink("/proc/self/fd/0", filepath.Join(staging, "stdin"))
+	os.Symlink("/proc/self/fd/1", filepath.Join(staging, "stdout"))
+	os.Symlink("/proc/self/fd/2", filepath.Join(staging, "stderr"))
+	os.Symlink("/proc/self/fd", filepath.Join(staging, "fd"))
+	_ = os.MkdirAll(filepath.Join(staging, "shm"), 0o777)
+
 	if _, err := os.Stat("/dev"); err == nil {
 		syscall.Unmount("/dev", syscall.MNT_DETACH)
 	}
 	_ = os.MkdirAll("/dev", 0o755)
-	if err := syscall.Mount("tmpfs", "/dev", "tmpfs", syscall.MS_NOSUID|syscall.MS_NOEXEC|syscall.MS_NODEV, "size=2m"); err != nil {
-		return err
+	if err := syscall.Mount(staging, "/dev", "", syscall.MS_MOVE, ""); err != nil {
+		return fmt.Errorf("move staged /dev: %w", err)
 	}
-
-	essentialDevices := []string{"null", "zero", "full", "random", "urandom", "tty"}
-	for _, devName := range essentialDevices {
-		hostPath := "/dev/" + devName
-		sandboxPath := "/dev/" + devName
-		if _, err := os.Stat(hostPath); err != nil {
-			continue
-		}
-		f, _ := os.Create(sandboxPath)
-		if f != nil {
-			f.Close()
-		}
-		syscall.Mount(hostPath, sandboxPath, "", syscall.MS_BIND, "")
-	}
-
-	os.Symlink("/proc/self/fd/0", "/dev/stdin")
-	os.Symlink("/proc/self/fd/1", "/dev/stdout")
-	os.Symlink("/proc/self/fd/2", "/dev/stderr")
-	os.Symlink("/proc/self/fd", "/dev/fd")
-
-	_ = os.MkdirAll("/dev/shm", 0o777)
+	moved = true
 	return nil
 }
 
@@ -2911,7 +2973,12 @@ func applyLandlockFilesystem(cfg config.ExecConfig) error {
 
 	// /dev/null is a universal write sink (2>/dev/null, shell redirects).
 	// Grant write access unconditionally without opening the whole /dev tree.
+	// A shell ">" redirect opens with O_TRUNC; grant TRUNCATE (ABI 3+) as well
+	// so such opens are never refused on kernels that check it.
 	devNullAccess := uint64(landlockAccessFSReadFile | landlockAccessFSWriteFile)
+	if abi >= 3 {
+		devNullAccess |= landlockAccessFSTruncate
+	}
 	_ = addLandlockPathBeneath(int(rid), devNullAccess, "/dev/null")
 
 	// Write paths: strip directory-only rights when the target is a regular file.
