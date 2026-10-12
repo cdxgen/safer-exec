@@ -1409,10 +1409,12 @@ describe('SaferExec Cryptographic Tracing Integration', { skip: !isLinux || !isR
       strict.ok(algoComponent.cryptoProperties.algorithmProperties.primitive, 'Algorithm primitive should be present');
       strict.ok(Array.isArray(algoComponent.cryptoProperties.algorithmProperties.cryptoFunctions), 'Algorithm should have cryptoFunctions array');
 
-      const materialComponent = componentsWithCrypto.find(c => c.cryptoProperties.assetType === 'related-crypto-material');
-      strict.ok(materialComponent, 'Should have at least one related-crypto-material component');
-      strict.ok(materialComponent.cryptoProperties.relatedCryptoMaterialProperties, 'Material component should have relatedCryptoMaterialProperties');
-      strict.equal(materialComponent.cryptoProperties.relatedCryptoMaterialProperties.type, 'library', 'Material type should be library');
+      // Crypto libraries are library components (related-crypto-material
+      // has no "library" type in the schema), each with a bom-ref.
+      const libraryComponent = cbomContent.components.find(c => c.type === 'library');
+      strict.ok(libraryComponent, 'Should have at least one crypto library component');
+      strict.ok(libraryComponent['bom-ref'], 'Library component should have a bom-ref');
+      strict.ok(algoComponent['bom-ref'] && algoComponent.cryptoProperties.oid, 'Algorithm should have a bom-ref and an OID');
 
       const protocolComponent = componentsWithCrypto.find(c => c.cryptoProperties.assetType === 'protocol');
       strict.ok(protocolComponent, 'Should have at least one cryptographic protocol component');
