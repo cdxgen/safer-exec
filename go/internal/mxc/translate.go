@@ -872,9 +872,6 @@ func (p *Plan) collectUnenforced(cfg config.ExecConfig, host Host, env *EnvSet, 
 		}
 	}
 
-	if cfg.TraceLibraries {
-		p.Warnings = append(p.Warnings, "traceLibraries is not available on Windows")
-	}
 	if cfg.TraceHTTPURLs || cfg.TraceCrypto || cfg.CBOMOutputPath != "" || len(cfg.AllowCiphers) > 0 {
 		p.Warnings = append(p.Warnings, "HTTP URL and crypto tracing use eBPF and are only supported on Linux; these settings are ignored on Windows")
 	}

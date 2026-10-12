@@ -122,7 +122,7 @@ Options:
   --windows-allow-dacl-mutation
                              Consent to MXC's host-ACL-modifying fallback tier on Windows builds without the BaseContainer API
   --trace-exec               Log every child process spawned (fork + exec audit)
-  --trace-libraries          Track dynamically loaded libraries at runtime
+  --trace-libraries          Track dynamically loaded libraries at runtime (Windows: needs an elevated prompt)
   --trace-output-file=<file> Write tracked libraries to file (implies trace-libraries)
   --trace-temp-dir=<dir>     Temporary directory to extract dynamic library helper to (implies trace-libraries)
   --trace-http-urls          Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only, requires CAP_BPF)

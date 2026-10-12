@@ -21,7 +21,7 @@ The Go engine binary is named **`safer-exec-rt`** (runtime). The name `safer-exe
 
 **macOS**: Generates Seatbelt profiles → applies RLIMIT quotas → runs via `sandbox-exec`
 
-**Windows**: Probes the host (`wxc-exec --probe`) → starts the egress proxy if needed → translates the config into an MXC 1.0.0 request (`internal/mxc`) → starts `wxc-exec.exe` suspended inside a job object carrying the resource limits (`internal/winjob`) → resumes it → filters MXC's stderr protocol → emits audit/learn/dry-run/diff output
+**Windows**: Probes the host (`wxc-exec --probe`) → starts the egress proxy if needed → translates the config into an MXC 1.0.0 request (`internal/mxc`) → starts an ETW session for `traceLibraries` (`internal/dlltrace`) → starts `wxc-exec.exe` suspended inside a job object carrying the resource limits (`internal/winjob`) → resumes it → filters MXC's stderr protocol → emits audit/learn/dry-run/diff and `lib-load` output
 
 **Linux**: Forks self with `--init` → unshares namespaces → sets MS_SLAVE on root → mounts tmpfs → creates cgroup v2 → bind-mounts paths (fd-based with TOCTTOU check) → enforces submount read-only flags → double pivot_root → sets up /proc (hidepid=2 + dangerous entry hardening) → sets up minimal /dev → applies Landlock network rules → applies Landlock filesystem rules → applies seccomp-bpf (base + stackable filters) → acquires file locks → forks PID 1 reaper → child closes leaked fds → child sets PR_SET_PDEATHSIG / setsid → child execves target
 
@@ -57,6 +57,9 @@ go/                           — Go engine (platform-specific sandboxing)
                                 Windows path rules, argv/batch quoting, env, denial reports,
                                 stderr protocol); unit-tested on every platform
     winjob/                   — Windows job objects (limits, suspended start, notifications)
+    dlltrace/                 — Windows DLL load tracing: an ETW session on Microsoft-Windows-Kernel-Process
+                                (session_windows.go) and the portable attribution of image loads to the
+                                workload's process tree and kernel-to-Win32 path mapping (dlltrace.go)
 apparmor/                     — AppArmor profile for unprivileged user namespace creation
   safer-exec                  — Bundled AppArmor profile
 npm/
@@ -121,7 +124,9 @@ BaseContainer API (older builds, Windows Server), or a host where MXC would fall
 to modifying file ACLs. Programs that load `user32.dll` (Node.js) need an interactive
 session; over SSH (session 0) run such checks through a scheduled task with `/it`.
 Most Node suites use POSIX tools and paths, so the Windows CI job runs an explicit list
-of portable suites plus `windows.test.js`.
+of portable suites plus `windows.test.js`. ETW tests (`internal/dlltrace`, the
+`traceLibraries` engine and Node tests) need an elevated process and skip otherwise; an
+interactive session for Node with an elevated token comes from `schtasks /it /rl HIGHEST`.
 
 ### Run Tests
 

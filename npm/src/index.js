@@ -1910,7 +1910,9 @@ export class SaferExec extends EventEmitter {
   }
 
   /**
-   * Track dynamic library loading via LD_AUDIT / DYLD_INSERT_LIBRARIES.
+   * Track dynamic library loading: LD_AUDIT on Linux, Seatbelt audit events
+   * on macOS, and kernel ETW image-load events on Windows (which needs an
+   * elevated process). Loads arrive as `lib-load` entries in `auditLog`.
    *
    * @returns {SaferExec} This instance for chaining
    */
