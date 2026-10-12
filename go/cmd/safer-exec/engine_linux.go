@@ -206,8 +206,11 @@ func run(cfg config.ExecConfig) error {
 	}
 	// Take pre-execution snapshot for filesystem diffing
 	var beforeSnap fsdiff.Snapshot
+	var snapper *fsdiff.Snapshotter
 	if cfg.EnableDiff && len(cfg.WritePaths) > 0 {
-		beforeSnap, _ = fsdiff.SnapshotPath(cfg.WritePaths...)
+		if snapper, _ = fsdiff.NewSnapshotter(cfg.WritePaths...); snapper != nil {
+			beforeSnap, _ = snapper.Snapshot()
+		}
 	}
 
 	// Egress proxy: enforce the hostname allowlist at CONNECT time. Landlock
@@ -525,7 +528,7 @@ func run(cfg config.ExecConfig) error {
 				closeHTTPTracer()
 				// Output diff even if killed by limits
 				if cfg.EnableDiff && beforeSnap != nil {
-					if afterSnap, err := fsdiff.SnapshotPath(cfg.WritePaths...); err == nil {
+					if afterSnap, err := snapper.Snapshot(); err == nil {
 						diff := fsdiff.Diff(beforeSnap, afterSnap)
 						if data, err := json.Marshal(diff); err == nil {
 							writeStructured(cfg, "FSDIFF:", data)
@@ -546,7 +549,7 @@ func run(cfg config.ExecConfig) error {
 
 	// Take post-execution snapshot and output diff on success
 	if cfg.EnableDiff && beforeSnap != nil {
-		if afterSnap, err := fsdiff.SnapshotPath(cfg.WritePaths...); err == nil {
+		if afterSnap, err := snapper.Snapshot(); err == nil {
 			diff := fsdiff.Diff(beforeSnap, afterSnap)
 			if data, err := json.Marshal(diff); err == nil {
 				writeStructured(cfg, "FSDIFF:", data)

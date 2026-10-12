@@ -184,8 +184,12 @@ func run(cfg config.ExecConfig) error {
 
 	// Handle diff mode: snapshot before execution
 	var beforeSnap fsdiff.Snapshot
+	var snapper *fsdiff.Snapshotter
 	if cfg.EnableDiff && len(cfg.WritePaths) > 0 {
-		beforeSnap, err = fsdiff.SnapshotPath(cfg.WritePaths...)
+		snapper, err = fsdiff.NewSnapshotter(cfg.WritePaths...)
+		if err == nil {
+			beforeSnap, err = snapper.Snapshot()
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: pre-snapshot: %v\n", err)
 		}
@@ -281,8 +285,8 @@ func run(cfg config.ExecConfig) error {
 	finish()
 
 	// Handle diff mode: snapshot after execution and output diff
-	if cfg.EnableDiff && len(cfg.WritePaths) > 0 {
-		afterSnap, err := fsdiff.SnapshotPath(cfg.WritePaths...)
+	if snapper != nil {
+		afterSnap, err := snapper.Snapshot()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: post-snapshot: %v\n", err)
 		} else {
