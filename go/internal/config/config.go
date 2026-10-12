@@ -496,6 +496,24 @@ type ExecConfig struct {
 	// requires a shared network namespace, so it is skipped with a warning when
 	// DisableNetwork created a fresh netns.
 	ProxyEgress bool `json:"proxyEgress,omitempty"`
+
+	// WindowsAllowDaclMutation, when true, consents to MXC's AppContainer +
+	// DACL containment tier on Windows hosts that lack the BaseContainer
+	// (CreateProcessSecurityEnvironment) API. That tier grants the container
+	// access by adding ACEs to the host security descriptor of every policy
+	// path for the duration of the run; they are restored on a clean exit but
+	// left behind if the launcher is killed. Off by default, so such hosts
+	// fail closed instead of having their ACLs modified. Windows-only.
+	WindowsAllowDaclMutation bool `json:"windowsAllowDaclMutation,omitempty"`
+
+	// WindowsBlockWin32k, when true, applies the Win32k system-call disable
+	// mitigation to the sandboxed process: no window, GDI or NtUser*/NtGdi*
+	// calls at all, which removes the GUI subsystem's kernel attack surface.
+	// Programs that load user32.dll during start-up — Node.js among them —
+	// then fail with STATUS_DLL_INIT_FAILED, so it is opt-in. Clipboard,
+	// input-injection, handle and atom isolation apply either way.
+	// Windows-only.
+	WindowsBlockWin32k bool `json:"windowsBlockWin32k,omitempty"`
 }
 
 // SeccompFilterSpec describes an additional seccomp-bpf filter to stack.
@@ -768,6 +786,10 @@ type PolicyFile struct {
 	// Network egress proxy (mirror of the ExecConfig field). When true, runs
 	// enforce with the local hostname-pinning egress proxy.
 	ProxyEgress bool `json:"proxyEgress,omitempty"`
+
+	// Windows-only mirrors of the ExecConfig fields.
+	WindowsAllowDaclMutation bool `json:"windowsAllowDaclMutation,omitempty"`
+	WindowsBlockWin32k       bool `json:"windowsBlockWin32k,omitempty"`
 
 	// Linux hardening / isolation round-trip (mirror of the ExecConfig fields).
 	// Booleans are emitted only when true; defaults live in the engines.

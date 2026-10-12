@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 )
 
@@ -103,6 +104,16 @@ func SanitizeEnv(env map[string]string, allowEnvs []string) map[string]string {
 	return result
 }
 
+// isInheritedHostVar reports whether a host variable is part of the minimal
+// set every sandboxed process inherits. Windows environment names are
+// case-insensitive ("Path" is PATH).
+func isInheritedHostVar(key string) bool {
+	if runtime.GOOS == "windows" {
+		key = strings.ToUpper(key)
+	}
+	return key == "PATH" || key == "HOME" || key == "TERM" || key == "LANG" || strings.HasPrefix(key, "LC_")
+}
+
 // FilteredEnviron returns a minimal slice of environment variables from the host environment.
 // This is used to prevent leakage of credentials (like AWS keys, tokens, etc.) when no
 // environment is explicitly specified. It only inherits essential variables:
@@ -118,8 +129,7 @@ func FilteredEnviron() []string {
 		if len(parts) == 0 {
 			continue
 		}
-		key := parts[0]
-		if key == "PATH" || key == "HOME" || key == "TERM" || key == "LANG" || strings.HasPrefix(key, "LC_") {
+		if isInheritedHostVar(parts[0]) {
 			env = append(env, envVar)
 		}
 	}
@@ -146,11 +156,9 @@ func BuildEnv(cfgEnv map[string]string) []string {
 			continue
 		}
 		key := parts[0]
-		if !envKeys[key] {
-			if key == "PATH" || key == "HOME" || key == "TERM" || key == "LANG" || strings.HasPrefix(key, "LC_") {
-				env = append(env, envVar)
-				envKeys[key] = true
-			}
+		if !envKeys[key] && isInheritedHostVar(key) {
+			env = append(env, envVar)
+			envKeys[key] = true
 		}
 	}
 

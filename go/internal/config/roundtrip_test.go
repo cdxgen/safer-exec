@@ -141,3 +141,38 @@ func TestOverlayExecConfigNilPolicy(t *testing.T) {
 		t.Errorf("nil policy must pass through, got %v", got)
 	}
 }
+
+// The Windows fields round-trip; consent to host-ACL mutation is a
+// relaxation (both layers must grant it) while the Win32k lockdown is
+// hardening (either layer turns it on).
+func TestWindowsFieldsRoundTripAndMerge(t *testing.T) {
+	var p PolicyFile
+	if err := json.Unmarshal([]byte(`{"windowsAllowDaclMutation":true,"windowsBlockWin32k":true}`), &p); err != nil {
+		t.Fatal(err)
+	}
+	if !p.WindowsAllowDaclMutation || !p.WindowsBlockWin32k {
+		t.Fatalf("fields not decoded: %+v", p)
+	}
+	out, _ := json.Marshal(&p)
+	for _, key := range []string{"windowsAllowDaclMutation", "windowsBlockWin32k"} {
+		if !containsKey(string(out), key) {
+			t.Errorf("serialized policy missing %q: %s", key, out)
+		}
+	}
+
+	merged := MergePolicies(&PolicyFile{WindowsAllowDaclMutation: true}, &PolicyFile{WindowsBlockWin32k: true})
+	if merged.WindowsAllowDaclMutation {
+		t.Error("DACL-mutation consent must require both layers")
+	}
+	if !merged.WindowsBlockWin32k {
+		t.Error("Win32k lockdown must survive a merge")
+	}
+	if m := MergePolicies(&PolicyFile{WindowsAllowDaclMutation: true}, &PolicyFile{WindowsAllowDaclMutation: true}); !m.WindowsAllowDaclMutation {
+		t.Error("consent granted by both layers was dropped")
+	}
+
+	overlaid := OverlayExecConfigToPolicy(ExecConfig{WindowsAllowDaclMutation: true, WindowsBlockWin32k: true}, &PolicyFile{})
+	if !overlaid.WindowsAllowDaclMutation || !overlaid.WindowsBlockWin32k {
+		t.Errorf("overlay dropped Windows fields: %+v", overlaid)
+	}
+}

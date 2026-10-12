@@ -2,7 +2,7 @@
 
 OS-level sandboxing with tracing, auditing, and learning mode for arbitrary binaries.
 
-On macOS the Go binary generates Seatbelt profiles and runs commands through `sandbox-exec`. On Linux it uses namespace isolation, bind mounts, `pivot_root`, seccomp-bpf filters, Landlock network and filesystem confinement, and cgroup v2 resource quotas (memory, CPU, PID, IO). OpenBSD support is available via `unveil(2)` and `pledge(2)`.
+On macOS the Go binary generates Seatbelt profiles and runs commands through `sandbox-exec`. On Linux it uses namespace isolation, bind mounts, `pivot_root`, seccomp-bpf filters, Landlock network and filesystem confinement, and cgroup v2 resource quotas (memory, CPU, PID, IO). On Windows it runs commands in a [Microsoft eXecution Container (MXC)](https://github.com/microsoft/mxc) ProcessContainer — an OS BaseContainer with deny-by-default filesystem grants and per-container WFP egress filtering — inside a job object that carries the resource limits (see [Windows](#windows-microsoft-execution-container)). OpenBSD support is available via `unveil(2)` and `pledge(2)`.
 
 ## Install
 
@@ -461,36 +461,36 @@ All methods return `this` for chaining except `.run()`.
 
 ### OS & Capability Support Matrix
 
-| API Method                             | macOS | Linux | Windows / BSD | Required Capabilities / Permissions                    | Notes                                                                                                                                                  |
-| :------------------------------------- | :---: | :---: | :-----------: | :----------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.allowHosts(...)`                     |  Yes  |  Yes  |      No       | None                                                   | On Linux: DNS resolution to IP. On macOS: Seatbelt rules.                                                                                              |
-| `.allowListen(...)`                    |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | Blocks loopback port binding by default unless explicitly permitted.                                                                                   |
-| `.allowPorts(...)`                     |  Yes  |  Yes  |      No       | None                                                   | Restricts outbound ports. macOS uses Seatbelt; Linux uses Landlock.                                                                                    |
-| `.proxyEgress()`                       |  Yes  |  Yes  |      No       | None                                                   | Local CONNECT proxy + `HTTP(S)_PROXY` injection; hostname allowlist enforced at CONNECT time. macOS additionally confines all egress to the proxy port. |
-| `.allowUrls(...)`                      |  No   |  Yes  |      No       | `CAP_BPF`, `CAP_PERFMON`                               | Requires eBPF tracing engine.                                                                                                                          |
-| `.readPaths(...)` / `.writePaths(...)` |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | Restricts filesystem access. macOS uses Seatbelt; Linux uses Mount Namespaces.                                                                         |
-| `.disableNetwork()`                    |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS blocks outbound; Linux unshares Net Namespace.                                                                                                   |
-| `.maxMemory(...)`                      |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_AS`. Linux: cgroups v2 `memory.max`.                                                                                                    |
-| `.maxCPUCores(...)`                    |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_CPU`. Linux: cgroups v2 `cpu.max`.                                                                                                      |
-| `.maxProcesses(...)`                   |  Yes  |  Yes  |      No       | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_NPROC`. Linux: cgroups v2 `pids.max`.                                                                                                   |
-| `.maxReadIOPS(...)` etc.               |  No   |  Yes  |      No       | Cgroups write permission                               | Linux cgroups v2 `io.max` throttling, applied to the devices actually backing your write paths (NVMe `259:x`, virtio `254:x`, ...), not a hardcoded SCSI id. |
-| `.enableAudit()`                       |  Yes  |  Yes  |      No       | None                                                   | macOS uses Seatbelt trace; Linux uses Seccomp-BPF trap.                                                                                                |
-| `.enableDiff()`                        |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS: Shadow dir snapshot. Linux: OverlayFS mount.                                                                                                    |
-| `.enableLearn()`                       |  Yes  |  Yes  |      No       | None (macOS), `SYS_PTRACE` or `ptrace_scope=0` (Linux) | macOS parses Seatbelt trace logs. Linux uses `strace` or fallback.                                                                                     |
-| `.enableDryRun()`                      |  Yes  |  Yes  |      No       | None (macOS), `strace` (Linux)                         | Deny-all run with an attempted-operations report (`result.dryRun`). macOS collects kernel sandbox reports via `log show`; Linux traces with `strace`.  |
-| `.allowExec(...)` / `.blockExec(...)`  |  Yes  |  Yes  |      No       | None                                                   | Restricts process execution. macOS uses Seatbelt; Linux uses Seccomp.                                                                                  |
-| `.blockFork()`                         |  Yes  |  Yes  |      No       | None                                                   | macOS uses Seatbelt; Linux uses Seccomp.                                                                                                               |
-| `.blockInterpreters()`                 |  Yes  |  n/a  |      No       | None                                                   | macOS-only. Denies tclsh/wish/perl/python/ruby/SamplingTools exec + starves Tcl/Tk/Ffidl reads. No-op elsewhere.                                       |
-| `.denyPersistenceWrites()`             |  Yes  |  Yes  |      No       | None (macOS), Unprivileged User Namespaces (Linux)     | macOS: Seatbelt write denies on LaunchAgents/plugins/`/usr/local/bin`. Linux: already deny-by-default via Landlock allowlist.                          |
-| `.allowWritableDylibLoad()`            |  Yes  |  n/a  |      No       | None                                                   | macOS-only. Relaxes the `.blockInterpreters()` writable-`.dylib` read deny.                                                                            |
-| `.allowSecurityServices()`             |  Yes  |  n/a  |      No       | None                                                   | macOS-only relaxation. `com.apple.SecurityServer` is the keychain endpoint, so a granted process can read items an unlocked login keychain hands over without a prompt. Off by default; the `nuget` policy opts in. |
-| `.blockJIT()`                          |  No   |  Yes  |      No       | None                                                   | Linux-only (Seccomp W^X). Denies mprotect PROT_EXEC, mmap W+X, memfd_create. Breaks V8/JVM/LuaJIT — opt-in. On macOS, Seatbelt cannot filter syscalls. |
-| `.traceExec()`                         |  Yes  |  Yes  |      No       | None                                                   | Logs child spawns. macOS: Seatbelt trace. Linux: Seccomp trap.                                                                                         |
-| `.allowGPU(...)`                       |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Bind mounts device nodes to sandbox.                                                                                                       |
-| `.blockTPM()`                          |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Restricts access to `/dev/tpm*`.                                                                                                           |
-| `.spoofAntiVM()`                       |  No   |  Yes  |      No       | Unprivileged User Namespaces                           | Linux-only. Conceals sandbox execution details.                                                                                                        |
-| `.traceLibraries()`                    |  Yes  |  Yes  |      No       | None                                                   | macOS: `DYLD_INSERT_LIBRARIES`. Linux: `LD_AUDIT`.                                                                                                     |
-| `.traceHTTPURLs()` / `.traceCrypto()`  |  No   |  Yes  |      No       | `CAP_BPF`, `CAP_PERFMON`                               | Linux eBPF TLS uprobes.                                                                                                                                |
+| API Method                             | macOS | Linux | Windows | BSD | Required Capabilities / Permissions                    | Notes                                                                                                                                                  |
+| :------------------------------------- | :---: | :---: | :-----: | :-: | :----------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.allowHosts(...)`                     |  Yes  |  Yes  | Yes | No | None                                                   | On Linux: DNS resolution to IP. On macOS: Seatbelt rules. Windows: Resolved to addresses and pinned with per-container WFP rules; hostname patterns need `.proxyEgress()`. |
+| `.allowListen(...)`                    |  Yes  |  Yes  | Partial | No | None (macOS), Unprivileged User Namespaces (Linux)     | Blocks loopback port binding by default unless explicitly permitted. Windows: inbound cannot be scoped by port, so allowing listeners admits private-network inbound. |
+| `.allowPorts(...)`                     |  Yes  |  Yes  | Yes | No | None                                                   | Restricts outbound ports. macOS uses Seatbelt; Linux uses Landlock. Windows: WFP TCP port rules. |
+| `.proxyEgress()`                       |  Yes  |  Yes  | Yes | No | None                                                   | Local CONNECT proxy + `HTTP(S)_PROXY` injection; hostname allowlist enforced at CONNECT time. macOS additionally confines all egress to the proxy port. Windows: WFP confines all container egress to the proxy endpoint. |
+| `.allowUrls(...)`                      |  No   |  Yes  | No | No | `CAP_BPF`, `CAP_PERFMON`                               | Requires eBPF tracing engine.                                                                                                                          |
+| `.readPaths(...)` / `.writePaths(...)` |  Yes  |  Yes  | Yes | No | None (macOS), Unprivileged User Namespaces (Linux)     | Restricts filesystem access. macOS uses Seatbelt; Linux uses Mount Namespaces. Windows: BaseContainer grants; everything else is invisible except the read-only Windows directory. |
+| `.disableNetwork()`                    |  Yes  |  Yes  | Yes | No | None (macOS), Unprivileged User Namespaces (Linux)     | macOS blocks outbound; Linux unshares Net Namespace. Windows: Egress and ingress deny. |
+| `.maxMemory(...)`                      |  Yes  |  Yes  | Yes | No | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_AS`. Linux: cgroups v2 `memory.max`. Windows: Job-wide committed-memory limit; the workload is terminated (exit 137) when it is exceeded. |
+| `.maxCPUCores(...)`                    |  Yes  |  Yes  | Yes | No | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_CPU`. Linux: cgroups v2 `cpu.max`. Windows: Job CPU rate hard cap. |
+| `.maxProcesses(...)`                   |  Yes  |  Yes  | Yes | No | None (macOS), Cgroups write permission (Linux)         | macOS: `RLIMIT_NPROC`. Linux: cgroups v2 `pids.max`. Windows: Job active-process limit. |
+| `.maxReadIOPS(...)` etc.               |  No   |  Yes  | No | No | Cgroups write permission                               | Linux cgroups v2 `io.max` throttling, applied to the devices actually backing your write paths (NVMe `259:x`, virtio `254:x`, ...), not a hardcoded SCSI id. |
+| `.enableAudit()`                       |  Yes  |  Yes  | Partial | No | None                                                   | macOS uses Seatbelt trace; Linux uses Seccomp-BPF trap. Windows: MXC denial capture; reports grant conflicts, not accesses to ungranted paths. |
+| `.enableDiff()`                        |  Yes  |  Yes  | Yes | No | None (macOS), Unprivileged User Namespaces (Linux)     | macOS: Shadow dir snapshot. Linux: OverlayFS mount. Windows: Snapshot diff of the write paths. |
+| `.enableLearn()`                       |  Yes  |  Yes  | Partial | No | None (macOS), `SYS_PTRACE` or `ptrace_scope=0` (Linux) | macOS parses Seatbelt trace logs. Linux uses `strace` or fallback. Windows: Contained run; hostnames via the recording proxy, files as reported by denial capture. |
+| `.enableDryRun()`                      |  Yes  |  Yes  | Partial | No | None (macOS), `strace` (Linux)                         | Deny-all run with an attempted-operations report (`result.dryRun`). macOS collects kernel sandbox reports via `log show`; Linux traces with `strace`. Windows: Deny-all run reported through MXC denial capture. |
+| `.allowExec(...)` / `.blockExec(...)`  |  Yes  |  Yes  | Partial | No | None                                                   | Restricts process execution. macOS uses Seatbelt; Linux uses Seccomp. Windows: Enforced when the executable is unreachable inside the container or with `.blockFork()`; otherwise reported. |
+| `.blockFork()`                         |  Yes  |  Yes  | Yes | No | None                                                   | macOS uses Seatbelt; Linux uses Seccomp. Windows: Job active-process limit (batch shims get their `cmd.exe` interpreters). |
+| `.blockInterpreters()`                 |  Yes  |  n/a  | n/a | No | None                                                   | macOS-only. Denies tclsh/wish/perl/python/ruby/SamplingTools exec + starves Tcl/Tk/Ffidl reads. No-op elsewhere.                                       |
+| `.denyPersistenceWrites()`             |  Yes  |  Yes  | Yes | No | None (macOS), Unprivileged User Namespaces (Linux)     | macOS: Seatbelt write denies on LaunchAgents/plugins/`/usr/local/bin`. Linux: already deny-by-default via Landlock allowlist. Windows: Denies Startup folders, PowerShell profiles and shell rc files under broader write grants. |
+| `.allowWritableDylibLoad()`            |  Yes  |  n/a  | n/a | No | None                                                   | macOS-only. Relaxes the `.blockInterpreters()` writable-`.dylib` read deny.                                                                            |
+| `.allowSecurityServices()`             |  Yes  |  n/a  | n/a | No | None                                                   | macOS-only relaxation. `com.apple.SecurityServer` is the keychain endpoint, so a granted process can read items an unlocked login keychain hands over without a prompt. Off by default; the `nuget` policy opts in. |
+| `.blockJIT()`                          |  No   |  Yes  | No | No | None                                                   | Linux-only (Seccomp W^X). Denies mprotect PROT_EXEC, mmap W+X, memfd_create. Breaks V8/JVM/LuaJIT — opt-in. On macOS, Seatbelt cannot filter syscalls. |
+| `.traceExec()`                         |  Yes  |  Yes  | Yes | No | None                                                   | Logs child spawns. macOS: Seatbelt trace. Linux: Seccomp trap. Windows: Job new-process notifications (with `.enableAudit()`). |
+| `.allowGPU(...)`                       |  No   |  Yes  | n/a | No | Unprivileged User Namespaces                           | Linux-only. Bind mounts device nodes to sandbox.                                                                                                       |
+| `.blockTPM()`                          |  No   |  Yes  | No | No | Unprivileged User Namespaces                           | Linux-only. Restricts access to `/dev/tpm*`.                                                                                                           |
+| `.spoofAntiVM()`                       |  No   |  Yes  | No | No | Unprivileged User Namespaces                           | Linux-only. Conceals sandbox execution details.                                                                                                        |
+| `.traceLibraries()`                    |  Yes  |  Yes  | No | No | None                                                   | macOS: `DYLD_INSERT_LIBRARIES`. Linux: `LD_AUDIT`.                                                                                                     |
+| `.traceHTTPURLs()` / `.traceCrypto()`  |  No   |  Yes  | No | No | `CAP_BPF`, `CAP_PERFMON`                               | Linux eBPF TLS uprobes.                                                                                                                                |
 
 ### Static Methods
 
@@ -569,6 +569,15 @@ The Node.js layer handles policy resolution, DNS lookups, and config serializati
 9. `pivot_root` to the new filesystem tree (hard error with `--strict`; chroot fallback otherwise)
 10. `execve` the target command
 
+**Windows path:**
+
+1. Probe the host with `wxc-exec --probe` and refuse MXC's host-ACL-mutating tier without consent
+2. Start the egress proxy when `proxyEgress` (or learning) needs it
+3. Translate the `ExecConfig` into an MXC 1.0.0 request (`go/internal/mxc`): grants, WFP egress rules or proxy, environment, quoted command line, denial capture
+4. Start `wxc-exec.exe` suspended, assign it to a job object carrying the memory, CPU and process limits, and resume it
+5. Forward the workload's output while extracting MXC's stderr protocol (error envelope, denial-report pointer)
+6. Emit audit entries, learned policies, dry-run reports and filesystem diffs in the shared formats
+
 **Linux path (reduced isolation — user namespaces unavailable):**
 
 1. Fork self with `--init-reduced` flag (no unshare)
@@ -595,6 +604,8 @@ These binaries are fully self-contained, wrapping Node.js and the statically com
 - **macOS Apple Silicon (`darwin-arm64`)**
 - **Linux GNU (`linux-amd64`, `linux-arm64`)**
 - **Linux Musl (`linux-amd64-musl`, `linux-arm64-musl`)**
+
+Windows is available through the npm packages (`@cdxgen/safer-exec` with the `@cdxgen/safer-exec-windows-amd64` / `-arm64` engine and MXC executor), not yet as a standalone binary.
 
 ### Download and Verification
 
@@ -735,6 +746,62 @@ sudo sysctl -p /etc/sysctl.d/99-userns.conf
 ```
 
 This weakens a system-wide security policy. Prefer the AppArmor profile for production systems.
+
+## Windows (Microsoft eXecution Container)
+
+On Windows the Go engine runs the command through the [Microsoft eXecution Container (MXC)](https://github.com/microsoft/mxc) executor, `wxc-exec.exe`, using MXC's ProcessContainer backend. On current Windows 11 builds that is an OS **BaseContainer** (`CreateProcessSecurityEnvironment`):
+
+- the process sees only the paths it is granted, plus the read-only Windows directory — Program Files, the user profile and the drive root are invisible without a grant;
+- outbound traffic is filtered per container by the Windows Filtering Platform, and the per-container WinHTTP proxy points at safer-exec's egress proxy in proxy mode;
+- clipboard, input injection, desktop, handle and atom access are restricted through job UI limits;
+- `wxc-exec.exe` itself runs inside a safer-exec job object. MXC's own job nests under it, so the memory, CPU and process-count limits cover the whole workload tree, and the tree is killed if safer-exec exits.
+
+### Requirements
+
+| Item | Requirement |
+| --- | --- |
+| Windows | Windows 11 24H2 build 26100.9278+, 25H2 build 26200.9278+ or 26H1 build 28000.2804+ (the August 2026 servicing update) for the BaseContainer tier. Run `safer-exec diagnostics` to check. |
+| MXC executor | `wxc-exec.exe`, shipped next to `safer-exec-rt.exe` in `@cdxgen/safer-exec-windows-amd64` / `-arm64` and built from a pinned MXC commit (`.github/scripts/build-mxc.ps1`). Set `SAFER_EXEC_MXC_EXEC` to an absolute path to use another copy. |
+| Session | An interactive session for programs that load `user32.dll` (Node.js, Java): a container started from session 0 — a Windows service or an SSH logon — cannot open that session's window station, and such programs fail with `STATUS_DLL_INIT_FAILED`. Console-only programs (cmd, curl, Go and Rust binaries, Python) are unaffected. |
+
+On older Windows builds MXC can only fall back to an AppContainer tier that grants access by **adding ACEs to the host security descriptors** of every policy path. safer-exec refuses that tier unless you consent with `windowsAllowDaclMutation()` / `--windows-allow-dacl-mutation`; the ACEs are restored on a clean exit but left behind if the launcher is killed.
+
+### How the policy maps
+
+| safer-exec setting | Windows enforcement |
+| --- | --- |
+| `readPaths` / `writePaths` | MXC read-only / read-write grants. The command's own directory and the working directory are granted read access automatically. Paths that do not exist, POSIX paths without a drive (`/etc/ssl/certs`), wildcards and alternate data streams are skipped. A grant on a volume root (`C:\`) does not extend to its subdirectories. |
+| `denyPersistenceWrites` | Denies the Startup folders, PowerShell profile directories and `.bashrc`/`.bash_profile`/`.profile` when a broader write grant covers them. |
+| `disableNetwork` | Egress and ingress deny (DNS resolution fails as well). |
+| `allowHosts` / `allowIPs` / `allowPorts` | Hosts are resolved to their addresses and allowed as `/32` / `/128` WFP rules on the allowed TCP ports (default 80 and 443) — egress is IP-pinned, unlike Linux and macOS, so prefer `proxyEgress` for CDN-fronted hosts whose addresses rotate. Wildcard hosts (`*.example.com`) cannot be pinned and need `proxyEgress`. Private-network destinations require Windows' bidirectional `privateNetworkClientServer` capability, which also admits private-network inbound connections. |
+| `proxyEgress` | Container egress is confined by WFP to the loopback proxy, which enforces hostnames at CONNECT time. The proxy has no package identity, so MXC's identity-less proxy mode is used (host loopback allowed, private-network capability granted); WFP still permits only the proxy endpoint. |
+| `allowLoopback` | Host loopback for direct-egress policies, on hosts whose container API supports it (`host_loopback` in diagnostics); otherwise it stays blocked with a warning. |
+| `maxMemoryMB` | Job-wide committed-memory limit (plus a 32 MB allowance for the launcher). When the workload exceeds it, safer-exec terminates it with exit code 137, matching a Linux cgroup OOM kill — Windows would otherwise just fail the allocation, which leaves many runtimes hung. |
+| `maxCPUCores` | Job CPU-rate hard cap as a share of the machine's logical processors. |
+| `maxProcesses` / `blockFork` | Job active-process limit. A `.bat`/`.cmd` command (for example `npm.cmd`) is budgeted two extra processes for its `cmd.exe` interpreters. |
+| `blockExec` / `allowExec` | Windows has no per-executable exec filter. An entry is enforced when no reachable copy exists inside the container (outside every grant and outside `%SystemRoot%`) or when `blockFork` leaves room for nothing but the command; otherwise it is reported as not enforced. |
+| `traceExec` (with `enableAudit`) | `process-exec` audit entries for every process the job starts. |
+| `enableAudit` | MXC denial capture (deny-and-record). See the limitation below. Resource-limit hits are reported as `resource-limit` entries. |
+| `enableLearn` | A contained (deny-and-record) run through a recording egress proxy. The learned policy lists the hostnames the proxy forwarded, the grants the run had and the file accesses denial capture reported. |
+| `enableDryRun` | A deny-all run (bootstrap reads only, no network) reported through denial capture. |
+| `enableDiff` | Snapshot diff of the write paths. |
+| `lockFiles` | `LockFileEx` on a sentinel byte range beyond the file data, so locks are advisory like `flock(2)`. |
+| `timeoutMs` | MXC process timeout (exit code 124), with a job-termination backstop 30 s later. |
+| `detectFIPS` / `strictFIPS` | The `FipsAlgorithmPolicy\Enabled` registry value. |
+| `windowsBlockWin32k` | Opt-in Win32k system-call disable mitigation (no GUI subsystem at all). Breaks programs that load `user32.dll`, including Node.js. |
+| `strict` | Any requested restriction listed as not enforced on Windows becomes an error instead of a warning. |
+
+The environment follows the minimal-inheritance model of the other engines with a Windows baseline (`PATH`, `PATHEXT`, `SystemRoot`, the profile folders, processor variables). Names are matched case-insensitively, and the CLR/CoreCLR profiler, `DOTNET_STARTUP_HOOKS` and `__COMPAT_LAYER` code-injection variables are stripped unless named in `allowEnvs`.
+
+Commands resolve through `PATH` and `PATHEXT` without the implicit current-directory search, and only `.com`, `.exe`, `.bat` and `.cmd` files are started. Arguments are quoted for `CommandLineToArgvW`; batch files run through an explicit `cmd.exe /d /e:ON /v:OFF /c` whose arguments are quoted for cmd's own parser, so an argument such as `x&calc` or `%PATH%` reaches the script literally (the CVE-2024-24576 "BatBadBut" class). When the command is `cmd.exe` itself, everything after `/c`, `/k` or `/r` is passed verbatim as the command string, as with `cmd /c` typed at a prompt.
+
+Not available on Windows: I/O rate limits, `blockJIT`, seccomp filters, `blockCrypto`, eBPF URL and crypto tracing, `traceLibraries`, `tmpOverlayPaths` and `bindFds`.
+
+### Known limitations
+
+- **Denial capture coverage.** On BaseContainer hosts MXC's denial capture reports accesses that conflict with a grant (for example a write under a read-only grant) and probes of protected directories, but not reads or writes of paths outside every grant, and it is best-effort: the same attempt is not reported on every run. Audit, learn and dry-run reports are therefore partial: grant missing paths explicitly and iterate. Enforcement does not depend on capture. MXC's permissive capture mode is not used, because on these hosts it lifts enforcement while recording nothing.
+- **Ancestor directories.** Tools that resolve real paths by walking from the drive root fail when an ancestor of a granted path is not readable. Node.js does this for script paths; run it with `NODE_OPTIONS=--preserve-symlinks --preserve-symlinks-main` (and `allowEnvs: ['NODE_OPTIONS']`), or wait for hosts that support MXC's `enumeratePaths` (`enumerate_paths` in diagnostics). Note that `--preserve-symlinks` changes how symlinked packages (pnpm layouts, workspaces) resolve.
+- **`cmd.exe` builtins.** `del` fails inside a BaseContainer even in a writable grant; programs that delete through the Win32 API (Node, Python, Go, `rmdir /s`) are unaffected.
 
 ## Pre-built Policies
 

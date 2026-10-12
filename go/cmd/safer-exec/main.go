@@ -37,7 +37,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"syscall"
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
 )
@@ -265,8 +264,7 @@ func initDryRunMain() {
 	}
 
 	// Set no_new_privs before Landlock (required for unprivileged use).
-	// PR_SET_NO_NEW_PRIVS=38, SYS_PRCTL=157 on amd64, 167 on arm64.
-	syscall.Syscall6(157, 38, 1, 0, 0, 0, 0)
+	setNoNewPrivs()
 
 	// Dry-run: deny all filesystem and network access via Landlock.
 	// Clear read/write paths and ports so Landlock rulesets are empty (deny-all).

@@ -79,11 +79,22 @@ function findInPath(cmd) {
   if (cmd.includes('/') || cmd.includes('\\')) {
     return cmd;
   }
-  const paths = (process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':');
+  const isWindows = process.platform === 'win32';
+  const paths = (process.env.PATH || '').split(isWindows ? ';' : ':');
+  // On Windows a bare name resolves through PATHEXT, and only extensions
+  // CreateProcess can start are candidates (npm ships both an extensionless
+  // POSIX shell script and npm.cmd in the same directory).
+  const launchable = ['.com', '.exe', '.bat', '.cmd'];
+  const exts = isWindows
+    ? (process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.toLowerCase()).filter((e) => launchable.includes(e))
+    : [''];
   for (const p of paths) {
-    const fullPath = join(p, cmd);
-    if (existsSync(fullPath)) {
-      return fullPath;
+    if (!p) continue;
+    for (const ext of exts) {
+      const fullPath = join(p, cmd + (isWindows && cmd.toLowerCase().endsWith(ext) ? '' : ext));
+      if (existsSync(fullPath)) {
+        return fullPath;
+      }
     }
   }
   return cmd;
@@ -478,6 +489,20 @@ export class SaferExec extends EventEmitter {
      * additionally confines all outbound traffic to the proxy port.
      */
     this._proxyEgress = options.proxyEgress || false;
+
+    /**
+     * @type {boolean} Windows only: consent to MXC's AppContainer + DACL
+     * containment tier on hosts without the BaseContainer API. That tier adds
+     * ACEs to the host security descriptors of policy paths for the duration
+     * of the run. Off by default, so such hosts fail closed.
+     */
+    this._windowsAllowDaclMutation = options.windowsAllowDaclMutation || false;
+
+    /**
+     * @type {boolean} Windows only: apply the Win32k system-call disable
+     * mitigation. Breaks programs that load user32.dll (Node.js), so opt-in.
+     */
+    this._windowsBlockWin32k = options.windowsBlockWin32k || false;
   }
 
   /**
@@ -693,6 +718,12 @@ export class SaferExec extends EventEmitter {
     }
     if (raw.proxyEgress) {
       this.proxyEgress();
+    }
+    if (raw.windowsAllowDaclMutation) {
+      this.windowsAllowDaclMutation();
+    }
+    if (raw.windowsBlockWin32k) {
+      this.windowsBlockWin32k();
     }
     if (raw.useReaper) {
       this.useReaper();
@@ -989,6 +1020,37 @@ export class SaferExec extends EventEmitter {
    */
   proxyEgress(enable = true) {
     this._proxyEgress = enable;
+    return this;
+  }
+
+  /**
+   * Windows only. Consent to MXC's AppContainer + DACL containment tier on
+   * hosts that lack the BaseContainer API (Windows 11 builds before the
+   * August 2026 servicing update). That tier grants the container access by
+   * adding ACEs to the host security descriptor of every policy path for the
+   * duration of the run; they are restored on a clean exit but left behind if
+   * the launcher is killed. Without this consent such hosts fail closed.
+   *
+   * @param {boolean} [enable=true] - Whether to allow host ACL mutation
+   * @returns {SaferExec} This instance for chaining
+   */
+  windowsAllowDaclMutation(enable = true) {
+    this._windowsAllowDaclMutation = enable;
+    return this;
+  }
+
+  /**
+   * Windows only. Apply the Win32k system-call disable mitigation so the
+   * sandboxed process cannot use the GUI subsystem at all (no windows, GDI or
+   * NtUser/NtGdi calls), removing that kernel attack surface. Programs that
+   * load user32.dll during start-up — Node.js and Java among them — then
+   * fail with STATUS_DLL_INIT_FAILED, so it is opt-in. Clipboard,
+   * input-injection, handle and atom isolation apply either way.
+   *
+   * @returns {SaferExec} This instance for chaining
+   */
+  windowsBlockWin32k() {
+    this._windowsBlockWin32k = true;
     return this;
   }
 
@@ -2108,7 +2170,8 @@ export class SaferExec extends EventEmitter {
     let effectiveWritePaths = [...this._writePaths].filter(p => p && existsSync(p));
 
     if (!this._allowHidden) {
-      const hiddenRegex = /(^|\/)\.[^\/]+/;
+      // Windows paths use either separator.
+      const hiddenRegex = process.platform === 'win32' ? /(^|[\\/])\.[^\\/]+/ : /(^|\/)\.[^\/]+/;
       const nodeDirs = new Set();
       try {
         const rawBin = dirname(process.execPath);
@@ -2122,7 +2185,7 @@ export class SaferExec extends EventEmitter {
       } catch {}
 
       effectiveReadPaths = effectiveReadPaths.filter(p => {
-        const isNodeDir = Array.from(nodeDirs).some(nd => p === nd || p.startsWith(nd + '/'));
+        const isNodeDir = Array.from(nodeDirs).some(nd => p === nd || p.startsWith(nd + '/') || (process.platform === 'win32' && p.toLowerCase().startsWith(nd.toLowerCase() + '\\')));
         if (isNodeDir) {
           return true;
         }
@@ -2265,6 +2328,8 @@ export class SaferExec extends EventEmitter {
       allowUserns: this._allowUserns,
       allowChrootFallback: this._allowChrootFallback,
       proxyEgress: this._proxyEgress,
+      windowsAllowDaclMutation: this._windowsAllowDaclMutation,
+      windowsBlockWin32k: this._windowsBlockWin32k,
     };
 
     const effectiveTimeout = this._timeoutMs;
@@ -2413,6 +2478,7 @@ SaferExec.diagnostics = async function () {
     const proc = spawn(binaryPath, ['--diagnostics'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10000,
+      windowsHide: true,
     });
 
     let stdout = '';

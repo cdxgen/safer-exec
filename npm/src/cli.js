@@ -118,6 +118,9 @@ Options:
   --allow-writable-dylib-load Permit loading .dylib from writable/temp dirs under --block-interpreters (macOS)
   --allow-security-services Permit mach-lookup to securityd + the user database (macOS; widens the sandbox to reach the keychain — .NET needs it, TLS validation does not)
   --block-jit                Block W^X / JIT syscalls (mprotect PROT_EXEC, memfd_create, MAP_JIT); breaks V8/JVM (Linux)
+  --windows-block-win32k     Disable all Win32k (GUI) system calls; breaks programs that load user32.dll such as Node.js (Windows)
+  --windows-allow-dacl-mutation
+                             Consent to MXC's host-ACL-modifying fallback tier on Windows builds without the BaseContainer API
   --trace-exec               Log every child process spawned (fork + exec audit)
   --trace-libraries          Track dynamically loaded libraries at runtime
   --trace-output-file=<file> Write tracked libraries to file (implies trace-libraries)
@@ -343,6 +346,12 @@ function parseCliArgs() {
         type: 'boolean',
       },
       'block-jit': {
+        type: 'boolean',
+      },
+      'windows-block-win32k': {
+        type: 'boolean',
+      },
+      'windows-allow-dacl-mutation': {
         type: 'boolean',
       },
       'proxy-egress': {
@@ -626,6 +635,12 @@ function buildExec(values, cmd, args) {
   }
   if (values['block-jit']) {
     exec.blockJIT();
+  }
+  if (values['windows-block-win32k']) {
+    exec.windowsBlockWin32k();
+  }
+  if (values['windows-allow-dacl-mutation']) {
+    exec.windowsAllowDaclMutation();
   }
   if (values['proxy-egress']) {
     exec.proxyEgress();

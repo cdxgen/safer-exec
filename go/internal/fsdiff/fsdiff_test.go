@@ -57,7 +57,7 @@ func TestSnapshotPath_WithFiles(t *testing.T) {
 	if _, ok := snap["file_b.txt"]; !ok {
 		t.Error("snapshot should contain file_b.txt")
 	}
-	if _, ok := snap["subdir/file_c.txt"]; !ok {
+	if _, ok := snap[filepath.Join("subdir", "file_c.txt")]; !ok {
 		t.Error("snapshot should contain subdir/file_c.txt")
 	}
 	if entry, ok := snap["subdir"]; !ok || !entry.IsDir {

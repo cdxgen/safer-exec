@@ -32,7 +32,9 @@
     "landlock",
     "cbom",
     "crypto",
-    "cdxgen"
+    "cdxgen",
+    "mxc",
+    "windows"
   ],
   "author": "Team AppThreat <cloud@appthreat.com>",
   "license": "MIT",
@@ -49,7 +51,9 @@
     "@cdxgen/safer-exec-darwin-arm64": "1.0.1",
     "@cdxgen/safer-exec-darwin-amd64": "1.0.1",
     "@cdxgen/safer-exec-linux-amd64": "1.0.1",
-    "@cdxgen/safer-exec-linux-arm64": "1.0.1"
+    "@cdxgen/safer-exec-linux-arm64": "1.0.1",
+    "@cdxgen/safer-exec-windows-amd64": "1.0.1",
+    "@cdxgen/safer-exec-windows-arm64": "1.0.1"
   },
   "engines": {
     "node": ">=20.0.0"

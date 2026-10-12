@@ -127,6 +127,9 @@ func MergePolicies(base, observed *PolicyFile) *PolicyFile {
 	// relaxation too: both layers must ask for it.
 	merged.AllowSecurityServices = base.AllowSecurityServices && observed.AllowSecurityServices
 	merged.ProxyEgress = base.ProxyEgress || observed.ProxyEgress
+	// Consent to host-ACL mutation is a relaxation: both layers must grant it.
+	merged.WindowsAllowDaclMutation = base.WindowsAllowDaclMutation && observed.WindowsAllowDaclMutation
+	merged.WindowsBlockWin32k = base.WindowsBlockWin32k || observed.WindowsBlockWin32k
 
 	// Linux hardening round-trip — opt-in hardening ORs together; escape
 	// hatches (AllowChrootFallback weakens pivot_root fail-closed) require
@@ -205,6 +208,12 @@ func OverlayExecConfigToPolicy(cfg ExecConfig, policy *PolicyFile) *PolicyFile {
 	}
 	if cfg.ProxyEgress {
 		policy.ProxyEgress = true
+	}
+	if cfg.WindowsAllowDaclMutation {
+		policy.WindowsAllowDaclMutation = true
+	}
+	if cfg.WindowsBlockWin32k {
+		policy.WindowsBlockWin32k = true
 	}
 	if cfg.TraceExec {
 		policy.TraceExec = true

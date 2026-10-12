@@ -437,6 +437,37 @@ describe('Next Improvements API', () => {
     });
   });
 
+  describe('Windows options', () => {
+    it('should default to off', async () => {
+      const s = new SaferExec();
+      strict.equal(s._windowsAllowDaclMutation, false);
+      strict.equal(s._windowsBlockWin32k, false);
+      const { config } = await s._buildConfig('true', []);
+      strict.equal(config.windowsAllowDaclMutation, false);
+      strict.equal(config.windowsBlockWin32k, false);
+    });
+    it('should enable via methods and options', async () => {
+      const viaMethods = await new SaferExec().windowsAllowDaclMutation().windowsBlockWin32k()._buildConfig('true', []);
+      strict.equal(viaMethods.config.windowsAllowDaclMutation, true);
+      strict.equal(viaMethods.config.windowsBlockWin32k, true);
+      const viaOptions = await new SaferExec({ windowsAllowDaclMutation: true, windowsBlockWin32k: true })._buildConfig('true', []);
+      strict.equal(viaOptions.config.windowsAllowDaclMutation, true);
+      strict.equal(viaOptions.config.windowsBlockWin32k, true);
+      strict.equal(new SaferExec().windowsAllowDaclMutation(false)._windowsAllowDaclMutation, false);
+    });
+    it('should be applied from a policy file', () => {
+      const path = `${tmpdir()}/safer-exec-windows-policy-${Date.now()}.json`;
+      writeFileSync(path, JSON.stringify({ windowsAllowDaclMutation: true, windowsBlockWin32k: true }));
+      try {
+        const s = new SaferExec().applyPolicyFile(path);
+        strict.equal(s._windowsAllowDaclMutation, true);
+        strict.equal(s._windowsBlockWin32k, true);
+      } finally {
+        try { unlinkSync(path); } catch {}
+      }
+    });
+  });
+
   describe('proxyEgress', () => {
     it('should default to false', () => {
       strict.equal(new SaferExec()._proxyEgress, false);

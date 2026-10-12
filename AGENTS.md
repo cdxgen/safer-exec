@@ -21,6 +21,8 @@ The Go engine binary is named **`safer-exec-rt`** (runtime). The name `safer-exe
 
 **macOS**: Generates Seatbelt profiles → applies RLIMIT quotas → runs via `sandbox-exec`
 
+**Windows**: Probes the host (`wxc-exec --probe`) → starts the egress proxy if needed → translates the config into an MXC 1.0.0 request (`internal/mxc`) → starts `wxc-exec.exe` suspended inside a job object carrying the resource limits (`internal/winjob`) → resumes it → filters MXC's stderr protocol → emits audit/learn/dry-run/diff output
+
 **Linux**: Forks self with `--init` → unshares namespaces → sets MS_SLAVE on root → mounts tmpfs → creates cgroup v2 → bind-mounts paths (fd-based with TOCTTOU check) → enforces submount read-only flags → double pivot_root → sets up /proc (hidepid=2 + dangerous entry hardening) → sets up minimal /dev → applies Landlock network rules → applies Landlock filesystem rules → applies seccomp-bpf (base + stackable filters) → acquires file locks → forks PID 1 reaper → child closes leaked fds → child sets PR_SET_PDEATHSIG / setsid → child execves target
 
 ---
@@ -34,6 +36,8 @@ go/                           — Go engine (platform-specific sandboxing)
     engine_darwin.go          — macOS: Seatbelt + RLIMIT engine
     engine_linux.go           — Linux: namespaces + seccomp + Landlock (net + fs) + cgroup
     engine_openbsd.go         — OpenBSD: unveil(2) + pledge(2) engine
+    engine_windows.go         — Windows: MXC ProcessContainer (wxc-exec.exe) + job objects
+    nnp_nonlinux.go           — no-op no_new_privs stub for non-Linux builds
     engine_linux_amd64.go     — x86_64 syscall numbers
     engine_linux_arm64.go     — arm64 syscall numbers
     engine_linux_*_syscall.go — Architecture-specific syscall constants
@@ -45,6 +49,10 @@ go/                           — Go engine (platform-specific sandboxing)
     learnermac/               — macOS Seatbelt trace parser (learning mode)
     fsdiff/                   — Filesystem snapshot + SHA-256 diff utilities
     httptrace/                — eBPF HTTP URL + crypto tracing (Linux-only)
+    mxc/                      — ExecConfig → MXC request translation (host-independent,
+                                Windows path rules, argv/batch quoting, env, denial reports,
+                                stderr protocol); unit-tested on every platform
+    winjob/                   — Windows job objects (limits, suspended start, notifications)
       bpf/                    — BPF C source + pre-compiled objects
       cipher.go               — Cipher name parser + IANA registry mapping
       cipher_test.go          — Cipher decomposition tests
@@ -100,7 +108,14 @@ Cross-compile for other platforms:
 ```bash
 GOOS=darwin GOARCH=arm64 go build -o bin/safer-exec-rt-darwin-arm64 ./cmd/safer-exec/
 GOOS=linux GOARCH=amd64 go build -o bin/safer-exec-rt-linux-amd64 ./cmd/safer-exec/
+GOOS=windows GOARCH=amd64 go build -o bin/safer-exec-rt-windows-amd64.exe ./cmd/safer-exec/
 ```
+
+The Windows engine needs the MXC executor `wxc-exec.exe` next to `safer-exec-rt.exe`
+(or `SAFER_EXEC_MXC_EXEC=<absolute path>`). Build it from the pinned MXC commit with
+`pwsh .github/scripts/build-mxc.ps1 -Arch x64|arm64` (Rust toolchain + MSVC required).
+Windows integration tests (`engine_windows_test.go`, `npm/src/windows.test.js`) skip
+themselves when the executor or the BaseContainer API is unavailable.
 
 ### Run Tests
 
@@ -143,7 +158,7 @@ The `ExecConfig` struct is the canonical JSON contract between Node.js and Go. A
 
 1. Add the field to `ExecConfig` in `config.go`
 2. Update the Node.js `SaferExec` class in `index.js`
-3. Update both platform engines (`engine_darwin.go` and `engine_linux.go`)
+3. Update the platform engines (`engine_darwin.go`, `engine_linux.go`, and the Windows translation in `internal/mxc/translate.go`)
 4. Update the CLI argument parser in `cli.js`
 5. Add tests for both platforms
 6. **Update documentation** (update README.md to describe the new configuration settings, CLI flags, and API methods)
@@ -153,6 +168,7 @@ The `ExecConfig` struct is the canonical JSON contract between Node.js and Go. A
 - **macOS** uses Go build tags (`//go:build darwin`) — Seatbelt profiles + RLIMIT
 - **Linux** uses Go build tags (`//go:build linux`) — namespaces + seccomp + Landlock (net + fs) + cgroup v2
 - **OpenBSD** uses Go build tags (`//go:build openbsd`) — unveil(2) + pledge(2)
+- **Windows** uses Go build tags (`//go:build windows`) — MXC ProcessContainer via `wxc-exec.exe`, job objects; the config translation lives in the portable `internal/mxc` package so it is tested on every platform
 - Architecture-specific syscall numbers use build tags (`linux && amd64`, `linux && arm64`)
 - The `run()` function signature is the same across platforms — the implementation differs
 
@@ -324,6 +340,7 @@ The `resolveBinaryPath()` function in `runner.js` locates the Go engine binary. 
 1. Add field to `ExecConfig` in `go/internal/config/config.go`
 2. Implement in `engine_darwin.go` (Seatbelt rule or RLIMIT)
 3. Implement in `engine_linux.go` (namespace, seccomp, Landlock, or cgroup)
+3a. Map it in `internal/mxc/translate.go` for Windows — or list it in `Plan.Unenforced` (restrictions) / `Plan.Warnings` (observability) so strict mode fails closed
 4. Add method to `SaferExec` class in `npm/src/index.js`
 5. If the feature has user-facing config, add the field to `PolicyFile` in `config.go` and the `applyPolicyFile` method in `index.js`
 6. Add CLI flag in `npm/src/cli.js`

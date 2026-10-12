@@ -27,6 +27,12 @@ jobs:
           - os: linux
             arch: arm64
             runner: ubuntu-latest
+          - os: windows
+            arch: amd64
+            runner: ubuntu-latest
+          - os: windows
+            arch: arm64
+            runner: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
@@ -43,10 +49,14 @@ jobs:
           cd go
           # CGO_ENABLED=0 required: cilium/ebpf is pure Go; static build works on both glibc and musl.
           # -extldflags are Linux-only hardening flags; omit for darwin cross-compile to avoid linker warnings.
-          if [[ "${{ matrix.os }}" == "linux" ]]; then
-            CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build \
+          ext=""
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            ext=".exe"
+          fi
+          if [[ "${{ matrix.os }}" == "linux" || "${{ matrix.os }}" == "windows" ]]; then
+            CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build \
               -trimpath -ldflags="-s -w" \
-              -o bin/safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }} ./cmd/safer-exec/
+              -o bin/safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }}${ext} ./cmd/safer-exec/
           else
             CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build \
               -ldflags="-s -w" \
@@ -57,7 +67,80 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }}
-          path: go/bin/safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }}
+          path: go/bin/safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }}*
+
+  # The Windows engine drives the Microsoft eXecution Container executor,
+  # built here from the commit pinned in .github/scripts/build-mxc.ps1.
+  build-mxc:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            mxc-arch: x64
+            runner: windows-2025
+          - arch: arm64
+            mxc-arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Build wxc-exec.exe
+        shell: pwsh
+        run: ./.github/scripts/build-mxc.ps1 -Arch ${{ matrix.mxc-arch }} -OutDir mxc-bin
+
+      - name: Upload MXC executor
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: mxc-windows-${{ matrix.arch }}
+          path: mxc-bin/
+          if-no-files-found: error
+
+  test-go-windows:
+    needs: [build-mxc]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-2025
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Download MXC executor
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: mxc-windows-${{ matrix.arch }}
+          path: mxc-bin
+
+      - name: MXC host probe
+        shell: pwsh
+        run: ./mxc-bin/wxc-exec.exe --probe
+
+      # The engine integration tests skip themselves when the runner image
+      # lacks the BaseContainer API; the translation and job-object tests
+      # always run.
+      - name: Run Go tests
+        shell: pwsh
+        run: |
+          $env:SAFER_EXEC_MXC_EXEC = (Resolve-Path mxc-bin/wxc-exec.exe).Path
+          cd go
+          go vet ./...
+          go test -v ./...
 
   check-bpf-objects:
     runs-on: ubuntu-latest
@@ -190,8 +273,67 @@ jobs:
           cd npm
           npm run test:security test:exhaustion
 
+  test-node-windows:
+    needs: [build-mxc]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-2025
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Download MXC executor
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: mxc-windows-${{ matrix.arch }}
+          path: mxc-bin
+
+      - name: Build Go engine
+        shell: pwsh
+        run: |
+          cd go
+          go build -trimpath -ldflags="-s -w" -o bin/safer-exec-rt.exe ./cmd/safer-exec/
+          Copy-Item ../mxc-bin/wxc-exec.exe bin/
+
+      - name: Run diagnostics
+        shell: pwsh
+        run: |
+          cd npm
+          node src/cli.js diagnostics
+
+      # cli.test.js, fsdiff.test.js and harness.test.js drive POSIX commands
+      # (echo, sh -c) and paths; windows.test.js covers the same paths with
+      # Windows tools.
+      - name: Run unit and Windows end-to-end tests
+        shell: pwsh
+        run: |
+          cd npm
+          $tests = Get-ChildItem src -Filter *.test.js -Recurse |
+            Where-Object { $_.Name -notin 'cli.test.js', 'fsdiff.test.js', 'harness.test.js' } |
+            ForEach-Object { $_.FullName }
+          node --test $tests
+
   publish:
-    needs: [build-go, check-bpf-objects, test-go, test-node]
+    needs: [build-go, build-mxc, check-bpf-objects, test-go, test-go-windows, test-node, test-node-windows]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     permissions:
@@ -207,6 +349,12 @@ jobs:
         with:
           pattern: safer-exec-rt-*
           path: binaries/
+
+      - name: Download MXC executors
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: mxc-windows-*
+          path: mxc/
 
       - name: Set up Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
@@ -227,7 +375,7 @@ jobs:
 
           # Package each binary into its own npm package
           for binary in binaries/safer-exec-rt-*/safer-exec-rt-*; do
-            binary_name=$(basename "$binary")
+            binary_name=$(basename "$binary" .exe)
             platform=$(echo "$binary_name" | cut -d- -f4,5)
             pkg_name="@cdxgen/safer-exec-${platform}"
             os_name=$(echo "$platform" | cut -d- -f1)
@@ -235,17 +383,28 @@ jobs:
               *-arm64) cpu="arm64" ;;
               *) cpu="x64" ;;
             esac
+            main="bin/safer-exec-rt"
             mkdir -p "publish-${platform}/bin"
-            cp "$binary" "publish-${platform}/bin/safer-exec-rt"
+            if [[ "$os_name" == "windows" ]]; then
+              # npm names the platform win32. The engine finds the MXC
+              # executor next to itself.
+              os_name="win32"
+              main="bin/safer-exec-rt.exe"
+              cp "$binary" "publish-${platform}/${main}"
+              cp mxc/mxc-${platform}/wxc-exec.exe mxc/mxc-${platform}/MXC-LICENSE.md mxc/mxc-${platform}/MXC-VERSION "publish-${platform}/bin/"
+            else
+              cp "$binary" "publish-${platform}/${main}"
+            fi
             jq -n \
               --arg name "$pkg_name" \
               --arg version "$version" \
               --arg os "$os_name" \
               --arg cpu "$cpu" \
+              --arg main "$main" \
               '{
                 name: $name,
                 version: $version,
-                main: "bin/safer-exec-rt",
+                main: $main,
                 files: ["bin/"],
                 license: "MIT",
                 repository: {

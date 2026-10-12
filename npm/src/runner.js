@@ -63,21 +63,21 @@ export function resolveBinaryPath() {
   const currentPlatform = platform();
   const currentArch = arch();
   const localArch = currentArch === 'x64' ? 'amd64' : currentArch;
+  const isWindows = currentPlatform === 'win32';
+  // Go names the platform "windows"; executables need the .exe suffix.
+  const goPlatform = isWindows ? 'windows' : currentPlatform;
+  const exeSuffix = isWindows ? '.exe' : '';
 
   // Try platform-arch specific locally compiled binary first
-  const platformArchBinary = join(__dirname, '..', '..', 'go', 'bin', `safer-exec-rt-${currentPlatform}-${localArch}`);
-  try {
-    readFileSync(platformArchBinary);
+  const platformArchBinary = join(__dirname, '..', '..', 'go', 'bin', `safer-exec-rt-${goPlatform}-${localArch}${exeSuffix}`);
+  if (existsSync(platformArchBinary)) {
     return platformArchBinary;
-  } catch {}
+  }
 
   // Try standard locally compiled binary
-  const localBinary = join(__dirname, '..', '..', 'go', 'bin', 'safer-exec-rt');
-  try {
-    readFileSync(localBinary);
+  const localBinary = join(__dirname, '..', '..', 'go', 'bin', `safer-exec-rt${exeSuffix}`);
+  if (existsSync(localBinary)) {
     return localBinary;
-  } catch {
-    // Not compiled yet
   }
 
   // Try to resolve from platform-specific optional dependencies
@@ -94,6 +94,14 @@ export function resolveBinaryPath() {
       pkgName = "@cdxgen/safer-exec-linux-amd64";
     } else if (currentArch === "arm64") {
       pkgName = "@cdxgen/safer-exec-linux-arm64";
+    }
+  } else if (isWindows) {
+    // The Windows packages also ship the MXC executor (wxc-exec.exe) next to
+    // the engine, which is where the engine looks for it.
+    if (currentArch === "x64") {
+      pkgName = "@cdxgen/safer-exec-windows-amd64";
+    } else if (currentArch === "arm64") {
+      pkgName = "@cdxgen/safer-exec-windows-arm64";
     }
   }
 
@@ -121,7 +129,7 @@ export function resolveBinaryPath() {
 
     for (const modulesDir of searchDirs) {
       // Direct structure under node_modules
-      const directPath = join(modulesDir, pkgName, "bin", "safer-exec-rt");
+      const directPath = join(modulesDir, pkgName, "bin", `safer-exec-rt${exeSuffix}`);
       let realDirectPath;
       try {
         realDirectPath = realpathSync(directPath);
@@ -129,10 +137,12 @@ export function resolveBinaryPath() {
         realDirectPath = directPath;
       }
       if (existsSync(realDirectPath)) {
-        try {
-          chmodSync(realDirectPath, 0o755);
-        } catch (_err) {
-          // ignore
+        if (!isWindows) {
+          try {
+            chmodSync(realDirectPath, 0o755);
+          } catch (_err) {
+            // ignore
+          }
         }
         return realDirectPath;
       }
@@ -143,6 +153,10 @@ export function resolveBinaryPath() {
       err.message,
     );
   }
+  if (isWindows) {
+    // PATH resolution by name; the engine finds wxc-exec.exe next to itself.
+    return 'safer-exec-rt.exe';
+  }
   // Try PATH
   const defaultGlobalPath = '/usr/local/bin/safer-exec-rt';
   try {
@@ -151,6 +165,38 @@ export function resolveBinaryPath() {
     }
   } catch {}
   return 'safer-exec-rt';
+}
+
+/**
+ * Options for spawning the engine. On POSIX the engine leads its own process
+ * group so a timeout can kill the whole tree. On Windows "detached" would
+ * give it a separate console instead; the engine's job object already ties
+ * the sandboxed tree to the engine's lifetime.
+ *
+ * @returns {import('node:child_process').SpawnOptions}
+ */
+export function engineSpawnOptions() {
+  if (platform() === 'win32') {
+    return { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true };
+  }
+  return { stdio: ['pipe', 'pipe', 'pipe'], detached: true };
+}
+
+/**
+ * Kill the engine after a timeout: the whole process group on POSIX, and on
+ * Windows the engine itself, whose job object then terminates the sandbox.
+ *
+ * @param {import('node:child_process').ChildProcess} child
+ */
+export function killEngine(child) {
+  if (platform() !== 'win32') {
+    try {
+      // Kill the entire process group, not just the unshare parent
+      process.kill(-child.pid, 'SIGKILL');
+      return;
+    } catch {}
+  }
+  child.kill('SIGKILL');
 }
 
 /**
@@ -168,10 +214,7 @@ export async function run(config, options = {}) {
   const binaryPath = options.binaryPath || resolveBinaryPath();
   const timeout = options.timeout || 60000;
 
-  const child = spawn(binaryPath, [], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: true,
-  });
+  const child = spawn(binaryPath, [], engineSpawnOptions());
 
   const configJson = JSON.stringify(config);
 
@@ -187,12 +230,7 @@ export async function run(config, options = {}) {
   let timedOut = false;
   const timeoutId = setTimeout(() => {
     timedOut = true;
-    try {
-      // Kill the entire process group, not just the unshare parent
-      process.kill(-child.pid, 'SIGKILL');
-    } catch (e) {
-      child.kill('SIGKILL');
-    }
+    killEngine(child);
   }, timeout);
 
   const { stdout, stderr, status, realtimeAuditLog } = await new Promise((resolve, reject) => {
@@ -522,10 +560,7 @@ export async function runPipe(config, options = {}) {
     config.structuredOutputPath = '';
   }
 
-  const child = spawn(binaryPath, [], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: true,
-  });
+  const child = spawn(binaryPath, [], engineSpawnOptions());
 
   const configJson = JSON.stringify(config);
   if (configJson === undefined) {
@@ -595,11 +630,7 @@ export async function runPipe(config, options = {}) {
   let timedOut = false;
   const timeoutId = setTimeout(() => {
     timedOut = true;
-    try {
-      process.kill(-child.pid, 'SIGKILL');
-    } catch (e) {
-      child.kill('SIGKILL');
-    }
+    killEngine(child);
   }, timeout);
 
   return new Promise((resolve, reject) => {
