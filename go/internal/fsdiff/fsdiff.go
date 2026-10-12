@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
 )
@@ -26,39 +25,60 @@ type SnapshotEntry struct {
 	ModTime int64
 }
 
-// Snapshot represents a point-in-time view of a directory tree.
-// Keys are relative paths from the root being snapshotted.
+// Snapshot represents a point-in-time view of one or more directory trees.
+// Keys are absolute paths spelled under the root they were found through
+// (the same value as SnapshotEntry.Path), so entries under different roots
+// never collide.
 type Snapshot map[string]SnapshotEntry
 
-// SnapshotPath walks the given root directory and returns a Snapshot
-// of all files and directories. It skips symlinks and special files.
-// Only files under [roots] are walked.
+// SnapshotPath walks the given roots and returns a Snapshot of all files and
+// directories under them. Symlinks inside a root are recorded, not followed;
+// a root that is itself a symlink (macOS /tmp → /private/tmp) is walked
+// through to its target and reported under the given spelling. A tree
+// reachable through more than one root (a root nested in or aliasing an
+// earlier one) is recorded once, under the first root that reaches it.
+// Nonexistent roots are skipped.
 func SnapshotPath(roots ...string) (Snapshot, error) {
 	snap := make(Snapshot)
+	// Resolved locations already recorded, so overlapping roots do not
+	// report the same file twice under different spellings.
+	seen := make(map[string]struct{})
 
-	for _, root := range roots {
-		root, err := filepath.Abs(root)
+	for _, given := range roots {
+		root, err := filepath.Abs(given)
 		if err != nil {
-			return nil, fmt.Errorf("resolve path %s: %w", root, err)
+			return nil, fmt.Errorf("resolve path %s: %w", given, err)
 		}
 
 		// Skip if root doesn't exist
 		if _, err := os.Stat(root); err != nil {
 			continue
 		}
+		// filepath.Walk does not follow a symlinked root; walk its target.
+		walkRoot := root
+		if resolved, err := filepath.EvalSymlinks(root); err == nil {
+			walkRoot = resolved
+		}
 
-		err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		err = filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return nil // skip errors during walk
 			}
-
-			rel := path
-			if root != "/" {
-				rel = strings.TrimPrefix(path, root)
-				rel = strings.TrimPrefix(rel, string(filepath.Separator))
+			if _, dup := seen[path]; dup {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
 			}
-			if rel == "" {
-				rel = "."
+			seen[path] = struct{}{}
+
+			reported := path
+			if walkRoot != root {
+				rel, err := filepath.Rel(walkRoot, path)
+				if err != nil {
+					return nil
+				}
+				reported = filepath.Join(root, rel)
 			}
 
 			hash := ""
@@ -66,8 +86,8 @@ func SnapshotPath(roots ...string) (Snapshot, error) {
 				hash = fileHash(path)
 			}
 
-			snap[rel] = SnapshotEntry{
-				Path:    path,
+			snap[reported] = SnapshotEntry{
+				Path:    reported,
 				Mode:    uint32(info.Mode()),
 				Size:    info.Size(),
 				IsDir:   info.IsDir(),
@@ -97,15 +117,17 @@ func Diff(before, after Snapshot) config.FSDiff {
 			// hash is unavailable on both sides (over the size cap, or
 			// unreadable), mtime is the fallback signal for regular files —
 			// the cap then costs hash precision, not change detection.
-			// Directories keep mode/size comparison: their mtime tracks entry
-			// churn, which would report every directory containing an add or
-			// delete as "modified".
-			modified := afterEntry.Hash != beforeEntry.Hash ||
-				afterEntry.Size != beforeEntry.Size ||
-				afterEntry.Mode != beforeEntry.Mode
-			if !modified && !afterEntry.IsDir &&
-				afterEntry.Hash == "" && beforeEntry.Hash == "" {
-				modified = afterEntry.ModTime != beforeEntry.ModTime
+			// Directories compare mode only: their mtime and size (APFS,
+			// tmpfs, ext4 block growth) track entry churn, which would report
+			// every directory containing an add or delete as "modified" when
+			// the added/deleted entries already describe the change.
+			modified := afterEntry.Mode != beforeEntry.Mode
+			if !modified && !afterEntry.IsDir {
+				modified = afterEntry.Hash != beforeEntry.Hash ||
+					afterEntry.Size != beforeEntry.Size
+				if !modified && afterEntry.Hash == "" && beforeEntry.Hash == "" {
+					modified = afterEntry.ModTime != beforeEntry.ModTime
+				}
 			}
 			if modified {
 				diff.Modified = append(diff.Modified, config.FSDiffEntry{

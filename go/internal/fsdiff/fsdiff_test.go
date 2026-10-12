@@ -2,6 +2,7 @@
 package fsdiff_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,9 +18,9 @@ func TestSnapshotPath_EmptyDir(t *testing.T) {
 		t.Fatalf("SnapshotPath failed: %v", err)
 	}
 
-	// Should have at least the "." entry
-	if _, ok := snap["."]; !ok {
-		t.Error("snapshot should contain '.' entry for the root directory")
+	// Should have at least the root's own entry
+	if _, ok := snap[dir]; !ok {
+		t.Error("snapshot should contain an entry for the root directory")
 	}
 }
 
@@ -51,16 +52,16 @@ func TestSnapshotPath_WithFiles(t *testing.T) {
 	}
 
 	// Verify entries
-	if _, ok := snap["file_a.txt"]; !ok {
+	if _, ok := snap[fileA]; !ok {
 		t.Error("snapshot should contain file_a.txt")
 	}
-	if _, ok := snap["file_b.txt"]; !ok {
+	if _, ok := snap[fileB]; !ok {
 		t.Error("snapshot should contain file_b.txt")
 	}
-	if _, ok := snap[filepath.Join("subdir", "file_c.txt")]; !ok {
+	if _, ok := snap[fileC]; !ok {
 		t.Error("snapshot should contain subdir/file_c.txt")
 	}
-	if entry, ok := snap["subdir"]; !ok || !entry.IsDir {
+	if entry, ok := snap[subdir]; !ok || !entry.IsDir {
 		t.Error("snapshot should contain subdir as a directory")
 	}
 }
@@ -281,5 +282,158 @@ func TestDiff_SortedOutput(t *testing.T) {
 			t.Errorf("added files should be sorted: %q < %q",
 				diff.Added[i].Path, diff.Added[i-1].Path)
 		}
+	}
+}
+
+// Two write roots holding files with the same relative path must not shadow
+// each other: a change under the first root has to be reported even though
+// the second root has an unchanged file (and root entry) of the same name.
+func TestDiff_SameRelativePathAcrossRoots(t *testing.T) {
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	for _, root := range []string{rootA, rootB} {
+		if err := os.WriteFile(filepath.Join(root, "package.json"), []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "gone.txt"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before, err := fsdiff.SnapshotPath(rootA, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{rootA, rootB, filepath.Join(rootA, "package.json"), filepath.Join(rootB, "package.json")} {
+		if _, ok := before[p]; !ok {
+			t.Errorf("snapshot is missing %s", p)
+		}
+	}
+
+	modified := filepath.Join(rootA, "package.json")
+	if err := os.WriteFile(modified, []byte(`{"name":"changed"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deleted := filepath.Join(rootA, "gone.txt")
+	if err := os.Remove(deleted); err != nil {
+		t.Fatal(err)
+	}
+	added := filepath.Join(rootB, "new.txt")
+	if err := os.WriteFile(added, []byte("n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := fsdiff.SnapshotPath(rootA, rootB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff := fsdiff.Diff(before, after)
+
+	if len(diff.Modified) != 1 || diff.Modified[0].Path != modified {
+		t.Errorf("modified = %+v, want only %s", diff.Modified, modified)
+	}
+	if len(diff.Deleted) != 1 || diff.Deleted[0].Path != deleted {
+		t.Errorf("deleted = %+v, want only %s", diff.Deleted, deleted)
+	}
+	if len(diff.Added) != 1 || diff.Added[0].Path != added {
+		t.Errorf("added = %+v, want only %s", diff.Added, added)
+	}
+}
+
+// A root nested inside another (or listed twice) is recorded once, under the
+// first root that reaches it, so its changes are not reported twice.
+func TestSnapshotPath_OverlappingRoots(t *testing.T) {
+	outer := t.TempDir()
+	inner := filepath.Join(outer, "inner")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := fsdiff.SnapshotPath(outer, inner, outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 2 {
+		t.Errorf("snapshot has %d entries, want 2 (outer, inner): %v", len(before), before)
+	}
+	if err := os.WriteFile(filepath.Join(inner, "f.txt"), []byte("f"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after, err := fsdiff.SnapshotPath(inner, outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff := fsdiff.Diff(before, after)
+	if len(diff.Added) != 1 || diff.Added[0].Path != filepath.Join(inner, "f.txt") {
+		t.Errorf("added = %+v, want only inner/f.txt", diff.Added)
+	}
+	if len(diff.Modified) != 0 || len(diff.Deleted) != 0 {
+		t.Errorf("unexpected modified=%+v deleted=%+v", diff.Modified, diff.Deleted)
+	}
+}
+
+// A root that is itself a symlink (macOS /tmp → /private/tmp) is walked
+// through to its target and reported under the spelling the caller gave.
+func TestSnapshotPath_SymlinkedRoot(t *testing.T) {
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	before, err := fsdiff.SnapshotPath(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := before[link]; !ok || !e.IsDir {
+		t.Fatalf("root entry %s missing or not a directory: %+v", link, before)
+	}
+	created := filepath.Join(link, "created.txt")
+	if err := os.WriteFile(created, []byte("c"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after, err := fsdiff.SnapshotPath(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff := fsdiff.Diff(before, after)
+	if len(diff.Added) != 1 || diff.Added[0].Path != created {
+		t.Errorf("added = %+v, want only %s", diff.Added, created)
+	}
+}
+
+// Entry churn inside a directory is described by the added/deleted entries;
+// the directory itself is modified only when its mode changes.
+func TestDiff_DirectoryModifiedOnlyByMode(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := fsdiff.SnapshotPath(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 20 {
+		if err := os.WriteFile(filepath.Join(sub, fmt.Sprintf("f%02d.txt", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, err := fsdiff.SnapshotPath(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := fsdiff.Diff(before, after); len(d.Added) != 20 || len(d.Modified) != 0 {
+		t.Errorf("entry churn: added=%d modified=%+v, want 20 added and none modified", len(d.Added), d.Modified)
+	}
+
+	if err := os.Chmod(sub, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(sub, 0o755)
+	chmodded, err := fsdiff.SnapshotPath(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := fsdiff.Diff(after, chmodded); len(d.Modified) != 1 || d.Modified[0].Path != sub {
+		t.Errorf("mode change: modified=%+v, want only %s", d.Modified, sub)
 	}
 }
