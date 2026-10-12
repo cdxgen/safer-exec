@@ -4,7 +4,7 @@ This skill guides AI agents on using the `safer-exec` CLI tool and Node.js API f
 
 ## Overview
 
-`safer-exec` runs commands inside an OS-level sandbox with configurable policies, resource limits, filesystem diffing, and behavioral auto-profiling. It uses Seatbelt on macOS and namespace/seccomp/Landlock isolation on Linux.
+`safer-exec` runs commands inside an OS-level sandbox with configurable policies, resource limits, filesystem diffing, and behavioral auto-profiling. It uses Seatbelt on macOS, namespace/seccomp/Landlock isolation on Linux, and a Microsoft eXecution Container (MXC) with job-object limits on Windows.
 
 ## CLI Quick Reference
 
@@ -52,7 +52,7 @@ safer-exec [OPTIONS] -- COMMAND [ARGS...]
 
 Available: `npm`, `pnpm`, `yarn`, `pypi`, `maven`, `cargo`, `rubygems`, `composer`, `deno`, `gomod`, `bun`
 
-Each policy is platform-aware and configures registry hosts, SSL cert paths, cache directories, and build directories for the ecosystem.
+Each policy configures registry hosts, SSL cert paths, cache directories, and build directories for the ecosystem on macOS and Linux. On Windows the policies' POSIX paths are skipped, so add the Windows locations (for example `%LOCALAPPDATA%\npm-cache`) with `--read-path`/`--write-path` or a policy file.
 
 ## Use Cases
 
