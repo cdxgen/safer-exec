@@ -1,0 +1,19 @@
+go/go.mod
+  s_8e2e56a6e30dd2::t_959d9b5114e1cb 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0abf0cbbe2ec33919919f27f0b8103d5ccfd2b55",
+  "prompts": {},
+  "sessions": {
+    "s_8e2e56a6e30dd2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5ed2dd81-dd5b-4fe6-bbec-93c3fbda6c81",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
