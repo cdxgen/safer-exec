@@ -70,8 +70,11 @@ jobs:
           path: go/bin/safer-exec-rt-${{ matrix.os }}-${{ matrix.arch }}*
 
   # The Windows engine drives the Microsoft eXecution Container executor,
-  # built here from the commit pinned in .github/scripts/build-mxc.ps1.
+  # built here from the commit pinned in .github/scripts/build-mxc.ps1. The
+  # build output is cached under a key derived from that script, so it is
+  # rebuilt only when the pin or the build steps change.
   build-mxc:
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -88,7 +91,15 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Restore MXC build
+        id: mxc-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: mxc-bin
+          key: mxc-${{ matrix.mxc-arch }}-${{ hashFiles('.github/scripts/build-mxc.ps1') }}
+
       - name: Build wxc-exec.exe
+        if: steps.mxc-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: ./.github/scripts/build-mxc.ps1 -Arch ${{ matrix.mxc-arch }} -OutDir mxc-bin
 
@@ -101,6 +112,7 @@ jobs:
 
   test-go-windows:
     needs: [build-mxc]
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -127,16 +139,24 @@ jobs:
           name: mxc-windows-${{ matrix.arch }}
           path: mxc-bin
 
+      # The probe reports which containment tier this runner image offers;
+      # Windows Server images are outside MXC's supported list and usually
+      # lack the BaseContainer API.
       - name: MXC host probe
         shell: pwsh
-        run: ./mxc-bin/wxc-exec.exe --probe
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          ./mxc-bin/wxc-exec.exe --probe
 
-      # The engine integration tests skip themselves when the runner image
-      # lacks the BaseContainer API; the translation and job-object tests
-      # always run.
+      # The engine integration tests skip themselves unless the probe reports
+      # the BaseContainer tier; the translation, quoting and job-object tests
+      # always run. $PSNativeCommandUseErrorActionPreference makes a failing
+      # go vet stop the step (pwsh otherwise reports only the last command).
       - name: Run Go tests
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           $env:SAFER_EXEC_MXC_EXEC = (Resolve-Path mxc-bin/wxc-exec.exe).Path
           cd go
           go vet ./...
@@ -275,6 +295,7 @@ jobs:
 
   test-node-windows:
     needs: [build-mxc]
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -310,6 +331,8 @@ jobs:
       - name: Build Go engine
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cd go
           go build -trimpath -ldflags="-s -w" -o bin/safer-exec-rt.exe ./cmd/safer-exec/
           Copy-Item ../mxc-bin/wxc-exec.exe bin/
@@ -317,20 +340,21 @@ jobs:
       - name: Run diagnostics
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           cd npm
           node src/cli.js diagnostics
 
-      # cli.test.js, fsdiff.test.js and harness.test.js drive POSIX commands
-      # (echo, sh -c) and paths; windows.test.js covers the same paths with
-      # Windows tools.
-      - name: Run unit and Windows end-to-end tests
+      # Most Node suites run POSIX tools (echo, sh -c, id) or assert POSIX
+      # paths, and the built-in ecosystem policies are written for macOS and
+      # Linux. Windows runs the suites that are platform-neutral plus
+      # windows.test.js, which exercises the engine end to end with Windows
+      # tools; the rest run on the Linux and macOS jobs above.
+      - name: Run portable unit and Windows end-to-end tests
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           cd npm
-          $tests = Get-ChildItem src -Filter *.test.js -Recurse |
-            Where-Object { $_.Name -notin 'cli.test.js', 'fsdiff.test.js', 'harness.test.js' } |
-            ForEach-Object { $_.FullName }
-          node --test $tests
+          node --test src/windows.test.js src/crypto.test.js src/env.test.js src/hardening.test.js src/net.test.js
 
   publish:
     needs: [build-go, build-mxc, check-bpf-objects, test-go, test-go-windows, test-node, test-node-windows]
@@ -361,8 +385,15 @@ jobs:
         with:
           node-version: "24"
           package-manager-cache: false
+      # Every package is staged before anything is published, and a package
+      # whose version is already on the registry is skipped, so a run that
+      # stops partway (for example, a new package without a trusted
+      # publisher configured yet) can be re-run without "version exists"
+      # failures. New package names need a first manual publish and a
+      # trusted-publisher entry on npmjs.com before OIDC publishing works.
       - name: Publish packages
         run: |
+          set -euo pipefail
           # Extract version from npm/package.json
           version=$(jq -r '.version' npm/package.json)
 
@@ -373,7 +404,18 @@ jobs:
             publish_opts=(--dry-run --access public)
           fi
 
-          # Package each binary into its own npm package
+          publish() {
+            local dir=$1 name
+            name=$(jq -r '.name' "$dir/package.json")
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "${name}@${version} is already published; skipping"
+              return
+            fi
+            (cd "$dir" && npm publish "${publish_opts[@]}")
+          }
+
+          # Stage each binary as its own npm package
+          staged=()
           for binary in binaries/safer-exec-rt-*/safer-exec-rt-*; do
             binary_name=$(basename "$binary" .exe)
             platform=$(echo "$binary_name" | cut -d- -f4,5)
@@ -391,7 +433,8 @@ jobs:
               os_name="win32"
               main="bin/safer-exec-rt.exe"
               cp "$binary" "publish-${platform}/${main}"
-              cp mxc/mxc-${platform}/wxc-exec.exe mxc/mxc-${platform}/MXC-LICENSE.md mxc/mxc-${platform}/MXC-VERSION "publish-${platform}/bin/"
+              cp mxc/mxc-${platform}/wxc-exec.exe mxc/mxc-${platform}/MXC-LICENSE.md mxc/mxc-${platform}/MXC-VERSION \
+                mxc/mxc-${platform}/MXC-THIRD-PARTY.md "publish-${platform}/bin/"
             else
               cp "$binary" "publish-${platform}/${main}"
             fi
@@ -418,9 +461,9 @@ jobs:
                 os: [$os],
                 cpu: [$cpu]
               }' > "publish-${platform}/package.json"
-            cd "publish-${platform}"
-            npm publish "${publish_opts[@]}"
-            cd ..
+            staged+=("publish-${platform}")
           done
-          cd npm
-          npm publish "${publish_opts[@]}"
+          for dir in "${staged[@]}"; do
+            publish "$dir"
+          done
+          publish npm
