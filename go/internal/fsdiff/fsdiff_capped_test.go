@@ -31,8 +31,8 @@ func TestDiffDetectsCappedFileModification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if before["blob.bin"].Hash != "" {
-		t.Fatalf("expected capped file to have empty hash, got %q", before["blob.bin"].Hash)
+	if before[blob].Hash != "" {
+		t.Fatalf("expected capped file to have empty hash, got %q", before[blob].Hash)
 	}
 
 	// Same size, same mode, different content — with an mtime delta beyond
