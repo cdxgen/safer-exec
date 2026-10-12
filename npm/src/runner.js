@@ -3,28 +3,30 @@
  * and captures stdout/stderr/exitCode with timeout support, audit log parsing,
  * filesystem diff output, and learned policy output.
  *
- * ## Structured output protocol
+ * ## Report channel
  *
- * The Go binary communicates structured data (fsDiff, learnedPolicy, profile)
- * back to Node.js via one of two mechanisms:
+ * The sandboxed command writes to the same stdout and stderr as the engine,
+ * so nothing parsed from those streams can be trusted: a command could print
+ * a line that looks like an audit entry or a `FSDIFF:` result. The engine
+ * therefore sends its audit entries and structured results (fsDiff,
+ * learnedPolicy, crypto, dryRun, profile) over a separate pipe, stdio[3],
+ * named in `config.reportFd`, which the command never inherits. Each line on
+ * it is one JSON object: `{"audit": {...}}` or `{"result": "FSDIFF", "data": ...}`.
+ * stdout and stderr carry only the command's output and the engine's own
+ * `safer-exec:` messages, and are passed through untouched.
  *
- * - **Buffered mode** (`run`): markers are written to stdout alongside regular
- *   output, prefixed with `FSDIFF:`, `LEARNED:`, or `PROFILE:`. After the
- *   process exits, `parseStructuredOutput` separates markers from clean stdout.
- *
- * - **Streaming mode** (`runPipe`): a temporary file path is passed to the Go
- *   binary via `config.structuredOutputPath`. The binary writes markers to
- *   that file instead of stdout, leaving stdout clean for raw real-time piping.
- *   After the process exits, `readStructuredFile` parses the file and deletes it.
+ * `parseStructuredOutput`, `readStructuredFile` and `parseAuditLog` read the
+ * older stdout/stderr/file protocol, which the engine still uses when it is
+ * run without a report channel (by hand, or from its own tests).
  *
  * @module runner
  */
 
-import { spawn, execSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { basename, dirname, join, win32 } from 'node:path';
-import { readFileSync, existsSync, mkdtempSync, rmSync, copyFileSync, chmodSync, realpathSync } from 'node:fs';
-import { tmpdir, platform, arch } from 'node:os';
+import { readFileSync, existsSync, chmodSync, realpathSync } from 'node:fs';
+import { platform, arch } from 'node:os';
 import { createRequire } from 'node:module';
 
 /**
@@ -220,10 +222,106 @@ function requireBinaryPath(override) {
  * @returns {import('node:child_process').SpawnOptions}
  */
 export function engineSpawnOptions() {
+  // stdio[3] is the report channel (see the module comment).
+  const stdio = ['pipe', 'pipe', 'pipe', 'pipe'];
   if (platform() === 'win32') {
-    return { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true };
+    return { stdio, windowsHide: true };
   }
-  return { stdio: ['pipe', 'pipe', 'pipe'], detached: true };
+  return { stdio, detached: true };
+}
+
+/** File descriptor of the report channel in the engine (stdio[3]). */
+export const REPORT_FD = 3;
+
+/**
+ * Reads the engine's report channel: newline-delimited JSON objects that are
+ * either an audit entry (`{"audit": {...}}`) or a structured result
+ * (`{"result": "FSDIFF", "data": ...}`). Malformed lines are ignored; when a
+ * result arrives more than once the last one wins.
+ *
+ * @param {(entry: object) => void} onAudit - Called for each audit entry
+ * @returns {{ push: (chunk: Buffer|string) => void, end: () => void, results: { fsDiff: object|null, learnedPolicy: object|null, crypto: object|null, dryRun: object|null, profile: string|null } }}
+ */
+export function createReportParser(onAudit) {
+  const results = { fsDiff: null, learnedPolicy: null, crypto: null, dryRun: null, profile: null };
+  const state = { opened: false };
+  const keys = { FSDIFF: 'fsDiff', LEARNED: 'learnedPolicy', CRYPTO: 'crypto', DRYRUN: 'dryRun' };
+  let buffer = '';
+  const handle = (line) => {
+    if (!line.trim()) {
+      return;
+    }
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg !== 'object') {
+      return;
+    }
+    if (msg.report !== undefined) {
+      state.opened = true;
+    } else if (msg.audit !== undefined) {
+      if (isValidAuditEntry(msg.audit)) {
+        onAudit(msg.audit);
+      }
+    } else if (msg.result === 'PROFILE') {
+      results.profile = typeof msg.data === 'string' ? msg.data : JSON.stringify(msg.data);
+    } else if (keys[msg.result]) {
+      results[keys[msg.result]] = msg.data ?? null;
+    }
+  };
+  return {
+    push(chunk) {
+      buffer += chunk.toString('utf-8');
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        handle(line);
+      }
+    },
+    end() {
+      handle(buffer);
+      buffer = '';
+    },
+    results,
+    /** Whether the engine opened the channel (its first line). */
+    get opened() {
+      return state.opened;
+    },
+  };
+}
+
+/**
+ * The warning shown when the engine never opened the report channel: an
+ * engine binary older than this package prints its results to stdout and
+ * stderr, where they are no longer read.
+ */
+const REPORT_MISSING =
+  'safer-exec: warning: the engine did not open its report channel, so audit entries and results are unavailable; ' +
+  'is safer-exec-rt older than @cdxgen/safer-exec?\n';
+
+/**
+ * Resolves once the report channel has been read to its end, or right away
+ * when the engine has none.
+ *
+ * @param {import('node:stream').Readable|undefined} stream
+ * @param {ReturnType<typeof createReportParser>} parser
+ * @returns {Promise<void>}
+ */
+function readReport(stream, parser) {
+  if (!stream) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    stream.on('data', (chunk) => parser.push(chunk));
+    stream.on('error', () => {});
+    stream.on('close', () => {
+      parser.end();
+      resolve();
+    });
+  });
 }
 
 /**
@@ -250,7 +348,7 @@ export function killEngine(child) {
  * @param {object} [options] - Runner options
  * @param {string} [options.binaryPath] - Override the default binary path
  * @param {number} [options.timeout=60000] - Timeout in milliseconds
- * @param {boolean} [options.enableAudit=false] - Whether to parse audit logs from stderr
+ * @param {boolean} [options.enableAudit=false] - Collect audit entries from the report channel
  * @param {boolean} [options.pipeStdout=false] - Pipe stdout/stderr directly (for CLI)
  * @returns {Promise<ExecResult>} The execution result
  */
@@ -260,14 +358,8 @@ export async function run(config, options = {}) {
 
   const child = spawn(binaryPath, [], engineSpawnOptions());
 
-  const configJson = JSON.stringify(config);
-
-  // Write config to stdin
-  if (configJson === undefined) {
-    child.stdin.write('{}');
-  } else {
-    child.stdin.write(configJson);
-  }
+  const configJson = JSON.stringify({ ...config, reportFd: REPORT_FD });
+  child.stdin.write(configJson);
   child.stdin.end();
 
   // Set up timeout
@@ -277,102 +369,47 @@ export async function run(config, options = {}) {
     killEngine(child);
   }, timeout);
 
-  const { stdout, stderr, status, realtimeAuditLog } = await new Promise((resolve, reject) => {
-    const chunks = { stdout: [], stderr: [] };
-    const realtimeAuditLog = [];
-    let stderrLineBuffer = '';
+  const chunks = { stdout: [], stderr: [] };
+  const auditLog = [];
+  const report = createReportParser((entry) => {
+    if (!options.enableAudit) {
+      return;
+    }
+    auditLog.push(entry);
+    if (options.onAudit) {
+      options.onAudit(entry);
+    }
+    // Audit entries are shown among the stderr output, as the engine used to
+    // print them there, unless the caller collects them on its own.
+    if (!options.suppressLibLoadStderr) {
+      chunks.stderr.push(Buffer.from(JSON.stringify(entry) + '\n'));
+    }
+  });
+  const reportDone = readReport(child.stdio[REPORT_FD], report);
 
+  const status = await new Promise((resolve, reject) => {
     child.stdout.on('data', (chunk) => chunks.stdout.push(chunk));
-    child.stderr.on('data', (chunk) => {
-      if (options.enableAudit) {
-        stderrLineBuffer += chunk.toString('utf-8');
-        const lines = stderrLineBuffer.split('\n');
-        stderrLineBuffer = lines.pop();
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) {
-            chunks.stderr.push(Buffer.from('\n'));
-            continue;
-          }
-
-          let parsed = null;
-          try {
-            const entry = JSON.parse(trimmed);
-            if (isValidAuditEntry(entry)) {
-              parsed = entry;
-            }
-          } catch {}
-
-          if (parsed) {
-            realtimeAuditLog.push(parsed);
-            if (options.onAudit) {
-              options.onAudit(parsed);
-            }
-            if (!options.suppressLibLoadStderr) {
-              chunks.stderr.push(Buffer.from(line + '\n'));
-            }
-          } else {
-            chunks.stderr.push(Buffer.from(line + '\n'));
-          }
-        }
-      } else {
-        chunks.stderr.push(chunk);
-      }
-    });
-
+    child.stderr.on('data', (chunk) => chunks.stderr.push(chunk));
     child.on('error', (err) => {
       clearTimeout(timeoutId);
       reject(err);
     });
     child.on('close', (code) => {
       clearTimeout(timeoutId);
-      if (options.enableAudit && stderrLineBuffer.trim()) {
-        const line = stderrLineBuffer;
-        const trimmed = line.trim();
-        let parsed = null;
-        try {
-          const entry = JSON.parse(trimmed);
-          if (isValidAuditEntry(entry)) {
-            parsed = entry;
-          }
-        } catch {}
-
-        if (parsed) {
-          realtimeAuditLog.push(parsed);
-          if (options.onAudit) {
-            options.onAudit(parsed);
-          }
-          if (!options.suppressLibLoadStderr) {
-            chunks.stderr.push(Buffer.from(line + '\n'));
-          }
-        } else {
-          chunks.stderr.push(Buffer.from(line + '\n'));
-        }
-      }
-      resolve({
-        stdout: Buffer.concat(chunks.stdout).toString('utf-8'),
-        stderr: Buffer.concat(chunks.stderr).toString('utf-8'),
-        status: code,
-        realtimeAuditLog,
-      });
+      resolve(code);
     });
   });
-
-  // Parse structured output from stdout
-  const { fsDiff, learnedPolicy, crypto, dryRun, profile, cleanStdout } = parseStructuredOutput(stdout);
-
-  // Parse audit log entries from stderr when enabled
-  let auditLog = null;
-  if (options.enableAudit) {
-    auditLog = realtimeAuditLog;
+  await reportDone;
+  if (!report.opened) {
+    chunks.stderr.push(Buffer.from(REPORT_MISSING));
   }
 
+  const { fsDiff, learnedPolicy, crypto, dryRun, profile } = report.results;
   return {
-    stdout: cleanStdout,
-    stderr,
+    stdout: Buffer.concat(chunks.stdout).toString('utf-8'),
+    stderr: Buffer.concat(chunks.stderr).toString('utf-8'),
     exitCode: status ?? 1,
-    auditLog,
+    auditLog: options.enableAudit ? auditLog : null,
     timedOut,
     ...(fsDiff !== null && { fsDiff }),
     ...(learnedPolicy !== null && { learnedPolicy }),
@@ -502,23 +539,6 @@ export function parseAuditLog(stderr) {
 }
 
 /**
- * Run a command through the Go binary, piping stdout/stderr directly
- * to the parent process in real-time. Used by the CLI for live output.
- *
- * Structured output markers (FSDIFF:, LEARNED:, PROFILE:) are intercepted
- * and suppressed from the live stream; they are returned in the resolved
- * value as parsed objects. All other stdout/stderr data is forwarded as
- * soon as it arrives.
- *
- * @param {object} config - The exec config (ExecConfig)
- * @param {object} [options] - Runner options
- * @param {string} [options.binaryPath] - Override the default binary path
- * @param {number} [options.timeout=60000] - Timeout in milliseconds
- * @param {NodeJS.WritableStream} [options.stdout=process.stdout] - Stream to pipe stdout to
- * @param {NodeJS.WritableStream} [options.stderr=process.stderr] - Stream to pipe stderr to
- * @returns {Promise<{ exitCode: number, timedOut: boolean, fsDiff: object|null, learnedPolicy: object|null }>}
- */
-/**
  * Read and parse structured output markers from a file.
  *
  * @param {string} filePath - Path to the structured output file
@@ -573,10 +593,9 @@ export function readStructuredFile(filePath) {
  * Run a command through the Go binary, piping stdout/stderr directly
  * to the parent process in real-time. Used by the CLI for live output.
  *
- * Real-time stdout is piped completely raw and without filtering.
- * Structured output markers (FSDIFF:, LEARNED:, PROFILE:) are written
- * to a temporary file specified in config.structuredOutputPath and
- * read back after the process exits.
+ * stdout and stderr are forwarded raw as they arrive. Audit entries and
+ * structured results come over the report channel; audit entries are also
+ * written to the stderr stream unless `suppressLibLoadStderr` is set.
  *
  * @param {object} config - The exec config (ExecConfig)
  * @param {object} [options] - Runner options
@@ -584,7 +603,10 @@ export function readStructuredFile(filePath) {
  * @param {number} [options.timeout=60000] - Timeout in milliseconds
  * @param {NodeJS.WritableStream} [options.stdout=process.stdout] - Stream to pipe stdout to
  * @param {NodeJS.WritableStream} [options.stderr=process.stderr] - Stream to pipe stderr to
- * @returns {Promise<{ exitCode: number, timedOut: boolean, fsDiff: object|null, learnedPolicy: object|null, profile: string|null }>}
+ * @param {boolean} [options.enableAudit=false] - Collect audit entries
+ * @param {boolean} [options.suppressLibLoadStderr=false] - Keep audit entries out of the stderr stream
+ * @param {(entry: object) => void} [options.onAudit] - Called for each audit entry as it arrives
+ * @returns {Promise<{ exitCode: number, timedOut: boolean, fsDiff: object|null, learnedPolicy: object|null, crypto: object|null, dryRun: object|null, profile: string|null, auditLog: object[]|null }>}
  */
 export async function runPipe(config, options = {}) {
   const binaryPath = requireBinaryPath(options.binaryPath);
@@ -592,26 +614,10 @@ export async function runPipe(config, options = {}) {
   const outStream = options.stdout === null ? null : (options.stdout ?? process.stdout);
   const errStream = options.stderr === null ? null : (options.stderr ?? process.stderr);
 
-  // Create temporary directory and file for structured output redirects
-  let tempDir = null;
-  let structuredPath = null;
-  try {
-    tempDir = mkdtempSync(join(tmpdir(), 'safer-exec-pipe-'));
-    structuredPath = join(tempDir, 'structured.log');
-    config.structuredOutputPath = structuredPath;
-  } catch (err) {
-    // Fail-safe: if temp file creation fails, proceed without StructuredOutputPath
-    config.structuredOutputPath = '';
-  }
-
   const child = spawn(binaryPath, [], engineSpawnOptions());
 
-  const configJson = JSON.stringify(config);
-  if (configJson === undefined) {
-    child.stdin.write('{}');
-  } else {
-    child.stdin.write(configJson);
-  }
+  const configJson = JSON.stringify({ ...config, reportFd: REPORT_FD });
+  child.stdin.write(configJson);
   child.stdin.end();
 
   // Forward stdout and stderr streams directly in real-time
@@ -621,54 +627,29 @@ export async function runPipe(config, options = {}) {
     } else {
       child.stdout.pipe(outStream);
     }
+  } else {
+    child.stdout.resume();
   }
-  const realtimeAuditLog = [];
-  let stderrLineBuffer = '';
-  if (options.enableAudit || errStream) {
-    child.stderr.on('data', (chunk) => {
-      if (options.enableAudit) {
-        stderrLineBuffer += chunk.toString('utf-8');
-        const lines = stderrLineBuffer.split('\n');
-        stderrLineBuffer = lines.pop();
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) {
-            if (errStream) {
-              errStream.write('\n');
-            }
-            continue;
-          }
-
-          let parsed = null;
-          try {
-            const entry = JSON.parse(trimmed);
-            if (isValidAuditEntry(entry)) {
-              parsed = entry;
-            }
-          } catch {}
-
-          if (parsed) {
-            realtimeAuditLog.push(parsed);
-            if (options.onAudit) {
-              options.onAudit(parsed);
-            }
-            if (!options.suppressLibLoadStderr && errStream) {
-              errStream.write(line + '\n');
-            }
-          } else {
-            if (errStream) {
-              errStream.write(line + '\n');
-            }
-          }
-        }
-      } else {
-        if (errStream) {
-          errStream.write(chunk);
-        }
-      }
-    });
+  if (errStream) {
+    child.stderr.on('data', (chunk) => errStream.write(chunk));
+  } else {
+    child.stderr.resume();
   }
+
+  const auditLog = [];
+  const report = createReportParser((entry) => {
+    if (!options.enableAudit) {
+      return;
+    }
+    auditLog.push(entry);
+    if (options.onAudit) {
+      options.onAudit(entry);
+    }
+    if (!options.suppressLibLoadStderr && errStream) {
+      errStream.write(JSON.stringify(entry) + '\n');
+    }
+  });
+  const reportDone = readReport(child.stdio[REPORT_FD], report);
 
   // Set up timeout
   let timedOut = false;
@@ -677,85 +658,30 @@ export async function runPipe(config, options = {}) {
     killEngine(child);
   }, timeout);
 
-  return new Promise((resolve, reject) => {
+  const code = await new Promise((resolve, reject) => {
     child.on('error', (err) => {
       clearTimeout(timeoutId);
-      if (tempDir && existsSync(tempDir)) {
-        try {
-          rmSync(tempDir, { recursive: true, force: true });
-        } catch {}
-      }
       reject(err);
     });
-
-    child.on('close', (code) => {
+    child.on('close', (exitCode) => {
       clearTimeout(timeoutId);
-
-      if (options.enableAudit && stderrLineBuffer.trim()) {
-        const line = stderrLineBuffer;
-        const trimmed = line.trim();
-        let parsed = null;
-        try {
-          const entry = JSON.parse(trimmed);
-          if (isValidAuditEntry(entry)) {
-            parsed = entry;
-          }
-        } catch {}
-
-        if (parsed) {
-          realtimeAuditLog.push(parsed);
-          if (options.onAudit) {
-            options.onAudit(parsed);
-          }
-          if (!options.suppressLibLoadStderr && errStream) {
-            errStream.write(line + '\n');
-          }
-        } else {
-          if (errStream) {
-            errStream.write(line + '\n');
-          }
-        }
-      }
-
-      let fsDiff = null;
-      let learnedPolicy = null;
-      let crypto = null;
-      let dryRun = null;
-      let profile = null;
-
-      // Parse structured output from the temporary file if it was created
-      if (structuredPath) {
-        const parsed = readStructuredFile(structuredPath);
-        fsDiff = parsed.fsDiff;
-        learnedPolicy = parsed.learnedPolicy;
-        crypto = parsed.crypto;
-        dryRun = parsed.dryRun;
-        profile = parsed.profile;
-      }
-
-      // Clean up the temporary directory/file
-      if (tempDir && existsSync(tempDir)) {
-        try {
-          rmSync(tempDir, { recursive: true, force: true });
-        } catch {}
-      }
-
-      let auditLog = null;
-      if (options.enableAudit) {
-        auditLog = realtimeAuditLog;
-      }
-
-      resolve({
-        exitCode: code ?? 1,
-        timedOut,
-        fsDiff,
-        learnedPolicy,
-        crypto,
-        dryRun,
-        profile,
-        auditLog,
-      });
+      resolve(exitCode);
     });
   });
-}
+  await reportDone;
+  if (!report.opened && errStream) {
+    errStream.write(REPORT_MISSING);
+  }
 
+  const { fsDiff, learnedPolicy, crypto, dryRun, profile } = report.results;
+  return {
+    exitCode: code ?? 1,
+    timedOut,
+    fsDiff,
+    learnedPolicy,
+    crypto,
+    dryRun,
+    profile,
+    auditLog: options.enableAudit ? auditLog : null,
+  };
+}

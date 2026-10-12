@@ -45,28 +45,6 @@ const (
 	rlimitNPROC = 6 // RLIMIT_NPROC: max child processes
 )
 
-// writeStructured writes a structured output line (e.g. "FSDIFF:{...}") either
-// to the file at cfg.StructuredOutputPath (when set) or to stdout as a fallback.
-// When the path is set every caller appends to the same file so multiple markers
-// can coexist in one file, one per line.
-func writeStructured(cfg config.ExecConfig, marker string, data []byte) {
-	line := marker + string(data) + "\n"
-	if cfg.StructuredOutputPath != "" {
-		f, err := os.OpenFile(cfg.StructuredOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: open structured-output file: %v\n", err)
-			return
-		}
-		defer f.Close()
-		if _, err := f.WriteString(line); err != nil {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: write structured-output file: %v\n", err)
-		}
-		return
-	}
-	// Fallback: write to stdout (legacy / buffered-run mode)
-	fmt.Print(line)
-}
-
 // run generates a Seatbelt profile from the config, applies RLIMIT quotas,
 // and executes the command under sandbox-exec with the generated profile.
 func run(cfg config.ExecConfig) error {
@@ -165,6 +143,9 @@ func run(cfg config.ExecConfig) error {
 	if cfg.TraceHTTPURLs || len(cfg.AllowURLRules) > 0 {
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: http-trace: eBPF HTTP tracing and fine-grained URL rules are only supported on Linux. These settings will be ignored on macOS.\n")
 	}
+	if (cfg.TraceCrypto || cfg.CBOMOutputPath != "") && !cfg.ProxyEgress && !cfg.DisableNetwork {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: trace-crypto: macOS records TLS parameters only for connections through the egress proxy; enable proxyEgress\n")
+	}
 
 	// Build the Seatbelt profile (after potentially adding the dylib path to ReadPaths)
 	profile := buildSeatbeltProfile(cfg, proxyPort)
@@ -235,6 +216,9 @@ func run(cfg config.ExecConfig) error {
 	finish := func() {
 		if proxy != nil {
 			proxy.flushViolations()
+			if cfg.TraceCrypto || cfg.CBOMOutputPath != "" {
+				emitCryptoResult(cfg, withProxyCiphers(nil, "darwin", proxy))
+			}
 			proxy.Close()
 			proxy = nil
 		}
@@ -332,7 +316,7 @@ func reportDarwinAudit(cfg config.ExecConfig, startedAt time.Time, rootPID int) 
 			"details": fmt.Sprintf("violation detected at %s", target),
 		}
 		if data, err := json.Marshal(entry); err == nil {
-			fmt.Fprintf(os.Stderr, "%s\n", string(data))
+			emitAuditLine(data, os.Stderr)
 		}
 	}
 }
@@ -1554,6 +1538,8 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["trace_http_urls"] = false
 	result.Features["allow_url_rules"] = false
 	result.Features["trace_crypto"] = false
+	// The egress proxy reads each tunnel's TLS handshake (traceCrypto).
+	result.Features["proxy_tls_observation"] = true
 	result.Features["profile_validation"] = hasSandbox // sandbox-exec -n validates profiles
 	result.Features["time_isolation"] = false          // not applicable on macOS
 	result.Features["ipc_isolation"] = false           // not applicable on macOS

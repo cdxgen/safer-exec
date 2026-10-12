@@ -78,25 +78,6 @@ const timeoutExitCode = 124
 // SIGKILL.
 const memoryLimitExitCode = 137
 
-// writeStructured writes a structured output line (e.g. "FSDIFF:{...}") either
-// to the file at cfg.StructuredOutputPath (when set) or to stdout.
-func writeStructured(cfg config.ExecConfig, marker string, data []byte) {
-	line := marker + string(data) + "\n"
-	if cfg.StructuredOutputPath != "" {
-		f, err := os.OpenFile(cfg.StructuredOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: open structured-output file: %v\n", err)
-			return
-		}
-		defer f.Close()
-		if _, err := f.WriteString(line); err != nil {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: write structured-output file: %v\n", err)
-		}
-		return
-	}
-	fmt.Print(line)
-}
-
 // resolveLauncher locates wxc-exec.exe: an explicit absolute path in
 // SAFER_EXEC_MXC_EXEC, then the engine's own directory (the npm platform
 // package ships it there). PATH is deliberately not searched: wxc-exec runs
@@ -463,20 +444,24 @@ func run(cfg config.ExecConfig) error {
 		defer job.Close()
 	}
 
-	// Library tracing needs its ETW session running before wxc-exec starts,
-	// so even the workload's first DLLs are recorded.
+	// Library and crypto tracing need the ETW session running before
+	// wxc-exec starts, so even the workload's first DLLs are recorded.
+	traceCrypto := cfg.TraceCrypto || cfg.CBOMOutputPath != ""
 	var libTrace *dlltrace.Session
-	if cfg.TraceLibraries {
+	if cfg.TraceLibraries || traceCrypto {
 		libTrace, err = dlltrace.Start()
 		if err != nil {
-			if cfg.Strict {
+			if cfg.Strict && cfg.TraceLibraries {
 				return fmt.Errorf("traceLibraries: %w", err)
 			}
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: traceLibraries: %v; no lib-load entries will be reported\n", err)
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: DLL tracing: %v; no lib-load or crypto-library entries will be reported\n", err)
 			libTrace = nil
 		} else {
 			defer libTrace.Stop()
 		}
+	}
+	if traceCrypto && proxy == nil && !cfg.DisableNetwork {
+		fmt.Fprintln(os.Stderr, "safer-exec: warning: trace-crypto: TLS parameters are recorded only for connections through the egress proxy; enable proxyEgress")
 	}
 
 	stderr := mxc.NewStderrFilter(os.Stderr)
@@ -577,8 +562,16 @@ func run(cfg config.ExecConfig) error {
 		stderr.EnsureNewline()
 		proxy.flushViolations()
 	}
+	var cryptoLibs []config.CryptoLibrary
 	if libTrace != nil {
-		emitLibraryLoads(libTrace, launcherPID, stderr)
+		cryptoLibs = reportImageLoads(cfg, libTrace, launcherPID, stderr)
+	}
+	if traceCrypto {
+		r := &config.CryptoResult{Platform: "windows", Libraries: cryptoLibs}
+		if proxy != nil {
+			r = withProxyCiphers(r, "windows", proxy)
+		}
+		emitCryptoResult(cfg, r)
 	}
 
 	// MXC prints an error envelope only when it fails, and then exits
@@ -690,11 +683,16 @@ func inServiceSession() bool {
 	return session == 0
 }
 
-// emitAudit writes one audit entry in the {"type","target","details"} JSON
-// line format the Node runner parses from stderr.
+// emitAudit writes one {"type","target","details"} audit entry: over the
+// report channel when the runner provided one, else as a line on stderr,
+// placed between the workload's own lines.
 func emitAudit(stderr *mxc.StderrFilter, entryType, target, details string) {
 	data, err := json.Marshal(map[string]string{"type": entryType, "target": target, "details": details})
 	if err != nil {
+		return
+	}
+	if reportActive() {
+		emitAuditLine(data, os.Stderr)
 		return
 	}
 	stderr.Emit(append(data, '\n'))
@@ -747,14 +745,14 @@ func consumeJobEvents(cfg config.ExecConfig, job *winjob.Job, launcherPID uint32
 // could otherwise load copies of a DLL under endless names.
 const maxLibraryLoads = 10000
 
-// emitLibraryLoads stops the ETW session and reports, as lib-load audit
-// entries, each image the workload's process tree loaded. wxc-exec's own
-// loads, each process's executable, and the console hosts Windows attaches
-// to the workload are left out, as traceExec leaves them out. The events come
-// from the kernel through the engine's own session, so the workload cannot
-// hide a load; it can only make many of them (and, as with every audit
-// entry, print look-alike lines on the stderr it shares with the engine).
-func emitLibraryLoads(s *dlltrace.Session, launcherPID uint32, stderr *mxc.StderrFilter) {
+// reportImageLoads stops the ETW session and reports each image the
+// workload's process tree loaded: as lib-load audit entries with
+// traceLibraries, and, with traceCrypto, as the crypto libraries it returns.
+// wxc-exec's own loads, each process's executable, and the console hosts
+// Windows attaches to the workload are left out, as traceExec leaves them
+// out. The events come from the kernel through the engine's own session, so
+// the workload cannot hide a load; it can only make many of them.
+func reportImageLoads(cfg config.ExecConfig, s *dlltrace.Session, launcherPID uint32, stderr *mxc.StderrFilter) []config.CryptoLibrary {
 	res := s.Stop()
 	stderr.EnsureNewline()
 	if res.Err != nil {
@@ -776,6 +774,7 @@ func emitLibraryLoads(s *dlltrace.Session, launcherPID uint32, stderr *mxc.Stder
 	}
 	loads := dlltrace.Attribute(res.Events, dlltrace.Root{PID: launcherPID, ParentPID: uint32(os.Getpid())}, skip)
 	seen := make(map[string]bool, len(loads))
+	var crypto []config.CryptoLibrary
 	reported := 0
 	for _, l := range loads {
 		path := mapper.Win32Path(l.Path)
@@ -788,16 +787,23 @@ func emitLibraryLoads(s *dlltrace.Session, launcherPID uint32, stderr *mxc.Stder
 		}
 		seen[key] = true
 		if reported == maxLibraryLoads {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: traceLibraries: more than %d distinct images were loaded; the rest are not reported\n", maxLibraryLoads)
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: DLL tracing: more than %d distinct images were loaded; the rest are not reported\n", maxLibraryLoads)
 			break
+		}
+		reported++
+		if name := dlltrace.CryptoLibrary(path); name != "" && (cfg.TraceCrypto || cfg.CBOMOutputPath != "") {
+			crypto = append(crypto, config.CryptoLibrary{Name: name, Version: dlltrace.FileVersion(path), Path: path, Source: "etw_image_load"})
+		}
+		if !cfg.TraceLibraries {
+			continue
 		}
 		process := "unknown process"
 		if l.Process != "" {
 			process = filepath.Base(mapper.Win32Path(l.Process))
 		}
 		emitAudit(stderr, "lib-load", path, fmt.Sprintf("loaded by %s (pid %d)", process, l.PID))
-		reported++
 	}
+	return crypto
 }
 
 // readCaptureReport loads the denial report MXC wrote into the run directory
@@ -1093,6 +1099,10 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["trace_http_urls"] = false
 	result.Features["allow_url_rules"] = false
 	result.Features["trace_crypto"] = false
+	// traceCrypto on Windows: crypto DLLs from the ETW session, and the TLS
+	// parameters the egress proxy reads from each tunnel's handshake.
+	result.Features["crypto_libraries"] = libErr == nil
+	result.Features["proxy_tls_observation"] = proxyOK
 	result.Features["crypto_control"] = false
 	result.Features["gpu_control"] = false
 	result.Features["tpm_control"] = false

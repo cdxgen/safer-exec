@@ -7,7 +7,7 @@
 import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { dirname } from 'node:path';
-import { resolveBinaryPath, run, runPipe, readStructuredFile } from './runner.js';
+import { resolveBinaryPath, run, runPipe, readStructuredFile, createReportParser, engineSpawnOptions, REPORT_FD } from './runner.js';
 
 const baseReadPaths = process.platform === 'darwin'
   ? ['/bin', '/usr', '/System', '/dev', '/private', dirname(process.execPath)]
@@ -66,5 +66,43 @@ describe('runPipe', () => {
     );
     strict.equal(result.exitCode, 0);
     strict.ok(output.includes('pipe test line'));
+  });
+});
+describe('report channel', () => {
+  it('splits audit entries and results across chunk boundaries', () => {
+    const audits = [];
+    const parser = createReportParser((e) => audits.push(e));
+    const lines = [
+      '{"report":1}',
+      '{"audit":{"type":"lib-load","target":"/lib/libc.so.6"}}',
+      '{"audit":{"type":"nothing"}}',
+      'not json',
+      '{"result":"FSDIFF","data":{"added":[{"path":"/tmp/a"}]}}',
+      '{"result":"PROFILE","data":"(version 1)\\n(deny default)"}',
+      '{"result":"CRYPTO","data":{"ciphers":[]}}',
+      '{"result":"UNKNOWN","data":1}',
+    ].join('\n');
+    for (let i = 0; i < lines.length; i += 7) {
+      parser.push(Buffer.from(lines.slice(i, i + 7)));
+    }
+    parser.end();
+    strict.equal(parser.opened, true);
+    strict.deepEqual(audits, [{ type: 'lib-load', target: '/lib/libc.so.6' }]);
+    strict.deepEqual(parser.results.fsDiff, { added: [{ path: '/tmp/a' }] });
+    strict.equal(parser.results.profile, '(version 1)\n(deny default)');
+    strict.deepEqual(parser.results.crypto, { ciphers: [] });
+    strict.equal(parser.results.learnedPolicy, null);
+  });
+
+  it('notices an engine that never opened the channel', () => {
+    const parser = createReportParser(() => {});
+    parser.push('{"audit":{"type":"lib-load","target":"/x"}}\n');
+    parser.end();
+    strict.equal(parser.opened, false);
+  });
+
+  it('passes the channel to the engine as stdio[3]', () => {
+    strict.equal(REPORT_FD, 3);
+    strict.equal(engineSpawnOptions().stdio[REPORT_FD], 'pipe');
   });
 });

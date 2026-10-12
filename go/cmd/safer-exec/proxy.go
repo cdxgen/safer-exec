@@ -32,6 +32,8 @@ import (
 	"time"
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
+	"github.com/cdxgen/safer-exec/go/internal/httptrace"
+	"github.com/cdxgen/safer-exec/go/internal/tlsobserve"
 )
 
 // egressProxy is a loopback HTTP CONNECT proxy enforcing the config's
@@ -48,17 +50,26 @@ type egressProxy struct {
 	ports    map[int]bool    // explicit port allowlist; nil/empty means 80/443 only
 	hasHosts bool            // whether any host/ip target is allowed at all
 	learn    bool            // learning mode: allow every target, record each one
+	// observeTLS records the cleartext handshake parameters of each CONNECT
+	// tunnel (traceCrypto): version, cipher suite, key-exchange group and, up
+	// to TLS 1.2, the server key. The tunnel itself is never altered.
+	observeTLS bool
 
 	mu         sync.Mutex
 	conns      map[net.Conn]struct{}
 	violations []config.AuditEntry
 	connected  map[string]bool // host:port targets already recorded as proxy-connect
+	ciphers    []config.CipherInfo
+	cipherSeen map[string]bool
 	closed     bool
 }
 
 // maxProxyConnectEntries caps distinct proxy-connect audit entries so a
 // command that fans out to many hosts cannot grow the audit log unbounded.
 const maxProxyConnectEntries = 4096
+
+// maxProxyCipherEntries caps the distinct TLS parameter sets recorded.
+const maxProxyCipherEntries = 1024
 
 // startEgressProxy binds the proxy to an ephemeral loopback port and compiles
 // the allowlist from cfg (AllowHosts, AllowIPs, AllowURLRules hosts,
@@ -75,7 +86,9 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 		ips:   make(map[string]bool),
 		conns: make(map[net.Conn]struct{}),
 
-		connected: make(map[string]bool),
+		connected:  make(map[string]bool),
+		cipherSeen: make(map[string]bool),
+		observeTLS: cfg.TraceCrypto || cfg.CBOMOutputPath != "",
 	}
 
 	addHost := func(h string) {
@@ -225,6 +238,67 @@ func (p *egressProxy) Close() {
 	}
 }
 
+// cipherSnapshot returns the TLS parameter sets the proxy observed.
+func (p *egressProxy) cipherSnapshot() []config.CipherInfo {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]config.CipherInfo(nil), p.ciphers...)
+}
+
+// recordTLS records one tunnel's handshake parameters once per distinct set.
+func (p *egressProxy) recordTLS(target string, h tlsobserve.Handshake) {
+	info := proxyCipherInfo(target, h)
+	key := strings.Join([]string{info.Host, info.ServerName, info.IANAName, info.Name, info.Protocol, info.Group, info.ServerKey}, "|")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cipherSeen[key] || len(p.ciphers) >= maxProxyCipherEntries {
+		return
+	}
+	p.cipherSeen[key] = true
+	p.ciphers = append(p.ciphers, info)
+}
+
+// proxyCipherInfo describes an observed handshake in the form the Linux
+// crypto tracer uses, so both feed the same audit entries and CBOM.
+func proxyCipherInfo(target string, h tlsobserve.Handshake) config.CipherInfo {
+	s := tlsobserve.Suite(h.CipherSuite)
+	info := config.CipherInfo{
+		Name:           s.Name,
+		IANAID:         h.CipherSuite,
+		Protocol:       tlsobserve.VersionName(h.Version),
+		Bits:           s.EncryptionBits,
+		KeyExchange:    s.KeyExchange,
+		Authentication: s.Authentication,
+		Encryption:     s.Encryption,
+		EncryptionBits: s.EncryptionBits,
+		Hash:           s.Hash,
+		Mode:           s.Mode,
+		Host:           target,
+		ServerName:     h.ServerName,
+		ECH:            h.ECH,
+		ServerKey:      h.ServerKey,
+		CertSignature:  h.CertSignature,
+		Source:         "proxy",
+	}
+	if s.Known {
+		info.IANAName = s.Name
+	}
+	if name, ok := httptrace.CipherNameByID(h.CipherSuite); ok {
+		info.Name = name
+	}
+	switch {
+	case h.Group != 0:
+		info.Group = tlsobserve.GroupName(h.Group)
+		info.PostQuantum = tlsobserve.GroupPostQuantum(h.Group)
+		if info.KeyExchange == "" {
+			info.KeyExchange = tlsobserve.GroupKeyExchange(h.Group)
+		}
+	case h.DHBits > 0:
+		info.Group = fmt.Sprintf("DH-%d", h.DHBits)
+	}
+	return info
+}
+
 // violationsSnapshot returns and clears recorded audit entries.
 func (p *egressProxy) violationsSnapshot() []config.AuditEntry {
 	p.mu.Lock()
@@ -234,9 +308,8 @@ func (p *egressProxy) violationsSnapshot() []config.AuditEntry {
 	return v
 }
 
-// flushViolations emits collected proxy-violation and proxy-connect audit
-// entries to stderr as one JSON object per line — the same protocol the Node
-// runner's parseAuditLog consumes for the Linux audit pipe.
+// flushViolations emits the collected proxy-violation and proxy-connect
+// audit entries, one JSON object each, over the report channel (or stderr).
 func (p *egressProxy) flushViolations() {
 	for _, v := range p.violationsSnapshot() {
 		entry := map[string]string{
@@ -245,7 +318,7 @@ func (p *egressProxy) flushViolations() {
 			"details": v.Detail,
 		}
 		if data, err := json.Marshal(entry); err == nil {
-			fmt.Fprintf(os.Stderr, "%s\n", string(data))
+			emitAuditLine(data, os.Stderr)
 		}
 	}
 }
@@ -458,14 +531,22 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 			return
 		}
 		defer upstream.Close()
-		p.recordConnect(net.JoinHostPort(normalizeProxyHost(host), portStr), "connect")
+		target := net.JoinHostPort(normalizeProxyHost(host), portStr)
+		p.recordConnect(target, "connect")
 		_ = conn.SetDeadline(time.Time{})
 		fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 		// Tunnel from `reader`, not `conn`: a client that pipelines its first
 		// payload (e.g. the TLS ClientHello) in the same segment as the
 		// CONNECT request has already had those bytes pulled into the bufio
 		// buffer, and reading the raw conn would drop them.
-		p.tunnel(conn, reader, upstream)
+		var clientSrc, serverSrc io.Reader = reader, upstream
+		if p.observeTLS {
+			obs := tlsobserve.New(func(h tlsobserve.Handshake) { p.recordTLS(target, h) })
+			defer obs.Close()
+			clientSrc = obs.ClientReader(reader)
+			serverSrc = obs.ServerReader(upstream)
+		}
+		p.tunnel(conn, clientSrc, upstream, serverSrc)
 		return
 	}
 
@@ -513,7 +594,7 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 		// coalesced into the same segment as its request line, leaving the
 		// origin waiting forever for a request it can never complete.
 		fmt.Fprintf(upstream, "%s %s %s\r\n", parts[0], path, parts[2])
-		p.tunnel(conn, reader, upstream)
+		p.tunnel(conn, reader, upstream, upstream)
 		return
 	}
 }
@@ -522,14 +603,15 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 // clientSrc is the client-side reader — the buffered reader the request was
 // parsed through, so that any bytes already drawn into its buffer are
 // forwarded rather than lost. a is the same client connection, used only for
-// writes and for the half-close.
-func (p *egressProxy) tunnel(a net.Conn, clientSrc io.Reader, b net.Conn) {
+// writes and for the half-close. serverSrc reads from b, possibly through the
+// TLS observer.
+func (p *egressProxy) tunnel(a net.Conn, clientSrc io.Reader, b net.Conn, serverSrc io.Reader) {
 	done := make(chan struct{}, 2)
 	cp := func(dst io.Writer, src io.Reader) {
 		_, _ = io.Copy(dst, src)
 		done <- struct{}{}
 	}
-	go cp(a, b)
+	go cp(a, serverSrc)
 	go cp(b, clientSrc)
 	<-done
 	// Closing the second direction unblocks the other copy.

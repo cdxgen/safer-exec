@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -449,4 +451,63 @@ func proxyStatusLine(t *testing.T, proxyPort int, request string) string {
 		t.Fatalf("read status: %v", err)
 	}
 	return strings.TrimRight(line, "\r\n")
+}
+
+// With traceCrypto the proxy reads the cleartext handshake of each tunnel
+// (version, suite, key-exchange group, and up to TLS 1.2 the server key)
+// while forwarding every byte unchanged.
+func TestEgressProxyRecordsTLSParameters(t *testing.T) {
+	body := strings.Repeat("x", 4<<20)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, body) })
+	tls13 := httptest.NewTLSServer(handler)
+	defer tls13.Close()
+	tls12 := httptest.NewUnstartedServer(handler)
+	tls12.TLS = &tls.Config{MaxVersion: tls.VersionTLS12, CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256}}
+	tls12.StartTLS()
+	defer tls12.Close()
+
+	var ports []int
+	for _, s := range []*httptest.Server{tls13, tls12} {
+		ports = append(ports, s.Listener.Addr().(*net.TCPAddr).Port)
+	}
+	p, err := startEgressProxy(config.ExecConfig{AllowIPs: []string{"127.0.0.1"}, AllowPorts: ports, TraceCrypto: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", p.port))
+	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         "observe.test",
+			CurvePreferences:   []tls.CurveID{tls.X25519MLKEM768, tls.X25519, tls.CurveP256},
+		},
+	}}
+	for _, s := range []*httptest.Server{tls13, tls12} {
+		resp, err := client.Get(s.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || len(got) != len(body) {
+			t.Fatalf("body through the observed tunnel: %d bytes, %v", len(got), err)
+		}
+	}
+
+	byHost := map[string]config.CipherInfo{}
+	for _, c := range p.cipherSnapshot() {
+		byHost[c.Host] = c
+	}
+	c13 := byHost[fmt.Sprintf("127.0.0.1:%d", ports[0])]
+	if c13.Protocol != "TLSv1.3" || c13.Group != "X25519MLKEM768" || !c13.PostQuantum || c13.KeyExchange != "ECDHE+ML-KEM" ||
+		c13.ServerName != "observe.test" || c13.Source != "proxy" || c13.IANAName == "" || c13.ServerKey != "" {
+		t.Errorf("TLS 1.3 tunnel = %+v", c13)
+	}
+	c12 := byHost[fmt.Sprintf("127.0.0.1:%d", ports[1])]
+	if c12.Protocol != "TLSv1.2" || c12.KeyExchange != "ECDHE" || c12.Group == "" || c12.ServerKey == "" || c12.CertSignature == "" ||
+		c12.Encryption != "AES" || c12.Mode != "GCM" {
+		t.Errorf("TLS 1.2 tunnel = %+v", c12)
+	}
 }

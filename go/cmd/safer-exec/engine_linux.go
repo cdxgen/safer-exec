@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -105,28 +106,6 @@ const cloneThreadFlag = 0x00010000
 
 const oPathFlag = 0x200000 // O_PATH on Linux (not in syscall package)
 
-// writeStructured writes a structured output line (e.g. "FSDIFF:{...}") either
-// to the file at cfg.StructuredOutputPath (when set) or to stdout as a fallback.
-// When the path is set every caller appends to the same file so multiple markers
-// can coexist in one file, one per line.
-func writeStructured(cfg config.ExecConfig, marker string, data []byte) {
-	line := marker + string(data) + "\n"
-	if cfg.StructuredOutputPath != "" {
-		f, err := os.OpenFile(cfg.StructuredOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: open structured-output file: %v\n", err)
-			return
-		}
-		defer f.Close()
-		if _, err := f.WriteString(line); err != nil {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: write structured-output file: %v\n", err)
-		}
-		return
-	}
-	// Fallback: write to stdout (legacy / buffered-run mode)
-	fmt.Print(line)
-}
-
 // trustedSystemDirs are the standard absolute locations for core system
 // utilities. Helper binaries that safer-exec runs before the sandbox is
 // established (unshare, ip) are resolved only from these directories.
@@ -217,12 +196,14 @@ func run(cfg config.ExecConfig) error {
 	// NET rules are port-granular, so the proxy adds hostname-level control
 	// for proxy-aware clients. It needs the sandbox to share the host network
 	// namespace, so it is skipped when DisableNetwork created an isolated one.
+	var proxy *egressProxy
 	if cfg.ProxyEgress {
 		if cfg.DisableNetwork {
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: proxy egress requires a shared network namespace; skipping (network namespace isolation is stronger)\n")
 		} else if p, pErr := startEgressProxy(cfg); pErr != nil {
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: egress proxy unavailable (%v); continuing with Landlock port confinement only\n", pErr)
 		} else {
+			proxy = p
 			defer p.Close()
 			// Deferred flush prints proxy-violation audit entries to stderr
 			// before Close tears down the listener (defers run LIFO).
@@ -270,6 +251,42 @@ func run(cfg config.ExecConfig) error {
 	var httpEvents []config.HTTPAccessEntry
 	var stopPIDRefresh chan struct{}
 	var cryptoResult *config.CryptoResult
+
+	// emitDiff and emitCrypto report a finished run's filesystem diff and
+	// crypto observations, in full and in reduced isolation alike.
+	emitDiff := func() {
+		if !cfg.EnableDiff || beforeSnap == nil {
+			return
+		}
+		if afterSnap, err := snapper.Snapshot(); err == nil {
+			if data, err := json.Marshal(fsdiff.Diff(beforeSnap, afterSnap)); err == nil {
+				writeStructured(cfg, "FSDIFF:", data)
+			}
+		}
+	}
+	// emitCrypto combines the eBPF observations with the TLS parameters the
+	// egress proxy saw (the only source when eBPF is missing).
+	emitCrypto := func() {
+		if !cfg.TraceCrypto {
+			return
+		}
+		if httpTracer != nil {
+			cryptoResult = buildCryptoResult(httpTracer, httpEvents)
+		}
+		if proxy != nil {
+			cryptoResult = withProxyCiphers(cryptoResult, "linux", proxy)
+		}
+		emitCryptoResult(cfg, cryptoResult)
+	}
+	// reduced runs the command in reduced isolation and reports its results.
+	reduced := func() error {
+		err := runReduced(cfg, cfgJSON, selfPath, httpTracer, &httpEvents, &stopPIDRefresh)
+		if err == nil {
+			emitDiff()
+		}
+		emitCrypto()
+		return err
+	}
 
 	// Auto-enable HTTP URL tracing if crypto tracing is requested
 	if cfg.TraceCrypto && !cfg.TraceHTTPURLs {
@@ -373,7 +390,7 @@ func run(cfg config.ExecConfig) error {
 			return fmt.Errorf("user namespaces unavailable")
 		}
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: user namespaces unavailable — running with reduced isolation (seccomp + landlock only; no filesystem, PID, or network namespace isolation). Install the safer-exec AppArmor profile for full isolation. See README for details.\n")
-		return runReduced(cfg, cfgJSON, selfPath, httpTracer, &httpEvents, &stopPIDRefresh)
+		return reduced()
 	}
 
 	// Use system unshare to create namespaces before Go starts
@@ -407,6 +424,9 @@ func run(cfg config.ExecConfig) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.ExtraFiles = []*os.File{auditW}
+	libPipe := newLibLoadPipe(cfg)
+	libPipe.attach(cmd)
+	defer libPipe.finish()
 
 	if cfg.WorkingDir != "" {
 		cmd.Dir = cfg.WorkingDir
@@ -421,6 +441,7 @@ func run(cfg config.ExecConfig) error {
 		}
 		return fmt.Errorf("starting sandboxed process: %w", err)
 	}
+	libPipe.started()
 
 	if cfg.EnableAudit && auditW != nil {
 		auditW.Close()
@@ -522,19 +543,12 @@ func run(cfg config.ExecConfig) error {
 				}
 				// Do NOT close httpTracer here — pass it to runReduced so HTTP tracing
 				// continues working in reduced isolation mode.
-				return runReduced(cfg, cfgJSON, selfPath, httpTracer, &httpEvents, &stopPIDRefresh)
+				return reduced()
 			}
 			if code == 132 || code == 137 || code == 153 {
 				closeHTTPTracer()
 				// Output diff even if killed by limits
-				if cfg.EnableDiff && beforeSnap != nil {
-					if afterSnap, err := snapper.Snapshot(); err == nil {
-						diff := fsdiff.Diff(beforeSnap, afterSnap)
-						if data, err := json.Marshal(diff); err == nil {
-							writeStructured(cfg, "FSDIFF:", data)
-						}
-					}
-				}
+				emitDiff()
 				return nil
 			}
 			closeHTTPTracer()
@@ -548,14 +562,7 @@ func run(cfg config.ExecConfig) error {
 	}
 
 	// Take post-execution snapshot and output diff on success
-	if cfg.EnableDiff && beforeSnap != nil {
-		if afterSnap, err := snapper.Snapshot(); err == nil {
-			diff := fsdiff.Diff(beforeSnap, afterSnap)
-			if data, err := json.Marshal(diff); err == nil {
-				writeStructured(cfg, "FSDIFF:", data)
-			}
-		}
-	}
+	emitDiff()
 
 	if cfg.EnableAudit && auditR != nil {
 		collectAuditLog(auditR)
@@ -589,32 +596,7 @@ func run(cfg config.ExecConfig) error {
 		}
 	}
 
-	// Build and emit crypto result if tracing was enabled
-	if cfg.TraceCrypto && httpTracer != nil {
-		cryptoResult = buildCryptoResult(httpTracer, httpEvents)
-		if len(cfg.AllowCiphers) > 0 && len(cryptoResult.Ciphers) > 0 {
-			allowedMap := make(map[string]bool)
-			for _, ac := range cfg.AllowCiphers {
-				allowedMap[ac] = true
-			}
-			for i := range cryptoResult.Ciphers {
-				c := &cryptoResult.Ciphers[i]
-				if !allowedMap[c.Name] && !allowedMap[c.IANAName] {
-					logAuditEntry("cipher-violation", c.Name)
-					fmt.Fprintf(os.Stderr, "safer-exec: cipher-violation: cipher %s (IANA: %s) is not allowed by policy\n", c.Name, c.IANAName)
-				}
-			}
-		}
-		if cfg.EnableAudit {
-			logAuditCryptoResult(cfg, cryptoResult)
-		}
-		if data, err := json.Marshal(cryptoResult); err == nil {
-			writeStructured(cfg, "CRYPTO:", data)
-		}
-		if cfg.CBOMOutputPath != "" {
-			writeCBOMFile(cfg.CBOMOutputPath, cryptoResult)
-		}
-	}
+	emitCrypto()
 
 	return nil
 }
@@ -727,184 +709,6 @@ func buildCryptoResult(tracer httptrace.Tracer, httpEvents []config.HTTPAccessEn
 	return result
 }
 
-// cbomDoc is a minimal CycloneDX CBOM document structure.
-type cbomDoc struct {
-	BomFormat   string          `json:"bomFormat"`
-	SpecVersion string          `json:"specVersion"`
-	Version     int             `json:"version"`
-	Components  []cbomComponent `json:"components,omitempty"`
-}
-
-type cbomComponent struct {
-	Type             string           `json:"type"`
-	Name             string           `json:"name"`
-	Version          string           `json:"version,omitempty"`
-	CryptoProperties *cbomCryptoProps `json:"cryptoProperties,omitempty"`
-}
-
-type cbomCryptoProps struct {
-	AssetType                  string            `json:"assetType"`
-	AlgorithmProperties        *cbomAlgoProps    `json:"algorithmProperties,omitempty"`
-	RelatedCryptoMaterialProps *cbomRelatedProps `json:"relatedCryptoMaterialProperties,omitempty"`
-	ProtocolProperties         *cbomProtoProps   `json:"protocolProperties,omitempty"`
-}
-
-type cbomAlgoProps struct {
-	Primitive              string   `json:"primitive,omitempty"`
-	ParameterSetIdentifier string   `json:"parameterSetIdentifier,omitempty"`
-	Mode                   string   `json:"mode,omitempty"`
-	ExecutionEnvironment   string   `json:"executionEnvironment,omitempty"`
-	ImplementationPlatform string   `json:"implementationPlatform,omitempty"`
-	CryptoFunctions        []string `json:"cryptoFunctions,omitempty"`
-	ClassicalSecurityLevel int      `json:"classicalSecurityLevel,omitempty"`
-}
-
-type cbomRelatedProps struct {
-	Type string `json:"type"`
-}
-
-type cbomProtoProps struct {
-	Type         string            `json:"type"`
-	Version      string            `json:"version,omitempty"`
-	CipherSuites []cbomCipherSuite `json:"cipherSuites,omitempty"`
-}
-
-type cbomCipherSuite struct {
-	Name       string   `json:"name"`
-	Algorithms []string `json:"algorithms,omitempty"`
-}
-
-// writeCBOMFile writes a minimal CycloneDX CBOM JSON document to the given path.
-func writeCBOMFile(path string, cryptoResult *config.CryptoResult) {
-	doc := cbomDoc{
-		BomFormat:   "CycloneDX",
-		SpecVersion: "1.7",
-		Version:     1,
-	}
-
-	for _, lib := range cryptoResult.Libraries {
-		ver := lib.Version
-		if ver == "" {
-			ver = "unknown"
-		}
-		doc.Components = append(doc.Components, cbomComponent{
-			Type:    "cryptographic-asset",
-			Name:    lib.Name,
-			Version: ver,
-			CryptoProperties: &cbomCryptoProps{
-				AssetType: "related-crypto-material",
-				RelatedCryptoMaterialProps: &cbomRelatedProps{
-					Type: "library",
-				},
-			},
-		})
-	}
-
-	for _, c := range cryptoResult.Ciphers {
-		funcs := []string{"encrypt"}
-		if c.Mode != "" {
-			funcs = append(funcs, "decrypt")
-		}
-		doc.Components = append(doc.Components, cbomComponent{
-			Type:    "cryptographic-asset",
-			Name:    c.Name,
-			Version: c.Protocol,
-			CryptoProperties: &cbomCryptoProps{
-				AssetType: "algorithm",
-				AlgorithmProperties: &cbomAlgoProps{
-					Primitive:              algoPrimitive(c),
-					ParameterSetIdentifier: c.Hash,
-					Mode:                   c.Mode,
-					ExecutionEnvironment:   c.Library,
-					ImplementationPlatform: c.Library,
-					CryptoFunctions:        funcs,
-					ClassicalSecurityLevel: c.Bits,
-				},
-			},
-		})
-	}
-
-	seenProtocols := make(map[string]bool)
-	for _, c := range cryptoResult.Ciphers {
-		if c.Protocol == "" {
-			continue
-		}
-		protoKey := c.Protocol
-		if seenProtocols[protoKey] {
-			continue
-		}
-		seenProtocols[protoKey] = true
-
-		protoVersion := c.Protocol
-		if strings.HasPrefix(protoVersion, "TLSv") {
-			protoVersion = strings.TrimPrefix(protoVersion, "TLSv")
-		}
-
-		var suites []cbomCipherSuite
-		for _, o := range cryptoResult.Ciphers {
-			if o.Protocol == c.Protocol {
-				name := o.IANAName
-				if name == "" {
-					name = o.Name
-				}
-				var algs []string
-				if o.KeyExchange != "" && o.KeyExchange != "inline" {
-					algs = append(algs, o.KeyExchange)
-				}
-				if o.Authentication != "" && o.Authentication != "inline" {
-					algs = append(algs, o.Authentication)
-				}
-				if o.Encryption != "" {
-					algs = append(algs, o.Encryption)
-				}
-				if o.Hash != "" {
-					algs = append(algs, o.Hash)
-				}
-				suites = append(suites, cbomCipherSuite{
-					Name:       name,
-					Algorithms: algs,
-				})
-			}
-		}
-
-		doc.Components = append(doc.Components, cbomComponent{
-			Type:    "cryptographic-asset",
-			Name:    c.Protocol,
-			Version: protoVersion,
-			CryptoProperties: &cbomCryptoProps{
-				AssetType: "protocol",
-				ProtocolProperties: &cbomProtoProps{
-					Type:         "tls",
-					Version:      protoVersion,
-					CipherSuites: suites,
-				},
-			},
-		})
-	}
-
-	data, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "safer-exec: cbom marshal: %v\n", err)
-		return
-	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "safer-exec: cbom write: %v\n", err)
-	}
-}
-
-func algoPrimitive(c config.CipherInfo) string {
-	switch {
-	case c.Mode == "GCM" || c.Mode == "CCM" || c.Mode == "POLY1305":
-		return "aead"
-	case c.Encryption != "":
-		return "block-cipher"
-	case c.KeyExchange != "":
-		return "key-agree"
-	default:
-		return "other"
-	}
-}
-
 // runLearn executes the command in learning mode using strace to observe behavior.
 func runLearn(cfg config.ExecConfig) error {
 	l := learner.New()
@@ -989,15 +793,7 @@ func runLearn(cfg config.ExecConfig) error {
 		policy.CryptoCiphers = cryptoResult.Ciphers
 		policy.CryptoLibraries = cryptoResult.Libraries
 		policy.CryptoOperations = cryptoResult.Operations
-		if cfg.EnableAudit {
-			logAuditCryptoResult(cfg, cryptoResult)
-		}
-		if data, err := json.Marshal(cryptoResult); err == nil {
-			writeStructured(cfg, "CRYPTO:", data)
-		}
-		if cfg.CBOMOutputPath != "" {
-			writeCBOMFile(cfg.CBOMOutputPath, cryptoResult)
-		}
+		emitCryptoResult(cfg, cryptoResult)
 	}
 
 	data, _ := json.Marshal(policy)
@@ -1054,8 +850,25 @@ func runDryRun(cfg config.ExecConfig) error {
 	if cfg.WorkingDir != "" {
 		cmd.Dir = cfg.WorkingDir
 	}
+	// The inner process's own audit entries travel over a pipe it marks
+	// close-on-exec, as in an enforced run.
+	var auditR *os.File
+	if r, w, perr := os.Pipe(); perr == nil {
+		auditR = r
+		cmd.ExtraFiles = []*os.File{w}
+		cmd.Env = append(cmd.Env, "SAFER_EXEC_AUDIT_FD=3")
+		defer w.Close()
+	}
 
-	_ = cmd.Run() // ignore real exit code
+	if err := cmd.Start(); err == nil {
+		if len(cmd.ExtraFiles) > 0 {
+			cmd.ExtraFiles[0].Close()
+		}
+		_ = cmd.Wait() // ignore real exit code
+	}
+	if auditR != nil {
+		collectAuditLog(auditR)
+	}
 
 	var events []config.DryRunEvent
 	if straceFile != "" {
@@ -1263,6 +1076,9 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.ExtraFiles = []*os.File{auditW}
+	libPipe := newLibLoadPipe(cfg)
+	libPipe.attach(cmd)
+	defer libPipe.finish()
 
 	if cfg.WorkingDir != "" {
 		cmd.Dir = cfg.WorkingDir
@@ -1277,6 +1093,7 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 		}
 		return fmt.Errorf("starting reduced sandbox: %w", err)
 	}
+	libPipe.started()
 
 	if auditW != nil {
 		auditW.Close()
@@ -1377,6 +1194,8 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 // runInitReduced is the inner init for reduced isolation mode. It skips namespace
 // and filesystem setup, applying only seccomp-bpf and Landlock network confinement.
 func runInitReduced(cfg config.ExecConfig) error {
+	adoptAuditFd()
+	adoptLibPipeFd()
 	cgroupPath, v1Paths, err := setupCgroup(cfg)
 	if err != nil {
 		return fmt.Errorf("setting up cgroup: %w", err)
@@ -1431,23 +1250,115 @@ func runInitReduced(cfg config.ExecConfig) error {
 	return execCommand(cfg)
 }
 
+// libLoadPipe carries the LD_AUDIT helper's lib-load events to the outer
+// engine when results go over the report channel. The helper runs inside the
+// workload, so the workload can write anything into this pipe; the relay
+// passes on only well-formed lib-load entries, rebuilt from their target, so
+// the most a workload can do is add lib-load entries of its own.
+type libLoadPipe struct {
+	r, w *os.File
+	done chan struct{}
+}
+
+// maxRelayedLibLoads bounds the distinct lib-load entries one run relays.
+const maxRelayedLibLoads = 10000
+
+func newLibLoadPipe(cfg config.ExecConfig) *libLoadPipe {
+	if !cfg.TraceLibraries || !reportActive() || isMusl() {
+		return nil
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: trace-libraries: lib-load pipe: %v\n", err)
+		return nil
+	}
+	return &libLoadPipe{r: r, w: w}
+}
+
+// attach passes the write end to cmd as fd 4 (fd 3 is the audit pipe).
+func (p *libLoadPipe) attach(cmd *exec.Cmd) {
+	if p == nil {
+		return
+	}
+	for len(cmd.ExtraFiles) < 1 {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, nil)
+	}
+	cmd.ExtraFiles = append(cmd.ExtraFiles[:1], p.w)
+	cmd.Env = append(cmd.Env, "SAFER_EXEC_LIBPIPE_FD=4")
+}
+
+// started closes the engine's write end and starts the relay.
+func (p *libLoadPipe) started() {
+	if p == nil {
+		return
+	}
+	p.w.Close()
+	p.w = nil
+	p.done = make(chan struct{})
+	go p.relay()
+}
+
+func (p *libLoadPipe) relay() {
+	defer close(p.done)
+	sc := bufio.NewScanner(p.r)
+	sc.Buffer(make([]byte, 0, 64<<10), 64<<10)
+	seen := make(map[string]bool)
+	for sc.Scan() {
+		var e struct {
+			Type   string `json:"type"`
+			Target string `json:"target"`
+		}
+		if json.Unmarshal(sc.Bytes(), &e) != nil || e.Type != "lib-load" || e.Target == "" || seen[e.Target] || len(seen) >= maxRelayedLibLoads {
+			continue
+		}
+		seen[e.Target] = true
+		if data, err := json.Marshal(map[string]string{"type": "lib-load", "target": e.Target}); err == nil {
+			emitAuditLine(data, os.Stderr)
+		}
+	}
+	// An over-long line stops the scanner; keep draining so the workload's
+	// helper never blocks on a full pipe.
+	_, _ = io.Copy(io.Discard, p.r)
+}
+
+// finish waits briefly for the relay to drain (a process the workload left
+// running can hold the pipe open indefinitely) and closes the pipe.
+func (p *libLoadPipe) finish() {
+	if p == nil {
+		return
+	}
+	if p.w != nil {
+		p.w.Close()
+	}
+	if p.done != nil {
+		select {
+		case <-p.done:
+		case <-time.After(2 * time.Second):
+		}
+	}
+	p.r.Close()
+}
+
+// collectAuditLog relays the inner process's audit pipe, line by line. Only
+// the inner process holds the pipe (it is close-on-exec there), so the
+// target cannot write into it.
 func collectAuditLog(r *os.File) {
 	defer r.Close()
-	buf := make([]byte, 4096)
+	br := bufio.NewReaderSize(r, 64<<10)
 	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			os.Stderr.Write(buf[:n])
+		line, err := br.ReadBytes('\n')
+		if line = bytes.TrimRight(line, "\r\n"); len(line) > 0 {
+			emitAuditLine(line, os.Stderr)
 		}
 		if err != nil {
-			break
+			return
 		}
 	}
 }
 
 func runInit(cfg config.ExecConfig) error {
-	// Clear audit FD env var to prevent child processes from discovering it
-	os.Unsetenv("SAFER_EXEC_AUDIT_FD")
+	adoptAuditFd()
+	adoptLibPipeFd()
 
 	// Bring up loopback interface if network is disabled but loopback is allowed.
 	// Resolve `ip` from trusted system directories rather than $PATH so a hijacked
@@ -1795,24 +1706,46 @@ func prepareExecEnv(cfg config.ExecConfig) (cmdPath string, argv []string, env [
 }
 
 // libLoadFd is the descriptor the LD_AUDIT helper writes lib-load events to
-// (-1 when library tracing is off). It is a duplicate of the engine's stderr,
-// taken before the target runs, so the events reach the engine even when the
+// (-1 when library tracing is off). It is a duplicate of the lib-load pipe
+// the outer engine passed (libPipeFd) or, without one, of stderr, taken
+// before the target runs, so the events reach the engine even when the
 // traced program redirects its own stderr to a file or pipe.
 var libLoadFd = -1
+
+// libPipeFd is the lib-load pipe from the outer engine (SAFER_EXEC_LIBPIPE_FD),
+// close-on-exec in this process; -1 without one.
+var libPipeFd = -1
+
+// adoptLibPipeFd takes over the lib-load pipe and marks it close-on-exec, so
+// only the duplicate handed to the LD_AUDIT helper reaches the target.
+func adoptLibPipeFd() {
+	v := os.Getenv("SAFER_EXEC_LIBPIPE_FD")
+	os.Unsetenv("SAFER_EXEC_LIBPIPE_FD")
+	fd, err := strconv.Atoi(v)
+	if err != nil || fd < 3 {
+		return
+	}
+	syscall.CloseOnExec(fd)
+	libPipeFd = fd
+}
 
 // libLoadFdMin keeps the descriptor clear of the low numbers programs use
 // for their own files and redirections.
 const libLoadFdMin = 100
 
-// dupLibLoadFd duplicates stderr to the lowest free descriptor at or above
-// libLoadFdMin, without close-on-exec so it survives into the target and its
-// children. Returns -1 when duplication fails (events then fall back to the
-// helper's own handling).
+// dupLibLoadFd duplicates the lib-load pipe (or stderr) to the lowest free
+// descriptor at or above libLoadFdMin, without close-on-exec so it survives
+// into the target and its children. Returns -1 when duplication fails
+// (events then fall back to the helper's own handling).
 func dupLibLoadFd() int {
 	if libLoadFd >= 0 {
 		return libLoadFd
 	}
-	fd, _, errno := syscall.Syscall(syscall.SYS_FCNTL, 2, syscall.F_DUPFD, libLoadFdMin)
+	src := 2
+	if libPipeFd >= 0 {
+		src = libPipeFd
+	}
+	fd, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(src), syscall.F_DUPFD, libLoadFdMin)
 	if errno != 0 {
 		return -1
 	}
@@ -3521,13 +3454,38 @@ func compileKafelPolicy(policy string) ([]syscall.SockFilter, error) {
 func logAuditEntry(entryType, target string) {
 	entry := map[string]string{"type": entryType, "target": target, "details": fmt.Sprintf("violation detected at %s", target)}
 	data, _ := json.Marshal(entry)
-	auditFD := os.Getenv("SAFER_EXEC_AUDIT_FD")
-	if auditFD != "" {
-		fd, _ := strconv.Atoi(auditFD)
-		syscall.Write(fd, append(data, '\n'))
-	} else {
-		fmt.Fprintf(os.Stderr, "%s\n", string(data))
+	writeAuditLine(data)
+}
+
+// initAuditFd is the audit pipe an inner process (--init, --init-reduced,
+// --init-dryrun) writes to; the outer engine relays it. It is -1 in the outer
+// engine, which writes to the report channel (or stderr) itself.
+var initAuditFd = -1
+
+// adoptAuditFd takes over the audit pipe the outer engine passed in
+// SAFER_EXEC_AUDIT_FD and marks it close-on-exec. The inner process execs the
+// target in its own place, so without this the target would inherit a
+// descriptor through which it could write audit entries of its choosing.
+func adoptAuditFd() {
+	v := os.Getenv("SAFER_EXEC_AUDIT_FD")
+	os.Unsetenv("SAFER_EXEC_AUDIT_FD")
+	fd, err := strconv.Atoi(v)
+	if err != nil || fd < 3 {
+		return
 	}
+	syscall.CloseOnExec(fd)
+	initAuditFd = fd
+}
+
+// writeAuditLine writes one audit entry: into the audit pipe from an inner
+// process, else over the report channel or to stderr.
+func writeAuditLine(data []byte) {
+	if initAuditFd >= 0 {
+		line := append(append(make([]byte, 0, len(data)+1), data...), '\n')
+		syscall.Write(initAuditFd, line)
+		return
+	}
+	emitAuditLine(data, os.Stderr)
 }
 
 // logAuditHTTPEntry emits an "http-request" audit entry for a captured HTTP call.
@@ -3570,78 +3528,7 @@ func logAuditHTTPEntry(e config.HTTPAccessEntry) {
 		entry["cryptoLibraryVersion"] = e.CryptoLibraryVersion
 	}
 	data, _ := json.Marshal(entry)
-	auditFD := os.Getenv("SAFER_EXEC_AUDIT_FD")
-	if auditFD != "" {
-		fd, _ := strconv.Atoi(auditFD)
-		syscall.Write(fd, append(data, '\n'))
-	} else {
-		fmt.Fprintf(os.Stderr, "%s\n", string(data))
-	}
-}
-
-// logAuditCryptoResult emits audit events for ciphers, libraries, and operations.
-func logAuditCryptoResult(cfg config.ExecConfig, r *config.CryptoResult) {
-	if r == nil {
-		return
-	}
-	// Log ciphers
-	for _, c := range r.Ciphers {
-		entry := map[string]interface{}{
-			"type":           "crypto-cipher",
-			"name":           c.Name,
-			"ianaName":       c.IANAName,
-			"ianaId":         c.IANAID,
-			"protocol":       c.Protocol,
-			"bits":           c.Bits,
-			"keyExchange":    c.KeyExchange,
-			"authentication": c.Authentication,
-			"encryption":     c.Encryption,
-			"encryptionBits": c.EncryptionBits,
-			"hash":           c.Hash,
-			"mode":           c.Mode,
-			"library":        c.Library,
-			"libraryVersion": c.LibraryVersion,
-			"pid":            c.PID,
-		}
-		data, _ := json.Marshal(entry)
-		writeAuditRaw(data)
-	}
-	// Log libraries
-	for _, l := range r.Libraries {
-		entry := map[string]interface{}{
-			"type":    "crypto-library",
-			"name":    l.Name,
-			"version": l.Version,
-			"path":    l.Path,
-			"source":  l.Source,
-		}
-		data, _ := json.Marshal(entry)
-		writeAuditRaw(data)
-	}
-	// Log operations
-	for _, o := range r.Operations {
-		entry := map[string]interface{}{
-			"type":           "crypto-operation",
-			"operation":      o.Type,
-			"algorithm":      o.Algorithm,
-			"library":        o.Library,
-			"libraryVersion": o.LibraryVersion,
-			"pid":            o.PID,
-			"count":          o.Count,
-		}
-		data, _ := json.Marshal(entry)
-		writeAuditRaw(data)
-	}
-}
-
-func writeAuditRaw(data []byte) {
-	auditFD := os.Getenv("SAFER_EXEC_AUDIT_FD")
-	if auditFD != "" {
-		fd, _ := strconv.Atoi(auditFD)
-		syscall.Write(fd, append(data, '\n'))
-	} else {
-		fmt.Fprintf(os.Stderr, "%s\n", string(data))
-	}
+	writeAuditLine(data)
 }
 
 func execCommand(cfg config.ExecConfig) error {
@@ -3820,7 +3707,7 @@ func monitorMaps(parentPid int, stopChan chan struct{}) {
 				seen[pathname] = true
 				entry := map[string]string{"type": "lib-load", "target": pathname}
 				if jsonData, err := json.Marshal(entry); err == nil {
-					fmt.Fprintf(os.Stderr, "%s\n", string(jsonData))
+					emitAuditLine(jsonData, os.Stderr)
 				}
 			}
 		}
@@ -4224,6 +4111,8 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["trace_http_urls"] = bpfForTrace
 	result.Features["allow_url_rules"] = bpfForTrace
 	result.Features["trace_crypto"] = bpfForTrace
+	// The egress proxy reads each tunnel's TLS handshake (traceCrypto).
+	result.Features["proxy_tls_observation"] = true
 	result.Features["time_isolation"] = result.Capabilities["time_namespace"].Available
 	result.Features["ipc_isolation"] = result.Capabilities["ipc_namespace"].Available
 	result.Features["landlock_filesystem"] = result.Capabilities["landlock_filesystem"].Available

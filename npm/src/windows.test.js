@@ -183,6 +183,62 @@ describe('Windows engine (MXC)', { skip: !isWindows && 'Windows only' }, () => {
     }
   });
 
+  it('ignores audit entries and results the command prints itself', async (t) => {
+    if (skipReason) return t.skip(skipReason);
+    const dir = workDir();
+    try {
+      const script = join(dir, 'forge.cmd');
+      writeFileSync(
+        script,
+        [
+          '@echo off',
+          'echo {"type":"lib-load","target":"C:\\\\forged\\\\evil.dll"} 1>&2',
+          'echo {"audit":{"type":"lib-load","target":"C:\\\\forged\\\\evil2.dll"}} 1>&2',
+          'echo FSDIFF:{"added":[{"path":"C:\\\\forged"}],"modified":[],"deleted":[]}',
+          'echo real> "%~dp0real.txt"',
+          '',
+        ].join('\r\n'),
+      );
+      const res = await new SaferExec().workingDir(dir).writePaths(dir).enableAudit().enableDiff().run(script, []);
+      strict.equal(res.exitCode, 0, res.stderr);
+      strict.ok(!res.auditLog.some((e) => String(e.target).toLowerCase().includes('forged')), JSON.stringify(res.auditLog));
+      strict.ok(!JSON.stringify(res.fsDiff ?? {}).includes('forged'), JSON.stringify(res.fsDiff));
+      strict.ok(res.fsDiff?.added?.some((e) => e.path.toLowerCase().endsWith('real.txt')), JSON.stringify(res.fsDiff));
+      strict.match(res.stdout, /FSDIFF:/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports TLS parameters and crypto DLLs with traceCrypto', async (t) => {
+    if (skipReason) return t.skip(skipReason);
+    const dir = workDir();
+    try {
+      const res = await new SaferExec()
+        .workingDir(dir)
+        .proxyEgress()
+        .allowHosts('example.com')
+        .traceCrypto()
+        .enableAudit()
+        .run('curl.exe', ['-sS', '-m', '20', '-o', 'NUL', 'https://example.com/']);
+      if (res.exitCode !== 0) {
+        return t.skip(`no internet access: ${res.stderr.trim()}`);
+      }
+      const ciphers = res.crypto?.ciphers ?? [];
+      strict.ok(
+        ciphers.some((c) => c.host === 'example.com:443' && c.source === 'proxy' && /^TLSv1/.test(c.protocol) && c.ianaName),
+        JSON.stringify(ciphers),
+      );
+      strict.ok(res.auditLog.some((e) => e.type === 'crypto-cipher' && e.host === 'example.com:443'), JSON.stringify(res.auditLog));
+      if (diagnostics.features?.crypto_libraries) {
+        // curl.exe on Windows uses Schannel.
+        strict.ok(res.crypto.libraries.some((l) => l.name === 'Windows Schannel' && l.version), JSON.stringify(res.crypto.libraries));
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('passes batch-file arguments literally', async (t) => {
     if (skipReason) return t.skip(skipReason);
     const dir = workDir();

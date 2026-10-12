@@ -21,7 +21,7 @@ The Go engine binary is named **`safer-exec-rt`** (runtime). The name `safer-exe
 
 **macOS**: Generates Seatbelt profiles → applies RLIMIT quotas → runs via `sandbox-exec`
 
-**Windows**: Probes the host (`wxc-exec --probe`) → starts the egress proxy if needed → translates the config into an MXC 1.0.0 request (`internal/mxc`) → starts an ETW session for `traceLibraries` (`internal/dlltrace`) → starts `wxc-exec.exe` suspended inside a job object carrying the resource limits (`internal/winjob`) → resumes it → filters MXC's stderr protocol → emits audit/learn/dry-run/diff and `lib-load` output
+**Windows**: Probes the host (`wxc-exec --probe`) → starts the egress proxy if needed → translates the config into an MXC 1.0.0 request (`internal/mxc`) → starts an ETW session for `traceLibraries` (`internal/dlltrace`) → starts `wxc-exec.exe` suspended inside a job object carrying the resource limits (`internal/winjob`) → resumes it → filters MXC's stderr protocol → emits audit/learn/dry-run/diff, `lib-load` and crypto output (DLLs from ETW, TLS parameters from the proxy)
 
 **Linux**: Forks self with `--init` → unshares namespaces → sets MS_SLAVE on root → mounts tmpfs → creates cgroup v2 → bind-mounts paths (fd-based with TOCTTOU check) → enforces submount read-only flags → double pivot_root → sets up /proc (hidepid=2 + dangerous entry hardening) → sets up minimal /dev → applies Landlock network rules → applies Landlock filesystem rules → applies seccomp-bpf (base + stackable filters) → acquires file locks → forks PID 1 reaper → child closes leaked fds → child sets PR_SET_PDEATHSIG / setsid → child execves target
 
@@ -33,6 +33,9 @@ The Go engine binary is named **`safer-exec-rt`** (runtime). The name `safer-exe
 go/                           — Go engine (platform-specific sandboxing)
   cmd/safer-exec/             — Entry point + platform engines
     main.go                   — Reads JSON config from stdin, dispatches
+    report.go                 — Report channel to the Node runner (audit entries, structured results)
+    proxy.go                  — Egress proxy (hostname allowlist; TLS handshake observation for traceCrypto)
+    crypto_report.go, cbom.go — Crypto results, crypto audit entries and the CycloneDX CBOM (all platforms)
     engine_darwin.go          — macOS: Seatbelt + RLIMIT engine
     engine_linux.go           — Linux: namespaces + seccomp + Landlock (net + fs) + cgroup
     engine_openbsd.go         — OpenBSD: unveil(2) + pledge(2) engine
@@ -57,6 +60,8 @@ go/                           — Go engine (platform-specific sandboxing)
                                 Windows path rules, argv/batch quoting, env, denial reports,
                                 stderr protocol); unit-tested on every platform
     winjob/                   — Windows job objects (limits, suspended start, notifications)
+    tlsobserve/               — passive reader of TLS handshakes in egress-proxy tunnels (version,
+                                suite, key-exchange group, TLS ≤1.2 server key) for traceCrypto
     dlltrace/                 — Windows DLL load tracing: an ETW session on Microsoft-Windows-Kernel-Process
                                 (session_windows.go) and the portable attribution of image loads to the
                                 workload's process tree and kernel-to-Win32 path mapping (dlltrace.go)
@@ -195,20 +200,29 @@ The Linux engine has been hardened with multiple layered defenses:
 6. **PID 1 reaper**: A guardian process runs as PID 1 in the PID namespace, reaping orphaned zombies and correctly propagating exit codes.
 7. **Exit code propagation**: `initMain()` and `initReducedMain()` now check for `ExitError` and use its code instead of always exiting with `1`.
 
-### Structured Output Protocol
+### Report Channel
 
-The Go binary communicates structured data back to Node.js via marker-prefixed JSON on stdout:
+The engine sends audit entries and structured results to Node.js over a dedicated pipe,
+not over stdout/stderr, which the sandboxed command shares and could forge lines on.
+`runner.js` spawns the engine with `stdio[3]` as a pipe and sets `reportFd: 3`
+(`cmd/safer-exec/report*.go` adopts it: close-on-exec on POSIX, non-inheritable and found
+through libuv's CRT descriptor table on Windows). One JSON object per line:
 
-- `FSDIFF:` prefix — filesystem diff report
-- `LEARNED:` prefix — learned policy output
-- `CRYPTO:` prefix — cryptographic observations (ciphers, libraries)
-- Audit entries — JSON lines on stderr
+- `{"audit": {"type": "lib-load", "target": "..."}}` — an audit entry (`emitAuditLine`)
+- `{"result": "FSDIFF", "data": {...}}` — a structured result (`writeStructured`):
+  `FSDIFF`, `LEARNED`, `CRYPTO`, `DRYRUN`, `PROFILE` (text)
 
-The Node.js `runner.js` parses these markers and separates them from regular stdout.
+Write every new audit entry with `emitAuditLine` (or a platform helper built on it) and
+every result with `writeStructured`; never print either to stdout or stderr directly.
+Without `reportFd` (the engine run by hand or by Go tests) they fall back to stderr
+lines and `FSDIFF:`-style stdout markers. On Linux the inner `--init*` processes write
+to an internal audit pipe they mark close-on-exec, and the `LD_AUDIT` helper (which runs
+inside the workload) writes to a separate pipe whose lines the engine re-validates as
+`lib-load` entries only.
 
 ### JSON Status Protocol
 
-A JSON-lines status protocol is available for external lifecycle monitoring. When `JsonStatusFd` is configured (set by the Node.js runner via an O_CLOEXEC pipe fd), the engine writes:
+A JSON-lines status protocol is available for external lifecycle monitoring (Linux reaper only; the Node.js runner does not set it). When `JsonStatusFd` names an inherited fd, the engine writes:
 
 ```json
 {"child-pid": 12345, "type": "sandbox-start"}
