@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document covers the sandboxing guarantees, attack surfaces, and failure modes of the `@cdxgen/safer-exec` library. The library enforces OS-level isolation around process execution through a Go binary that uses native mechanisms on macOS and Linux.
+This document covers the sandboxing guarantees, attack surfaces, and failure modes of the `@cdxgen/safer-exec` library. The library enforces OS-level isolation around process execution through a Go binary that uses native mechanisms on macOS and Linux, and on Windows the Microsoft eXecution Container (MXC) ProcessContainer backend.
 
 ## 1. System Overview
 
@@ -12,6 +12,7 @@ This document covers the sandboxing guarantees, attack surfaces, and failure mod
 - **Go engine** (`go/cmd/safer-exec/`) reads JSON config from stdin and applies platform-specific isolation.
 - **macOS engine** generates Seatbelt profiles, applies RLIMIT quotas, and runs commands through `sandbox-exec`.
 - **Linux engine** uses namespace isolation, bind mounts, `pivot_root`, seccomp-bpf filters, Landlock network confinement, and cgroup v2 resource quotas.
+- **Windows engine** translates the config into an MXC request (`go/internal/mxc/`) and runs the command through the MXC executor `wxc-exec.exe` inside a job object (`go/internal/winjob/`).
 - **Learner** (`go/internal/learner/`) traces process behavior via strace (Linux) or Seatbelt trace rules (macOS) to generate policies.
 - **Filesystem diff** (`go/internal/fsdiff/`) captures file mutations via OverlayFS (Linux) or pre/post snapshots with SHA-256 hashes (macOS).
 
@@ -124,6 +125,18 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 | Submount remount  | Read-only enforcement     | Parses `/proc/self/mountinfo`, remounts each submount as read-only         |
 | /proc hardening   | Dangerous entry blockage  | Covers `sys`, `sysrq-trigger`, `irq`, `bus` with read-only bind mounts     |
 | /dev isolation    | Minimal device exposure   | Fresh tmpfs with only essential device nodes + stdio symlinks              |
+
+### Windows (MXC ProcessContainer + job objects)
+
+| Mechanism | What it enforces | How |
+| --- | --- | --- |
+| BaseContainer filesystem grants | File read/write | `CreateProcessSecurityEnvironment` grants; ungranted paths are inaccessible, `%SystemRoot%` is read-only |
+| Denied paths | Persistence locations under broad write grants | Native deny grants (`PSE_SUPPORT_FS_DENY`) |
+| Per-container WFP filters | Egress by destination CIDR, protocol and port; proxy-only egress | Applied and owned by the OS for the container's lifetime |
+| Job UI limits | Clipboard, input injection, desktop, handles, atoms | `JOB_OBJECT_UILIMIT_*` on MXC's job |
+| Win32k system-call disable (opt-in) | GUI subsystem kernel attack surface | `windowsBlockWin32k` |
+| Outer job object | Committed memory, CPU rate, active processes; tree teardown | Limits on safer-exec's job; MXC's job nests under it; `KILL_ON_JOB_CLOSE` |
+| Explicit environment block | No inherited profile environment | `process.env` is always supplied, `inheritDefaultEnv` false |
 
 ## 3. Threats and Attack Vectors
 
@@ -509,6 +522,24 @@ no trusted binary is found; `unshare` falls back to the bare name only on exotic
 systems where it is absent from every standard directory (no worse than the
 historical behavior, while the common case is fully pinned).
 
+### 3.18 Windows Engine (MXC)
+
+**Containment tier.** The guarantees above hold on the BaseContainer tier (Windows 11 24H2/25H2 with the August 2026 servicing update, or later). On older builds MXC can fall back to an AppContainer tier that grants access by adding ACEs to the host security descriptors of the policy paths. The engine probes the host on every run and refuses that tier unless the caller sets `windowsAllowDaclMutation`, because the ACEs outlive an abnormally terminated launcher. Under the BFS tier no host ACLs are modified.
+
+**Executor integrity.** `wxc-exec.exe` runs with the caller's privileges and creates the container, so it is trusted like the engine itself: it ships next to `safer-exec-rt.exe` in the platform package and is built from a pinned MXC commit. `SAFER_EXEC_MXC_EXEC` must name an absolute path. MXC's elevating helpers (`winhttp-proxy-shim.exe`, `plm.exe`, `wxc-host-prep.exe`) are not shipped, so no run can trigger a UAC prompt; tiers that need them fail instead. MXC's own debug and override variables (`MXC_*`, `WXC_*`, e.g. `MXC_FORCE_TIER`) are removed from the executor's environment so they cannot select a tier other than the one the probe vetted.
+
+**Command-line injection.** MXC passes `process.commandLine` to `CreateProcessW`. The engine resolves the executable itself (absolute `PATH` entries only, no current-directory search, only `.com/.exe/.bat/.cmd`), always quotes the program path, and escapes arguments for `CommandLineToArgvW`. Batch files are run through an explicit `%SystemRoot%\System32\cmd.exe /d /e:ON /v:OFF /c` taken from the host environment (a caller-supplied `SYSTEMROOT` cannot redirect it), with cmd-specific quoting, `%` neutralised and CR/LF rejected — the CVE-2024-24576 class. A batch script that expands its own arguments unquoted (`%~1`) can still be injected by its arguments; that is a property of the script.
+
+**Network.** Direct-egress rules pin the addresses `allowHosts` resolve to when the run starts; a host whose addresses rotate may become unreachable, but no other host becomes reachable. In proxy mode the container may reach only the proxy endpoint, but because safer-exec's proxy has no package or AppContainer identity, MXC's identity-less mode is used: host loopback is allowed in both directions and the private-network capability (which also admits private-network inbound connections) is granted. `allowListen` and private-network destinations grant the same bidirectional capability. Only HTTP(S) clients that honour the WinHTTP or environment proxy settings can use the proxy; other egress is blocked.
+
+**Resource limits.** Job limits apply to the launcher too, so 32 MB is added to the memory limit for it. Windows fails allocations past a job memory limit instead of killing the process; the engine terminates the workload (exit 137) on the first limit notification so a runtime cannot wedge in its out-of-memory path. I/O rate limits are not enforced.
+
+**Exec control.** There is no per-executable exec filter. `blockExec` entries are enforced only when the executable is unreachable inside the container; `blockFork` is enforced by the active-process limit, which allows a `.bat`/`.cmd` command two additional `cmd.exe` interpreter processes.
+
+**Observability gaps.** On BaseContainer hosts MXC's denial capture does not report accesses to paths outside every grant and is best-effort even for grant conflicts, so audit, learning and dry-run reports are partial and must not be treated as a complete record. Learning runs stay contained (deny-and-record) instead of using MXC's permissive mode, which lifts enforcement while recording nothing on these hosts.
+
+**Session 0.** Containers started from session 0 (services, SSH logons) cannot open the session's window station, so programs that load `user32.dll` fail to start. This fails closed.
+
 ## 4. Platform-Aware Policies
 
 Policies are resolved at runtime based on the operating system. The following platform differences affect policy behavior:
@@ -548,8 +579,9 @@ This section analyzes advanced threat vectors, escape techniques, and how `safer
 1. The Go binary itself is not tampered with. It is statically compiled and shipped with the npm package.
 2. The host OS provides working namespace, mount, and cgroup v2 support on Linux.
 3. The host OS provides `sandbox-exec` on macOS.
-4. DNS resolution returns correct results during the execution window.
-5. The target command is a standard executable, not a shell script that modifies its own environment before running.
+4. On Windows, the host provides the BaseContainer API and the MXC executor shipped with the platform package is not tampered with.
+5. DNS resolution returns correct results during the execution window.
+6. The target command is a standard executable, not a shell script that modifies its own environment before running.
 
 ## 6. Recommendations
 

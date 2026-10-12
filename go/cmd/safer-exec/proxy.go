@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +45,7 @@ type egressProxy struct {
 	anyHost  bool            // an empty-host URL rule or bare "*" allows any host
 	ports    map[int]bool    // explicit port allowlist; nil/empty means 80/443 only
 	hasHosts bool            // whether any host/ip target is allowed at all
+	learn    bool            // learning mode: allow every target, record each one
 
 	mu         sync.Mutex
 	conns      map[net.Conn]struct{}
@@ -114,6 +116,34 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 
 	go p.acceptLoop()
 	return p, nil
+}
+
+// startLearningEgressProxy starts a proxy that allows every target and
+// records each distinct host:port it forwards (as proxy-connect entries and
+// through connectedTargets). Learning runs use it to discover the hostnames a
+// command needs; the allowlist fields of cfg are ignored.
+func startLearningEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
+	p, err := startEgressProxy(cfg)
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	p.learn = true
+	p.mu.Unlock()
+	return p, nil
+}
+
+// connectedTargets returns the distinct host:port targets the proxy forwarded,
+// sorted.
+func (p *egressProxy) connectedTargets() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, 0, len(p.connected))
+	for t := range p.connected {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // envVars returns the proxy environment variables to inject into the
@@ -219,6 +249,12 @@ func (p *egressProxy) flushViolations() {
 // target is denied.
 func (p *egressProxy) targetAllowed(host string, port int) bool {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	p.mu.Lock()
+	learn := p.learn
+	p.mu.Unlock()
+	if learn {
+		return host != "" && port > 0 && port <= 65535
+	}
 	if net.ParseIP(host) != nil {
 		if !p.hasHosts && len(p.ips) == 0 {
 			return false

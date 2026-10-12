@@ -4,6 +4,7 @@ package config
 import (
 	"encoding/json"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -468,7 +469,7 @@ func TestBuildEnv(t *testing.T) {
 		if strings.HasPrefix(env, "MY_CUSTOM_VAR=custom-val") {
 			foundCustom = true
 		}
-		if strings.HasPrefix(env, "PATH=") {
+		if strings.HasPrefix(env, "PATH=") || (runtime.GOOS == "windows" && strings.HasPrefix(strings.ToUpper(env), "PATH=")) {
 			foundPath = true
 		}
 	}
