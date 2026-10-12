@@ -134,7 +134,7 @@ Options:
   -l, --learn                Enable behavioral auto-profiling (learning mode)
       --learn-output=<file>  Write learned policy to file
       --dry-run              Run with all operations denied; report what the command attempted (no side effects)
-      --validate-profile     Validate Seatbelt profile syntax (macOS only)
+      --validate-profile     Validate the generated profile (macOS Seatbelt syntax, Windows MXC request)
   -a, --audit                Enable sandbox violation auditing
       --audit-output-file=<f> Write audit log to file (implies audit)
   -s, --strict               Treat sandbox setup warnings as errors

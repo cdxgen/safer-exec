@@ -2,8 +2,10 @@
  * End-to-end tests for the Windows engine through the Node API and CLI:
  * Node.js -> safer-exec-rt.exe -> wxc-exec.exe (MXC) -> workload.
  *
- * Skipped on other platforms, and when the engine reports that the MXC
- * ProcessContainer is unavailable (no wxc-exec.exe or no BaseContainer API).
+ * Skipped on other platforms, and unless the engine reports MXC's
+ * BaseContainer tier: no wxc-exec.exe, no BaseContainer API (older builds,
+ * Windows Server), or a host where MXC would fall back to modifying file ACLs,
+ * which the engine refuses without consent.
  * Workloads are Windows system tools (cmd.exe, curl.exe), which a container
  * can run without grants.
  *
@@ -13,11 +15,12 @@
 import { describe, it, before } from 'node:test';
 import strict from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SaferExec } from './index.js';
+import { findOnWindowsPath } from './runner.js';
 
 const isWindows = process.platform === 'win32';
 const cliPath = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
@@ -40,8 +43,8 @@ describe('Windows engine (MXC)', { skip: !isWindows && 'Windows only' }, () => {
   before(async () => {
     try {
       const info = await SaferExec.diagnostics();
-      if (!info.features?.mxc_process_container) {
-        skipReason = `MXC ProcessContainer unavailable: ${JSON.stringify(info.capabilities?.mxc_probe ?? info.capabilities?.mxc_executor)}`;
+      if (!info.features?.base_container || info.capabilities?.host_acl_mutation_required?.available) {
+        skipReason = `MXC BaseContainer tier unavailable: ${JSON.stringify(info.capabilities?.mxc_probe ?? info.capabilities?.mxc_executor)}`;
       }
     } catch (err) {
       skipReason = `diagnostics failed: ${err.message}`;
@@ -120,12 +123,17 @@ describe('Windows engine (MXC)', { skip: !isWindows && 'Windows only' }, () => {
   it('blocks the network when disabled', async (t) => {
     if (skipReason) return t.skip(skipReason);
     const dir = workDir();
+    const fetch = () => ['-sS', '-m', '10', '-o', 'NUL', 'http://example.com/'];
     try {
-      const res = await new SaferExec()
-        .workingDir(dir)
-        .disableNetwork()
-        .run('curl.exe', ['-sS', '-m', '5', '-o', 'NUL', 'http://example.com/']);
-      strict.notEqual(res.exitCode, 0);
+      // Control: the same request succeeds when the host is allowed, so the
+      // failure below comes from the policy rather than the machine.
+      const allowed = await new SaferExec().workingDir(dir).allowHosts('example.com').run('curl.exe', fetch());
+      if (allowed.exitCode !== 0) {
+        return t.skip(`no internet access for the control request: ${allowed.stderr.trim()}`);
+      }
+      const res = await new SaferExec().workingDir(dir).disableNetwork().run('curl.exe', fetch());
+      // curl: 6 = could not resolve host, 7 = could not connect, 28 = timeout.
+      strict.ok([6, 7, 28].includes(res.exitCode), `exit ${res.exitCode}: ${res.stderr}`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -197,18 +205,45 @@ describe('Windows engine (MXC)', { skip: !isWindows && 'Windows only' }, () => {
     }
   });
 
-  it('runs through the CLI', async (t) => {
+  it('runs through the CLI with a policy file', async (t) => {
     if (skipReason) return t.skip(skipReason);
     const dir = workDir();
+    const policyDir = workDir();
     try {
-      const policyFile = join(dir, 'policy.json');
+      const policyFile = join(policyDir, 'policy.json');
       writeFileSync(policyFile, JSON.stringify({ writePaths: [dir], windowsBlockWin32k: true }));
-      const res = await runCli('--cwd', dir, '--policy-file', policyFile, '--', 'cmd.exe', '/c', 'echo cli-ok');
+      const inside = join(dir, 'cli.txt');
+      const res = await runCli('--cwd', dir, '--policy-file', policyFile, '--', 'cmd.exe', '/c', `echo cli-ok& echo x> "${inside}"`);
       strict.equal(res.exitCode, 0, res.stderr);
       strict.match(res.stdout, /cli-ok/);
-      strict.ok(readFileSync(policyFile, 'utf-8').includes('windowsBlockWin32k'));
+      strict.ok(existsSync(inside), 'the policy file write grant was not applied');
+      // The policy file grants nothing else: its own directory stays closed.
+      const outside = join(policyDir, 'cli.txt');
+      const denied = await runCli('--cwd', dir, '--policy-file', policyFile, '--', 'cmd.exe', '/c', `echo x> "${outside}"`);
+      strict.notEqual(denied.exitCode, 0);
+      strict.ok(!existsSync(outside));
     } finally {
       rmSync(dir, { recursive: true, force: true });
+      rmSync(policyDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Windows engine lookup', { skip: !isWindows && 'Windows only' }, () => {
+  it('never resolves the engine from the current or a relative directory', () => {
+    const planted = workDir();
+    const real = workDir();
+    const cwd = process.cwd();
+    try {
+      writeFileSync(join(planted, 'safer-exec-rt.exe'), '');
+      process.chdir(planted);
+      strict.equal(findOnWindowsPath('safer-exec-rt.exe', { Path: `.;;safer;${join(real, 'missing')}` }), undefined);
+      writeFileSync(join(real, 'safer-exec-rt.exe'), '');
+      strict.equal(findOnWindowsPath('safer-exec-rt.exe', { PATH: `.;"${real}"` }), join(real, 'safer-exec-rt.exe'));
+    } finally {
+      process.chdir(cwd);
+      rmSync(planted, { recursive: true, force: true });
+      rmSync(real, { recursive: true, force: true });
     }
   });
 });
