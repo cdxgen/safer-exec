@@ -126,7 +126,7 @@ Options:
   --trace-output-file=<file> Write tracked libraries to file (implies trace-libraries)
   --trace-temp-dir=<dir>     Temporary directory to extract dynamic library helper to (implies trace-libraries)
   --trace-http-urls          Capture HTTPS request URLs/methods via eBPF TLS uprobes (Linux only, requires CAP_BPF)
-  --trace-crypto             Enable cryptographic tracing: cipher suites, libraries (auto-enables --trace-http-urls)
+  --trace-crypto             Enable cryptographic tracing: cipher suites, libraries (on Linux also records HTTP requests)
   --cbom-output=<file>       Write CycloneDX CBOM JSON to file (requires --trace-crypto)
   --crypto-probe-mode=<mode> Crypto probe depth: "tls-only" (default) or "operations"
 

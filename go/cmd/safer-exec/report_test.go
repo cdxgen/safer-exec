@@ -138,14 +138,15 @@ func TestCryptoResultAndCBOM(t *testing.T) {
 	for _, c := range doc.Components {
 		byName[c.Name] = c
 	}
-	kem := byName["X25519MLKEM768"]
+	// The hybrid X25519MLKEM768 is recorded as its two halves.
+	kem := byName["ML-KEM-768"]
 	if kem.CryptoProperties == nil || kem.CryptoProperties.AlgorithmProperties.Primitive != "kem" || kem.CryptoProperties.AlgorithmProperties.NistQuantumSecurityLevel != 3 {
-		t.Errorf("hybrid group component = %+v", kem.CryptoProperties)
+		t.Errorf("ML-KEM half of the hybrid group = %+v", kem.CryptoProperties)
 	}
 	if c := byName["secp256r1"]; c.CryptoProperties == nil || c.CryptoProperties.AlgorithmProperties.Primitive != "key-agree" {
 		t.Errorf("classical group component = %+v", c)
 	}
-	for _, name := range []string{"RSA-2048", "Windows Schannel", "TLSv1.3", "TLSv1.2"} {
+	for _, name := range []string{"x25519", "RSA-2048", "Windows Schannel", "TLSv1.3", "TLSv1.2"} {
 		if _, ok := byName[name]; !ok {
 			t.Errorf("CBOM lacks %s: %v", name, doc.Components)
 		}

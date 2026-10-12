@@ -401,7 +401,7 @@ export class SaferExec extends EventEmitter {
     /** @type {boolean} Attach eBPF uprobes to TLS write functions to capture HTTP URLs (Linux only, kernel >= 5.8) */
     this._traceHTTPURLs = options.traceHTTPURLs || false;
 
-    /** @type {boolean} Enable cryptographic tracing (cipher suites, libraries). Auto-enables traceHTTPURLs. */
+    /** @type {boolean} Enable cryptographic tracing (cipher suites, libraries). */
     this._traceCrypto = options.traceCrypto || false;
 
     /** @type {string} Path for CycloneDX CBOM JSON output */
@@ -1941,7 +1941,10 @@ export class SaferExec extends EventEmitter {
 
   /**
    * Enable cryptographic tracing via eBPF uprobes on TLS cipher negotiation and
-   * crypto operation functions. Automatically enables HTTP URL tracing.
+   * crypto operation functions on Linux, and through the egress proxy and (on
+   * Windows) ETW everywhere else. On Linux the engine starts the eBPF tracer
+   * that URL tracing uses, so `http-request` audit entries are recorded too;
+   * URL tracing itself stays off, so macOS and Windows do not warn about it.
    *
    * Captures:
    * - Negotiated TLS cipher suites per connection (name, IANA ID, protocol version, key size)
@@ -1958,16 +1961,16 @@ export class SaferExec extends EventEmitter {
    */
   traceCrypto() {
     this._traceCrypto = true;
-    this._traceHTTPURLs = true;
     return this;
   }
 
   /**
    * Set the path for CycloneDX CBOM (Cryptography Bill of Materials) output.
    *
-   * When set, the Go binary writes a minimal CycloneDX JSON document with
-   * cryptographic-asset components for detected libraries, cipher suites,
-   * and crypto operations to this file path after execution completes.
+   * When set, the Go binary writes a CycloneDX JSON document to this file
+   * path after execution completes: a library component per crypto library,
+   * and cryptographic-asset components for the algorithms (with OIDs) and TLS
+   * protocol versions it saw, valid against CycloneDX 1.6 and 1.7.
    *
    * Requires traceCrypto() or --trace-crypto to be active.
    *
@@ -2283,7 +2286,7 @@ export class SaferExec extends EventEmitter {
       maxWriteBps: this._maxWriteBps,
       timeoutMs: this._timeoutMs,
       workingDir: this._workingDir,
-      enableAudit: this._enableAudit || this._traceLibraries || this._traceHTTPURLs,
+      enableAudit: this._enableAudit || this._traceLibraries || this._traceHTTPURLs || this._traceCrypto,
       enableDiff: this._enableDiff,
       enableLearn: this._enableLearn,
       enableDryRun: this._enableDryRun,
@@ -2392,7 +2395,7 @@ export class SaferExec extends EventEmitter {
     const options = {
       binaryPath,
       timeout: effectiveTimeout + 2000,
-      enableAudit: this._enableAudit || this._traceLibraries || this._traceHTTPURLs,
+      enableAudit: this._enableAudit || this._traceLibraries || this._traceHTTPURLs || this._traceCrypto,
       suppressLibLoadStderr: this._suppressLibLoadStderr,
       onAudit: (entry) => this.emit('audit', entry),
     };
@@ -2433,7 +2436,7 @@ export class SaferExec extends EventEmitter {
     const options = {
       binaryPath,
       timeout: effectiveTimeout + 2000,
-      enableAudit: this._enableAudit || this._traceLibraries || this._traceHTTPURLs,
+      enableAudit: this._enableAudit || this._traceLibraries || this._traceHTTPURLs || this._traceCrypto,
       stdout: pipeOptions.stdout !== undefined ? pipeOptions.stdout : process.stdout,
       stderr: pipeOptions.stderr !== undefined ? pipeOptions.stderr : process.stderr,
       suppressLibLoadStderr: this._suppressLibLoadStderr,

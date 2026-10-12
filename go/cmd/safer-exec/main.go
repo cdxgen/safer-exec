@@ -41,6 +41,9 @@ import (
 	"github.com/cdxgen/safer-exec/go/internal/config"
 )
 
+// version is the engine's release, reported by --version and in the CBOM.
+const version = "1.1.1"
+
 type ExitError struct {
 	Code int
 }
@@ -99,7 +102,7 @@ func main() {
 
 	// Handle version flag
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
-		fmt.Println("safer-exec 1.1.1")
+		fmt.Println("safer-exec " + version)
 		return
 	}
 

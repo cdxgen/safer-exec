@@ -19,10 +19,10 @@ describe('SaferExec crypto tracing API', () => {
       strict.equal(exec._traceCrypto, true);
     });
 
-    it('should auto-enable _traceHTTPURLs', () => {
+    it('should not turn on URL tracing, which is Linux-only', () => {
       const exec = new SaferExec();
       exec.traceCrypto();
-      strict.equal(exec._traceHTTPURLs, true);
+      strict.equal(exec._traceHTTPURLs, false);
     });
 
     it('should return this for chaining', () => {
@@ -152,7 +152,11 @@ describe('SaferExec crypto tracing API', () => {
       strict.equal(config.traceCrypto, true);
       strict.equal(config.cbomOutputPath, './cbom.json');
       strict.equal(config.cryptoProbeMode, 'operations');
-      strict.equal(config.traceHTTPURLs, true);
+      // The engine starts the shared eBPF tracer on Linux itself; asking for
+      // URL tracing would make macOS and Windows warn about it.
+      strict.equal(config.traceHTTPURLs, false);
+      // Crypto audit entries (crypto-cipher, crypto-library) need the audit log.
+      strict.equal(config.enableAudit, true);
     });
 
     it('should include allowURLRules and traceHTTPURLs in config', async () => {
