@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -182,8 +183,7 @@ const containerProfileMarker = `\packages\sandbox.{`
 type LearnInput struct {
 	Cmd  string
 	Args []string
-	// Report is the permissive-mode denial report (accesses outside the
-	// policy that were allowed and recorded).
+	// Report is the learning run's denial report.
 	Report *DenialReport
 	// Plan is the plan the learning run executed; its grants were in effect
 	// and therefore never appear in Report.
@@ -192,11 +192,24 @@ type LearnInput struct {
 	ProxyTargets []string
 	// NetworkDisabled reports whether the learning run had no network.
 	NetworkDisabled bool
+	// Forbidden are locations no learned grant may reach (the engine's run
+	// directories, MXC's state); anything inside them is dropped.
+	Forbidden []string
 }
 
 // LearnPolicy builds a policy from a learning run: the grants the run already
 // had plus every recorded access, collapsed to minimal path sets, and the
 // hostnames and ports the egress proxy observed.
+//
+// The workload chooses what it touches, so a learned grant must not be
+// broader than a person would write by hand. Recorded paths are dropped when
+// they are spelled through an alias that hides what they name (a UNC or
+// device path, an 8.3 short name, trailing dots or spaces, a stream), when
+// they are or contain a broad root (the user profile and its AppData roots,
+// the Users directory, Program Files, ProgramData), and when they fall inside
+// %SystemRoot% or a Forbidden path; writes are also never learned for a
+// persistence location or a directory above one. Host-local
+// network targets are never learned.
 func LearnPolicy(in LearnInput) *config.PolicyFile {
 	policy := &config.PolicyFile{
 		Cmd:        in.Cmd,
@@ -209,15 +222,19 @@ func LearnPolicy(in LearnInput) *config.PolicyFile {
 	}
 	var reads, writes, anchors, pathDirs []string
 	systemRoot := ""
+	var broad, forbidden, noWrite []string
+	forbidden = append(forbidden, in.Forbidden...)
 	if in.Plan != nil {
 		reads = append(reads, in.Plan.ReadPaths...)
 		writes = append(writes, in.Plan.WritePaths...)
 		anchors = append(anchors, in.Plan.Cwd, WinDir(in.Plan.Program))
 		systemRoot = in.Plan.SystemRoot
 		env := ParseEnviron(in.Plan.Request.Process.Env)
+		broad = broadRoots(env)
+		noWrite = persistencePaths(env, "")
 		if pathList, ok := env.Get("PATH"); ok {
-			for dir := range strings.SplitSeq(pathList, ";") {
-				if dir = strings.Trim(strings.TrimSpace(dir), `"`); WinIsAbs(dir) {
+			for _, dir := range SplitPathList(pathList) {
+				if WinIsAbs(dir) {
 					pathDirs = append(pathDirs, WinClean(dir))
 				}
 			}
@@ -237,6 +254,9 @@ func LearnPolicy(in LearnInput) *config.PolicyFile {
 			if d.ResourceType != "file" || !WinIsAbs(d.Resource) || IsBaselineNoise(d, systemRoot) {
 				continue
 			}
+			if aliasedPath(d.Resource) {
+				continue
+			}
 			path := WinClean(d.Resource)
 			switch {
 			case strings.Contains(strings.ToLower(path), containerProfileMarker):
@@ -248,6 +268,15 @@ func LearnPolicy(in LearnInput) *config.PolicyFile {
 			case systemRoot != "" && WinHasPrefix(path, systemRoot):
 				// The Windows directory is readable without a grant and must
 				// never be granted for writing.
+				continue
+			case slices.ContainsFunc(broad, func(b string) bool { return WinHasPrefix(b, path) }):
+				// A broad root itself, or an ancestor of one.
+				continue
+			case coveredBy(path, forbidden):
+				continue
+			case d.AccessType == "write" && (coveredBy(path, noWrite) || isAncestorOfAny(path, noWrite)):
+				// Reading .npmrc is ordinary; learning write access to it, or
+				// to a directory above it, is how persistence gets planted.
 				continue
 			}
 			seen = append(seen, observed{
@@ -298,9 +327,16 @@ func LearnPolicy(in LearnInput) *config.PolicyFile {
 			continue
 		}
 		if ip := net.ParseIP(h); ip != nil {
+			if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+				continue
+			}
 			ips[ip.String()] = true
 		} else {
-			hosts[strings.ToLower(h)] = true
+			h = strings.ToLower(strings.TrimSuffix(h, "."))
+			if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+				continue
+			}
+			hosts[h] = true
 		}
 		if port > 0 {
 			ports[port] = true
@@ -323,6 +359,62 @@ func LearnPolicy(in LearnInput) *config.PolicyFile {
 		policy.ProxyEgress = true
 	}
 	return policy
+}
+
+// broadRoots are directories too broad to learn as grants: the user profile
+// and its AppData roots, the directory holding all profiles, Program Files
+// and ProgramData. A learned path equal to one of them, or above one, is
+// dropped; narrower paths inside them are still learned.
+func broadRoots(env *EnvSet) []string {
+	var out []string
+	for _, name := range []string{"USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PROGRAMDATA", "PUBLIC"} {
+		if v, ok := env.Get(name); ok && WinIsAbs(v) {
+			out = appendUniquePath(out, WinClean(v))
+		}
+	}
+	if v, ok := env.Get("USERPROFILE"); ok && WinIsAbs(v) && !WinIsVolumeRoot(WinDir(WinClean(v))) {
+		out = appendUniquePath(out, WinDir(WinClean(v)))
+	}
+	return out
+}
+
+// aliasedPath reports whether a recorded path is spelled in a form whose
+// meaning the lexical checks above cannot see: a UNC, device or \\?\ path
+// (\\localhost\C$\Windows is C:\Windows), an alternate data stream, a
+// component with trailing dots or spaces (C:\Windows. is C:\Windows), or an
+// 8.3 short name (C:\PROGRA~1).
+func aliasedPath(raw string) bool {
+	s := strings.ReplaceAll(raw, "/", `\`)
+	if strings.HasPrefix(s, `\\`) || IsDevicePath(s) {
+		return true
+	}
+	if i := strings.LastIndexByte(s, ':'); i != 1 {
+		return true
+	}
+	for _, part := range strings.Split(strings.TrimRight(s[2:], `\`), `\`) {
+		if part == "" || part == "." || part == ".." {
+			continue
+		}
+		if strings.HasSuffix(part, ".") || strings.HasSuffix(part, " ") || shortNameComponent(part) {
+			return true
+		}
+	}
+	return false
+}
+
+// shortNameComponent matches the NAME~N[.EXT] shape of generated 8.3 names.
+func shortNameComponent(part string) bool {
+	base, _, _ := strings.Cut(part, ".")
+	i := strings.LastIndexByte(base, '~')
+	if i <= 0 || i == len(base)-1 || len(base) > 8 {
+		return false
+	}
+	for _, r := range base[i+1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // isAncestorOfAny reports whether dir is a strict ancestor of any path.

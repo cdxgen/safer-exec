@@ -264,10 +264,13 @@ func TestComposeCmdCommandLine(t *testing.T) {
 		args []string
 		want string
 	}{
-		{[]string{"/c", `echo data> "C:\a b\x.txt"`}, `"C:\Windows\System32\cmd.exe" /c echo data> "C:\a b\x.txt"`},
-		{[]string{"/d", "/s", "/C", `"tool.exe" --flag`}, `"C:\Windows\System32\cmd.exe" /d /s /C "tool.exe" --flag`},
-		{[]string{"/c", "echo", "a", "b"}, `"C:\Windows\System32\cmd.exe" /c echo a b`},
-		{[]string{"/k"}, `"C:\Windows\System32\cmd.exe" /k`},
+		{[]string{"/c", `echo data> "C:\a b\x.txt"`}, `"C:\Windows\System32\cmd.exe" /d /s /c "echo data> "C:\a b\x.txt""`},
+		{[]string{"/d", "/s", "/C", `"tool.exe" --flag`}, `"C:\Windows\System32\cmd.exe" /d /s /C ""tool.exe" --flag"`},
+		{[]string{"/c", "echo", "a", "b"}, `"C:\Windows\System32\cmd.exe" /d /s /c "echo a b"`},
+		// More than two quotes: /S strips only the outer pair.
+		{[]string{"/c", `"C:\Program Files\nodejs\node.exe" -e "x"`}, `"C:\Windows\System32\cmd.exe" /d /s /c ""C:\Program Files\nodejs\node.exe" -e "x""`},
+		{[]string{"/q", "/c", "ver"}, `"C:\Windows\System32\cmd.exe" /q /d /s /c "ver"`},
+		{[]string{"/k"}, `"C:\Windows\System32\cmd.exe" /d /s /k`},
 		{[]string{"/q", "/v:off"}, `"C:\Windows\System32\cmd.exe" /q /v:off`},
 	}
 	for _, c := range cases {

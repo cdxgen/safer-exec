@@ -19,8 +19,10 @@ type Mode int
 const (
 	// ModeEnforce runs the workload under the translated policy.
 	ModeEnforce Mode = iota
-	// ModeLearn runs the workload in MXC's permissive learning mode: accesses
-	// outside the policy are allowed and recorded so a policy can be derived.
+	// ModeLearn runs the workload contained under the policy with denial
+	// capture on, and derives a policy from what was recorded. (MXC's
+	// permissive capture mode is not used: on BaseContainer hosts it lifts
+	// enforcement but records no filesystem accesses.)
 	ModeLearn
 	// ModeDryRun denies everything except bootstrap reads and records what the
 	// workload attempted.
@@ -62,6 +64,14 @@ type Host struct {
 	LookupIP func(host string) ([]net.IP, error)
 	// NumCPU is the number of logical processors.
 	NumCPU int
+	// LongPath expands 8.3 short names in an existing path (GetLongPathName),
+	// so a grant spelled C:\Users\RUNNER~1 is compared as the directory it
+	// names. Optional; nil leaves paths as spelled.
+	LongPath func(path string) string
+	// Documents is the user's Documents known folder, which OneDrive and
+	// folder redirection can move away from %USERPROFILE%\Documents.
+	// Optional.
+	Documents string
 }
 
 // Options carries per-run engine decisions into the translation.
@@ -79,6 +89,14 @@ type Options struct {
 	// HostLoopbackSupported reports whether this host's container API can
 	// open host loopback for a direct-egress policy (PSEC 1.1 ingress).
 	HostLoopbackSupported bool
+	// ProtectedPaths are engine-owned locations (the run directories that
+	// hold requests and denial reports, MXC's ACL-recovery state) that no
+	// workload may touch. Each is denied whenever a grant covers it.
+	ProtectedPaths []string
+	// CascadingGrants is set when MXC runs on its ACL-modifying tier, where
+	// a grant is an inheritable ACE on the target and so covers the whole
+	// tree below it, volume roots included.
+	CascadingGrants bool
 }
 
 // JobLimits are resource limits the engine applies through a job object that
@@ -116,6 +134,10 @@ type Plan struct {
 	// Unenforced lists requested restrictions Windows cannot enforce for this
 	// run. They are warnings by default and errors under strict mode.
 	Unenforced []string
+	// Broadened lists places where Windows must grant more than the config
+	// asked for (a capability that cannot be scoped as narrowly). Warnings by
+	// default, errors under strict mode.
+	Broadened []string
 	// Skipped lists policy paths that were not sent to MXC and why.
 	Skipped []string
 	// DroppedEnv lists caller variables removed by the Windows filter.
@@ -203,7 +225,21 @@ func Translate(cfg config.ExecConfig, host Host, opts Options) (*Plan, error) {
 	}
 
 	// --- Filesystem --------------------------------------------------------
+	// Every path that is compared with a grant goes through canon, so 8.3
+	// short spellings (an interactive session's %TEMP% is often
+	// C:\Users\RUNNER~1\...) compare equal to the long names grants use.
+	canon := func(path string) string {
+		if host.LongPath != nil && WinIsAbs(path) && host.Exists(path) {
+			if long := host.LongPath(path); WinIsAbs(long) {
+				return WinClean(long)
+			}
+		}
+		return path
+	}
 	userProfile, _ := host.Env.Get("USERPROFILE")
+	if WinIsAbs(userProfile) {
+		userProfile = canon(WinClean(userProfile))
+	}
 	norm := func(raw string) (string, bool) {
 		path, reason := normalizePolicyPath(raw, cwd, userProfile)
 		if reason != "" {
@@ -211,13 +247,13 @@ func Translate(cfg config.ExecConfig, host Host, opts Options) (*Plan, error) {
 			return "", false
 		}
 		if !host.Exists(path) {
-			// A grant on a path that does not exist yet is not honoured by the
+			// A grant on a path that does not exist yet is not honored by the
 			// OS container API, matching the Linux engine, which skips missing
 			// bind-mount sources.
 			p.Skipped = append(p.Skipped, fmt.Sprintf("%s (does not exist)", raw))
 			return "", false
 		}
-		return path, true
+		return canon(path), true
 	}
 
 	var writePaths, readPaths []string
@@ -245,24 +281,64 @@ func Translate(cfg config.ExecConfig, host Host, opts Options) (*Plan, error) {
 	covered := func(path string) bool {
 		return WinHasPrefix(path, systemRoot) || coveredBy(path, writePaths) || coveredBy(path, readPaths)
 	}
-	for _, path := range []string{WinDir(program), cwd} {
+	// The program's directory is granted so the loader can find DLLs next
+	// to it, unless that directory is a broad one (the user profile, an
+	// ancestor of it, a volume root, Documents, Desktop or Downloads): there
+	// only the program file itself is granted, so running a tool stored in
+	// the profile root does not expose everything beside it.
+	programGrant := canon(WinDir(program))
+	if broadDirectory(programGrant, host, userProfile) {
+		programGrant = canon(program)
+		p.Warnings = append(p.Warnings, fmt.Sprintf("%s is in a broad directory (%s); only the program file is readable, so DLLs or files beside it are not", program, WinDir(program)))
+	}
+	for _, path := range []string{programGrant, canon(cwd)} {
 		if !covered(path) {
 			readPaths = appendUniquePath(readPaths, path)
 		}
 	}
 
 	for _, path := range append(append([]string{}, writePaths...), readPaths...) {
-		if WinIsVolumeRoot(path) {
-			p.Warnings = append(p.Warnings, fmt.Sprintf("the grant on volume root %s does not extend to its subdirectories in a Windows container; grant the specific directories instead", path))
+		if !WinIsVolumeRoot(path) {
+			continue
 		}
+		if opts.CascadingGrants {
+			return nil, fmt.Errorf("refusing the grant on volume root %s: on MXC's ACL-modifying tier it would apply to the whole drive", path)
+		}
+		p.Warnings = append(p.Warnings, fmt.Sprintf("the grant on volume root %s does not extend to its subdirectories in a Windows container; grant the specific directories instead", path))
 	}
 
-	var deniedPaths []string
+	// Denied paths must exist: the container API refuses to create an
+	// environment whose policy denies a missing path (ERROR_PATH_NOT_FOUND).
+	var deniedPaths, undeniable []string
 	if cfg.DenyPersistenceWrites {
-		for _, d := range persistencePaths(host.Env) {
-			if coveredBy(d, writePaths) && !containsPath(writePaths, d) {
-				deniedPaths = appendUniquePath(deniedPaths, d)
+		for _, d := range persistencePaths(host.Env, host.Documents) {
+			d = canon(d)
+			if !coveredBy(d, writePaths) || containsPath(writePaths, d) {
+				continue
 			}
+			if host.Exists(d) {
+				deniedPaths = appendUniquePath(deniedPaths, d)
+			} else {
+				undeniable = append(undeniable, d)
+			}
+		}
+	}
+	if len(undeniable) > 0 {
+		p.Unenforced = append(p.Unenforced, fmt.Sprintf("denyPersistenceWrites for %s (they do not exist yet, and a Windows container cannot deny a missing path; the write grant lets the workload create them)", strings.Join(undeniable, ", ")))
+	}
+	// Engine-owned locations are never reachable, whatever the grants say.
+	// The engine creates them before translating.
+	for _, raw := range opts.ProtectedPaths {
+		if !WinIsAbs(raw) {
+			continue
+		}
+		d := WinClean(raw)
+		if !host.Exists(d) {
+			continue
+		}
+		d = canon(d)
+		if coveredBy(d, writePaths) || coveredBy(d, readPaths) || grantsInside(d, writePaths, readPaths) {
+			deniedPaths = appendUniquePath(deniedPaths, d)
 		}
 	}
 
@@ -296,7 +372,7 @@ func Translate(cfg config.ExecConfig, host Host, opts Options) (*Plan, error) {
 	p.Limits = p.translateLimits(cfg, host)
 
 	// --- Controls Windows cannot enforce -----------------------------------
-	p.collectUnenforced(cfg, host, envSet, systemRoot)
+	p.collectUnenforced(cfg, host, envSet, systemRoot, canon)
 
 	// --- Request -----------------------------------------------------------
 	var timeout uint32
@@ -373,7 +449,23 @@ func normalizePolicyPath(raw, cwd, userProfile string) (string, string) {
 	if !WinIsAbs(s) {
 		s = WinJoin(cwd, s)
 	}
-	return WinClean(s), ""
+	return WinClean(trimComponentDots(s)), ""
+}
+
+// trimComponentDots drops the trailing dots and spaces Win32 path parsing
+// strips from each component, so C:\Users\me. and C:\Users\me are compared
+// as the same directory. "." and ".." are left for WinClean.
+func trimComponentDots(s string) string {
+	parts := strings.Split(strings.ReplaceAll(s, "/", `\`), `\`)
+	for i, part := range parts {
+		if part == "." || part == ".." || (i == 0 && strings.HasSuffix(part, ":")) {
+			continue
+		}
+		if trimmed := strings.TrimRight(part, ". "); trimmed != "" || part == "" {
+			parts[i] = trimmed
+		}
+	}
+	return strings.Join(parts, `\`)
 }
 
 func appendUniquePath(list []string, path string) []string {
@@ -406,26 +498,73 @@ func coveredBy(path string, grants []string) bool {
 }
 
 // persistencePaths lists per-user and machine-wide locations whose contents
-// run automatically at logon or shell start. They are denied when
-// DenyPersistenceWrites is set and a broader write grant would cover them.
-func persistencePaths(env *EnvSet) []string {
+// run automatically at logon, at shell or tool start, or ahead of system
+// commands on PATH. They are denied when DenyPersistenceWrites is set and a
+// broader write grant would cover them. documents is the Documents known
+// folder when it has been redirected (OneDrive), else empty.
+func persistencePaths(env *EnvSet, documents string) []string {
 	var out []string
 	add := func(base string, elems ...string) {
 		if WinIsAbs(base) {
-			out = append(out, WinJoin(base, elems...))
+			out = appendUniquePath(out, WinClean(WinJoin(base, elems...)))
 		}
 	}
 	appData, _ := env.Get("APPDATA")
+	localAppData, _ := env.Get("LOCALAPPDATA")
 	programData, _ := env.Get("PROGRAMDATA")
 	userProfile, _ := env.Get("USERPROFILE")
+	// Logon.
 	add(appData, `Microsoft\Windows\Start Menu\Programs\Startup`)
 	add(programData, `Microsoft\Windows\Start Menu\Programs\StartUp`)
-	add(userProfile, `Documents\WindowsPowerShell`)
-	add(userProfile, `Documents\PowerShell`)
-	add(userProfile, ".bashrc")
-	add(userProfile, ".bash_profile")
-	add(userProfile, ".profile")
+	// PowerShell profiles, under the real Documents folder and the default.
+	for _, docs := range []string{documents, WinJoin(userProfile, "Documents")} {
+		add(docs, "WindowsPowerShell")
+		add(docs, "PowerShell")
+	}
+	// Per-user directories on PATH: a planted program there shadows or
+	// adds commands for every later shell.
+	add(localAppData, `Microsoft\WindowsApps`)
+	add(appData, "npm")
+	// Shell, git, npm and SSH configuration that runs code or grants access.
+	for _, f := range []string{".bashrc", ".bash_profile", ".profile", ".gitconfig", ".npmrc", ".ssh"} {
+		add(userProfile, f)
+	}
 	return out
+}
+
+// grantsInside reports whether any grant lies strictly inside dir; denying
+// dir then also shuts those grants (MXC's strictest-wins rule).
+func grantsInside(dir string, lists ...[]string) bool {
+	for _, list := range lists {
+		for _, g := range list {
+			if !WinEqual(g, dir) && WinHasPrefix(g, dir) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// broadDirectory reports whether dir is too broad to grant just because a
+// program lives there: a volume root, the user profile or one of its
+// ancestors, or the profile's Desktop, Documents or Downloads.
+func broadDirectory(dir string, host Host, userProfile string) bool {
+	if WinIsVolumeRoot(dir) {
+		return true
+	}
+	if !WinIsAbs(userProfile) {
+		return false
+	}
+	userProfile = WinClean(userProfile)
+	if WinHasPrefix(userProfile, dir) {
+		return true
+	}
+	for _, sub := range []string{"Desktop", "Documents", "Downloads"} {
+		if WinEqual(dir, WinJoin(userProfile, sub)) {
+			return true
+		}
+	}
+	return host.Documents != "" && WinEqual(dir, host.Documents)
 }
 
 // translateNetwork maps the safer-exec network fields onto MXC's directional
@@ -449,8 +588,11 @@ func (p *Plan) translateNetwork(cfg config.ExecConfig, host Host, opts Options) 
 		// A ProcessContainer proxy requires the private-network capability
 		// (ingress default allow). safer-exec's proxy is an unpackaged process
 		// without an AppContainer identity, so MXC also requires host-loopback
-		// allow; WFP still confines the container's egress to the proxy
-		// endpoint, so no other host service becomes reachable.
+		// allow. MXC documents this identity-less mode as its weaker option;
+		// on Windows 11 25H2 WFP still confines the container's egress to the
+		// proxy endpoint: other loopback listeners, the host's LAN address and
+		// allowed hosts dialed directly all stay unreachable (covered by
+		// TestWindowsEngineConfinesHostAndProxyBypass).
 		if cfg.AllowLoopback {
 			p.Warnings = append(p.Warnings, "allowLoopback is not available together with the egress proxy on Windows: the container can reach only the proxy endpoint on loopback")
 		}
@@ -593,15 +735,16 @@ func (p *Plan) translateNetwork(cfg config.ExecConfig, host Host, opts Options) 
 
 	if privateDest {
 		n.Ingress.Default = ActionAllow
-		p.Warnings = append(p.Warnings, "private-network destinations require the bidirectional privateNetworkClientServer capability on Windows, which also admits private-network inbound connections")
+		p.Broadened = append(p.Broadened, "private-network destinations need the bidirectional privateNetworkClientServer capability, which also admits private-network inbound connections")
 	}
 	if len(cfg.AllowListen) > 0 {
 		n.Ingress.Default = ActionAllow
-		p.Warnings = append(p.Warnings, "allowListen: Windows containers cannot scope inbound access by address or port; private-network inbound is allowed for this run")
+		p.Broadened = append(p.Broadened, "allowListen cannot be scoped by address or port; private-network inbound is allowed for this run")
 	}
 	if hostLoopback {
 		if opts.HostLoopbackSupported {
 			n.Ingress.HostLoopback = ActionAllow
+			p.Broadened = append(p.Broadened, "host loopback cannot be scoped by port; every loopback service on the host is reachable in both directions")
 		} else {
 			p.Warnings = append(p.Warnings, "host loopback access was requested but this Windows build's container API cannot grant it for direct egress; loopback stays blocked")
 		}
@@ -644,7 +787,13 @@ func isPrivatePrefix(pfx netip.Prefix) bool {
 func (p *Plan) translateLimits(cfg config.ExecConfig, host Host) JobLimits {
 	var l JobLimits
 	if cfg.MaxMemoryMB > 0 {
-		l.MemoryBytes = uint64(cfg.MaxMemoryMB)<<20 + launcherMemoryHeadroom
+		// Saturate rather than wrap: an absurd limit must not become "none".
+		const maxMB = (math.MaxUint64 - launcherMemoryHeadroom) >> 20
+		if mb := uint64(cfg.MaxMemoryMB); mb > maxMB {
+			l.MemoryBytes = math.MaxUint64
+		} else {
+			l.MemoryBytes = mb<<20 + launcherMemoryHeadroom
+		}
 	}
 	if cfg.MaxCPUCores > 0 {
 		ncpu := host.NumCPU
@@ -677,14 +826,14 @@ func (p *Plan) translateLimits(cfg config.ExecConfig, host Host) JobLimits {
 		}
 	}
 	if workload > 0 {
-		l.ActiveProcesses = uint32(workload + launcherProcesses)
+		l.ActiveProcesses = uint32(min(int64(workload)+launcherProcesses, math.MaxUint32))
 	}
 	return l
 }
 
 // collectUnenforced records requested restrictions that Windows cannot
 // enforce for this run, and warns about Linux/macOS-only observability.
-func (p *Plan) collectUnenforced(cfg config.ExecConfig, host Host, env *EnvSet, systemRoot string) {
+func (p *Plan) collectUnenforced(cfg config.ExecConfig, host Host, env *EnvSet, systemRoot string, canon func(string) string) {
 	if cfg.MaxReadIOPS > 0 || cfg.MaxWriteIOPS > 0 || cfg.MaxReadBps > 0 || cfg.MaxWriteBps > 0 {
 		p.Unenforced = append(p.Unenforced, "I/O rate limits (Windows job objects cannot separate read and write limits)")
 	}
@@ -701,15 +850,20 @@ func (p *Plan) collectUnenforced(cfg config.ExecConfig, host Host, env *EnvSet, 
 	// Exec controls. A Windows container can start only executables it can
 	// read, so an entry is enforced when no reachable copy exists; a process
 	// limit that leaves room for nothing but the command itself (blockFork)
-	// enforces every exec restriction.
-	execLimited := cfg.BlockFork && p.Limits.ActiveProcesses > 0
+	// enforces every exec restriction. A batch command is the exception: its
+	// interpreter slots can be taken by any program the script starts, so
+	// they do not stand in for exec rules.
+	execLimited := cfg.BlockFork && p.Limits.ActiveProcesses > 0 && !p.IsBatch
+	if cfg.BlockFork && p.IsBatch {
+		p.Unenforced = append(p.Unenforced, fmt.Sprintf("blockFork for a batch command (%s runs through cmd.exe, and the %d process slots its interpreters need can be used by any program it starts)", WinBase(p.Program), batchShimProcesses))
+	}
 	if len(cfg.AllowExec) > 0 && !execLimited {
 		p.Unenforced = append(p.Unenforced, "allowExec (Windows has no per-executable exec filter; combine with blockFork to forbid child processes)")
 	}
 	if len(cfg.BlockExec) > 0 && !execLimited {
 		var open []string
 		for _, entry := range cfg.BlockExec {
-			if !p.execBlocked(entry, env, systemRoot, host) {
+			if !p.execBlocked(entry, env, systemRoot, host, canon) {
 				open = append(open, entry)
 			}
 		}
@@ -734,14 +888,17 @@ func (p *Plan) collectUnenforced(cfg config.ExecConfig, host Host, env *EnvSet, 
 		p.Warnings = append(p.Warnings, "spoofAntiVM is not supported on Windows")
 	}
 	if cfg.BlockTPM {
-		p.Warnings = append(p.Warnings, "blockTPM is not enforced on Windows (the container has no TPM device grant, but TBS access is not verified)")
+		p.Unenforced = append(p.Unenforced, "blockTPM (the container has no TPM device grant, but access through the TPM Base Services is not verified)")
 	}
 }
 
 // execBlocked reports whether a blockExec entry is unreachable inside the
 // container: an absolute path outside every grant and outside %SystemRoot%,
-// or a bare name with no launchable match in any readable PATH directory.
-func (p *Plan) execBlocked(entry string, env *EnvSet, systemRoot string, host Host) bool {
+// or a bare name with no launchable match in any readable PATH directory. A
+// bare name means "the program PATH would find", as on macOS (which blocks
+// the name in /bin, /usr/bin and /usr/local/bin); a copy stored elsewhere can
+// still be started by its full path.
+func (p *Plan) execBlocked(entry string, env *EnvSet, systemRoot string, host Host, canon func(string) string) bool {
 	entry = strings.TrimSpace(entry)
 	if entry == "" {
 		return true
@@ -757,14 +914,13 @@ func (p *Plan) execBlocked(entry string, env *EnvSet, systemRoot string, host Ho
 			// A POSIX path from a cross-platform policy names nothing here.
 			return true
 		}
-		return !readable(WinClean(entry))
+		return !readable(canon(WinClean(entry)))
 	}
 	pathList, _ := env.Get("PATH")
 	pathExt, _ := env.Get("PATHEXT")
 	exts := launchableExtsFrom(pathExt)
-	for dir := range strings.SplitSeq(pathList, ";") {
-		dir = strings.Trim(strings.TrimSpace(dir), `"`)
-		if dir == "" || !WinIsAbs(dir) || !readable(dir) {
+	for _, dir := range SplitPathList(pathList) {
+		if dir == "" || !WinIsAbs(dir) || !readable(canon(WinClean(dir))) {
 			continue
 		}
 		base := WinJoin(dir, entry)

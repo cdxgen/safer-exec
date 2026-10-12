@@ -37,11 +37,20 @@ var inheritedWindowsEnv = []string{
 var requiredWindowsEnv = []string{"SYSTEMROOT", "LOCALAPPDATA"}
 
 // windowsDangerousEnv lists Windows-specific variables that load code into a
-// process the sandbox allows to run: CLR and CoreCLR profilers inject an
-// arbitrary DLL into every .NET process, DOTNET_STARTUP_HOOKS loads managed
-// assemblies before Main, and __COMPAT_LAYER applies application-compatibility
-// shims. They are stripped unless named in allowEnvs, on top of the
-// cross-platform loader-control filtering config.SanitizeEnv already applied.
+// process the sandbox allows to run:
+//
+//   - CLR and CoreCLR profilers inject an arbitrary DLL into every .NET
+//     process; DOTNET_STARTUP_HOOKS loads managed assemblies before Main;
+//     DOTNET_ADDITIONAL_DEPS and DOTNET_SHARED_STORE add assemblies to the
+//     resolution set; DOTNET_DiagnosticPorts connects the runtime to an
+//     outside diagnostics server that can inject code;
+//   - COMPlus_* is the legacy spelling of every CLR configuration knob,
+//     profilers included;
+//   - __COMPAT_LAYER applies application-compatibility shims;
+//   - PSModulePath decides where PowerShell auto-loads modules from.
+//
+// They are stripped unless named in allowEnvs, on top of the cross-platform
+// loader-control filtering config.SanitizeEnv already applied.
 var windowsDangerousEnv = map[string]bool{
 	"COR_ENABLE_PROFILING":     true,
 	"COR_PROFILER":             true,
@@ -51,10 +60,21 @@ var windowsDangerousEnv = map[string]bool{
 	"CORECLR_ENABLE_PROFILING": true,
 	"CORECLR_PROFILER":         true,
 	"DOTNET_STARTUP_HOOKS":     true,
+	"DOTNET_ADDITIONAL_DEPS":   true,
+	"DOTNET_SHARED_STORE":      true,
+	"DOTNET_DIAGNOSTICPORTS":   true,
 	"__COMPAT_LAYER":           true,
+	"PSMODULEPATH":             true,
 }
 
-var windowsDangerousEnvPrefixes = []string{"CORECLR_PROFILER_PATH", "COR_PROFILER_PATH"}
+var windowsDangerousEnvPrefixes = []string{"CORECLR_PROFILER_PATH", "COR_PROFILER_PATH", "COMPLUS_"}
+
+// noCwdSearchEnv makes CreateProcess, cmd.exe and the C runtime's search skip
+// the current directory when resolving a bare command name. The engine
+// resolves the program itself without searching the working directory, but
+// batch shims (npm.cmd starting node) and the workload's own children would
+// otherwise run a node.exe planted in the project before the one on PATH.
+const noCwdSearchEnv = "NoDefaultCurrentDirectoryInExePath"
 
 // IsWindowsDangerousEnv reports whether key is a Windows code-injection
 // variable (case-insensitive).
@@ -197,6 +217,10 @@ func BuildEnv(opts EnvOptions) (entries []string, dropped []string) {
 			continue
 		}
 		env.Set(k, opts.Config[k])
+	}
+
+	if _, set := env.Get(noCwdSearchEnv); !set {
+		env.Set(noCwdSearchEnv, "1")
 	}
 
 	if opts.Proxy != nil {

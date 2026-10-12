@@ -15,13 +15,19 @@ import (
 //     "message":...,"extended_error":...}}, whenever MXC itself failed (the
 //     process exit code is then 1 or -1);
 //   - a capture pointer, {"type":"captureDenials","outputPath":...}, naming
-//     the denial report actually written (MXC stamps a run id into the file
-//     name).
+//     the denial report it wrote.
 //
 // The envelope can follow unterminated diagnostic text on the same line, so
 // StderrFilter matches the markers anywhere in the stream, forwards every
 // other byte unchanged and as soon as it arrives, and consumes the protocol
 // lines. Only a tail that could still become a marker is held back.
+//
+// Because the workload writes to the same handle, everything here is
+// untrusted: a workload can print lines that look exactly like MXC's. The
+// filter therefore only reports what it saw, and the engine treats it as a
+// hint. Capture pointers are consumed but never surfaced; the engine finds
+// the report in its own run directory instead of following a path the
+// workload could have chosen.
 
 var (
 	envelopeMarker = []byte(`{"error":{"code":"`)
@@ -39,20 +45,15 @@ type Envelope struct {
 	ExtendedError string `json:"extended_error,omitempty"`
 }
 
-// CapturePointer is the stderr line wxc-exec prints after writing a denial
-// report.
-type CapturePointer struct {
-	Type                     string `json:"type"`
-	OutputPath               string `json:"outputPath"`
-	ExitCode                 int64  `json:"exitCode"`
-	TotalDenials             int    `json:"totalDenials"`
-	DeniedResourcesTruncated bool   `json:"deniedResourcesTruncated"`
-	EtlPath                  string `json:"etlPath,omitempty"`
-}
+// Envelope codes MXC emits; anything else is not an MXC envelope.
+const (
+	CodePolicyValidation = "policy_validation"
+	CodeBackendError     = "backend_error"
+)
 
 // IsTimeout reports whether the envelope is MXC's process-timeout result.
 func (e *Envelope) IsTimeout() bool {
-	return e != nil && e.Code == "backend_error" && strings.HasPrefix(e.Message, "script timed out")
+	return e != nil && e.Code == CodeBackendError && strings.HasPrefix(e.Message, "script timed out")
 }
 
 // StderrFilter is an io.Writer that forwards to an underlying writer while
@@ -65,7 +66,6 @@ type StderrFilter struct {
 	lastByte byte
 	wrote    bool
 	envelope *Envelope
-	pointers []CapturePointer
 }
 
 // NewStderrFilter returns a filter forwarding to w.
@@ -151,22 +151,14 @@ func (f *StderrFilter) EnsureNewline() {
 	f.terminateLine()
 }
 
-// Envelope returns the MXC error envelope seen on stderr, if any.
+// Envelope returns the last MXC error envelope seen on stderr, if any. MXC
+// writes its envelope after the workload has exited, so the last one is the
+// genuine one when both are present; the workload can still print one of its
+// own, so callers must corroborate it (see the engine).
 func (f *StderrFilter) Envelope() *Envelope {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.envelope
-}
-
-// CapturePointer returns the last capture pointer seen on stderr, if any.
-func (f *StderrFilter) CapturePointer() *CapturePointer {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.pointers) == 0 {
-		return nil
-	}
-	cp := f.pointers[len(f.pointers)-1]
-	return &cp
 }
 
 func (f *StderrFilter) forward(b []byte) {
@@ -180,29 +172,61 @@ func (f *StderrFilter) forward(b []byte) {
 
 // consumeLine interprets a suspected protocol line. Anything that is not a
 // well-formed MXC protocol object is forwarded verbatim.
+//
+// A workload can leave a marker unterminated so that MXC's genuine line is
+// glued onto it and no longer parses. MXC's line always ends the glued line,
+// so when the whole line does not parse, the last marker inside it is tried
+// on its own and the text before it is forwarded as ordinary output.
 func (f *StderrFilter) consumeLine(line []byte, hadNewline bool) {
 	trimmed := bytes.TrimRight(line, "\r")
-	if bytes.HasPrefix(trimmed, envelopeMarker) {
-		var env struct {
-			Error *Envelope `json:"error"`
-		}
-		if json.Unmarshal(trimmed, &env) == nil && env.Error != nil && env.Error.Code != "" {
-			f.envelope = env.Error
-			f.terminateLine()
-			return
-		}
-	} else if bytes.HasPrefix(trimmed, pointerMarker) {
-		var cp CapturePointer
-		if json.Unmarshal(trimmed, &cp) == nil && cp.Type == "captureDenials" {
-			f.pointers = append(f.pointers, cp)
-			f.terminateLine()
-			return
-		}
+	if f.consumeProtocol(trimmed) {
+		return
+	}
+	if i := protocolSuffix(trimmed); i > 0 {
+		f.forward(trimmed[:i])
+		f.consumeProtocol(trimmed[i:])
+		return
 	}
 	f.forward(line)
 	if hadNewline {
 		f.forward([]byte{'\n'})
 	}
+}
+
+// consumeProtocol records b if it is a well-formed protocol object.
+func (f *StderrFilter) consumeProtocol(b []byte) bool {
+	env, ok := parseProtocol(b)
+	if !ok {
+		return false
+	}
+	if env != nil {
+		f.envelope = env
+	}
+	f.terminateLine()
+	return true
+}
+
+// parseProtocol parses one protocol object: an envelope with one of MXC's
+// codes (returned), or a capture pointer (recognized, then dropped).
+func parseProtocol(b []byte) (*Envelope, bool) {
+	switch {
+	case bytes.HasPrefix(b, envelopeMarker):
+		var env struct {
+			Error *Envelope `json:"error"`
+		}
+		if json.Unmarshal(b, &env) == nil && env.Error != nil &&
+			(env.Error.Code == CodePolicyValidation || env.Error.Code == CodeBackendError) {
+			return env.Error, true
+		}
+	case bytes.HasPrefix(b, pointerMarker):
+		var cp struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(b, &cp) == nil && cp.Type == "captureDenials" {
+			return nil, true
+		}
+	}
+	return nil, false
 }
 
 // terminateLine ends a line of forwarded text that a consumed protocol
@@ -211,6 +235,25 @@ func (f *StderrFilter) terminateLine() {
 	if f.wrote && f.lastByte != '\n' {
 		f.forward([]byte{'\n'})
 	}
+}
+
+// protocolSuffix returns the earliest index after the start of b at which a
+// marker begins a well-formed protocol object running to the end of b, or -1.
+// Scanning from the front lets a marker quoted inside MXC's own message text
+// stay part of that message.
+func protocolSuffix(b []byte) int {
+	for i := 1; i < len(b); {
+		j := indexMarker(b[i:])
+		if j < 0 {
+			return -1
+		}
+		i += j
+		if _, ok := parseProtocol(b[i:]); ok {
+			return i
+		}
+		i++
+	}
+	return -1
 }
 
 func indexMarker(b []byte) int {

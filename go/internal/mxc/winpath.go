@@ -220,3 +220,28 @@ func WinHasPrefix(p, dir string) bool {
 	}
 	return len(cp) > len(cd) && strings.EqualFold(cp[:len(cd)], cd)
 }
+
+// SplitPathList splits a Windows PATH value the way Windows does: on
+// semicolons outside double quotes, with the quotes removed, so a quoted
+// entry may itself contain ';'. Entries are trimmed of surrounding spaces;
+// empty entries are kept as "" for the caller to skip.
+func SplitPathList(list string) []string {
+	if list == "" {
+		return nil
+	}
+	var out []string
+	var cur strings.Builder
+	quoted := false
+	for _, r := range list {
+		switch {
+		case r == '"':
+			quoted = !quoted
+		case r == ';' && !quoted:
+			out = append(out, strings.TrimSpace(cur.String()))
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	return append(out, strings.TrimSpace(cur.String()))
+}

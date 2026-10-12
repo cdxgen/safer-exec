@@ -20,6 +20,11 @@
 //     (error envelope, denial-report pointer);
 //  6. emits audit entries, learned policies, dry-run reports and filesystem
 //     diffs in the same formats as the macOS and Linux engines.
+//
+// The workload shares wxc-exec's stderr, so nothing read from it is trusted
+// on its own: the denial report is read only from the engine's run
+// directory, a timeout is confirmed against the engine's own clock, and
+// audit and diff output are produced whatever MXC appears to have reported.
 package main
 
 import (
@@ -91,7 +96,9 @@ func writeStructured(cfg config.ExecConfig, marker string, data []byte) {
 
 // resolveLauncher locates wxc-exec.exe: an explicit absolute path in
 // SAFER_EXEC_MXC_EXEC, then the engine's own directory (the npm platform
-// package and the standalone bundles ship it there), then PATH.
+// package ships it there). PATH is deliberately not searched: wxc-exec runs
+// with the user's full privileges, and a PATH directory a previous sandbox
+// could write to would let it plant one.
 func resolveLauncher() (string, error) {
 	if p := os.Getenv(launcherEnvVar); p != "" {
 		if !filepath.IsAbs(p) {
@@ -110,12 +117,7 @@ func resolveLauncher() (string, error) {
 			}
 		}
 	}
-	if p, err := exec.LookPath(launcherName); err == nil {
-		if abs, err := filepath.Abs(p); err == nil {
-			return abs, nil
-		}
-	}
-	return "", fmt.Errorf("the MXC executor %s was not found next to the safer-exec runtime or in PATH (set %s to its absolute path)", launcherName, launcherEnvVar)
+	return "", fmt.Errorf("the MXC executor %s was not found next to the safer-exec runtime (set %s to its absolute path)", launcherName, launcherEnvVar)
 }
 
 // launcherEnv is the environment for wxc-exec.exe itself: the engine's own,
@@ -150,9 +152,85 @@ func liveHost() mxc.Host {
 			_, err := os.Stat(p)
 			return err == nil
 		},
-		LookupIP: net.LookupIP,
-		NumCPU:   runtime.NumCPU(),
+		LookupIP:  net.LookupIP,
+		NumCPU:    runtime.NumCPU(),
+		LongPath:  longPath,
+		Documents: documentsFolder(),
 	}
+}
+
+// documentsFolder returns the user's Documents folder, which OneDrive and
+// folder redirection can move. It reads the shell's User Shell Folders key
+// rather than calling SHGetKnownFolderPath, which needs shell32.dll (and
+// with it user32.dll) and fails where those cannot initialize.
+func documentsFolder() string {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders`, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	v, _, err := k.GetStringValue("Personal")
+	if err != nil {
+		return ""
+	}
+	if expanded, err := registry.ExpandString(v); err == nil {
+		v = expanded
+	}
+	if !filepath.IsAbs(v) {
+		return ""
+	}
+	return v
+}
+
+// longPath expands 8.3 short names in an existing path; it returns path
+// unchanged when the expansion fails.
+func longPath(path string) string {
+	in, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return path
+	}
+	buf := make([]uint16, windows.MAX_LONG_PATH)
+	n, err := windows.GetLongPathName(in, &buf[0], uint32(len(buf)))
+	if err != nil || n == 0 || int(n) > len(buf) {
+		return path
+	}
+	return windows.UTF16ToString(buf[:n])
+}
+
+// runRoot is the parent of every run directory. Each request names it as a
+// protected path, so no sandbox (this one or a concurrent one with a broad
+// TEMP grant) can read another run's request, which carries its environment,
+// or rewrite a request or denial report before MXC or the engine reads it.
+func runRoot() string {
+	return filepath.Join(os.TempDir(), "safer-exec-mxc")
+}
+
+// mxcStateDir is where MXC keeps the ACL backups it replays on every start
+// (its crash recovery for the ACL-modifying tier). A workload able to write
+// there could make the next unsandboxed wxc-exec rewrite arbitrary ACLs.
+func mxcStateDir() string {
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "Microsoft", "MXC")
+}
+
+// protectedPaths creates the engine-owned directories (a deny is applied to
+// an existing path) and returns them.
+func protectedPaths() []string {
+	var out []string
+	for _, p := range []string{runRoot(), mxcStateDir()} {
+		if p == "" {
+			continue
+		}
+		if err := os.MkdirAll(p, 0o700); err != nil {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: create %s: %v\n", p, err)
+		}
+		// Long names, so the learner compares them with recorded paths.
+		out = append(out, longPath(p))
+	}
+	return out
 }
 
 // probeHost runs "wxc-exec --probe", which selects the containment tier
@@ -255,7 +333,8 @@ func run(cfg config.ExecConfig) error {
 	}
 	defer releaseFileLocks(locks)
 
-	workDir, err := os.MkdirTemp("", "safer-exec-mxc-")
+	protected := protectedPaths()
+	workDir, err := os.MkdirTemp(runRoot(), "run-")
 	if err != nil {
 		return fmt.Errorf("create run directory: %w", err)
 	}
@@ -289,7 +368,10 @@ func run(cfg config.ExecConfig) error {
 		proxy = &egressProxy{port: 1}
 	}
 
-	opts := mxc.Options{Mode: mode}
+	opts := mxc.Options{Mode: mode, ProtectedPaths: protected}
+	if probe.MutatesHost() {
+		opts.CascadingGrants = true
+	}
 	if proxy != nil {
 		opts.ProxyPort = proxy.port
 		opts.ProxyEnv = proxy.envVars()
@@ -316,6 +398,14 @@ func run(cfg config.ExecConfig) error {
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: not enforced on Windows: %s\n", u)
 		}
 	}
+	if len(plan.Broadened) > 0 {
+		if cfg.Strict {
+			return fmt.Errorf("strict mode: Windows would grant more than requested: %s", strings.Join(plan.Broadened, "; "))
+		}
+		for _, b := range plan.Broadened {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: broader than requested on Windows: %s\n", b)
+		}
+	}
 
 	request, err := json.MarshalIndent(&plan.Request, "", "  ")
 	if err != nil {
@@ -334,16 +424,21 @@ func run(cfg config.ExecConfig) error {
 	}
 	if proxy != nil {
 		if mode == mxc.ModeLearn {
-			fmt.Fprintf(os.Stderr, "safer-exec: learning egress proxy listening on 127.0.0.1:%d; the container can reach only this endpoint\n", proxy.port)
+			fmt.Fprintf(os.Stderr, "safer-exec: learning egress proxy listening on 127.0.0.1:%d; the container can reach only this endpoint, which forwards to any public host and records it\n", proxy.port)
 		} else {
 			fmt.Fprintf(os.Stderr, "safer-exec: egress proxy listening on 127.0.0.1:%d; outbound traffic is confined to it and hostnames are enforced at CONNECT time\n", proxy.port)
 		}
 	}
 
 	var before fsdiff.Snapshot
-	diffRoots := plan.WritePaths
-	if cfg.EnableDiff && len(diffRoots) > 0 && mode == mxc.ModeEnforce {
-		if before, err = fsdiff.SnapshotPath(diffRoots...); err != nil {
+	var snapper *fsdiff.Snapshotter
+	if cfg.EnableDiff && len(plan.WritePaths) > 0 && mode == mxc.ModeEnforce {
+		snapper, err = fsdiff.NewSnapshotter(plan.WritePaths...)
+		if err == nil {
+			before, err = snapper.Snapshot()
+		}
+		if err != nil {
+			snapper = nil
 			fmt.Fprintf(os.Stderr, "safer-exec: warning: pre-snapshot: %v\n", err)
 		}
 	}
@@ -395,8 +490,14 @@ func run(cfg config.ExecConfig) error {
 	}
 	launcherPID := uint32(cmd.Process.Pid)
 
+	started := time.Now()
 	var events sync.WaitGroup
 	var memoryKilled atomic.Bool
+	// workloadStarted records whether any process other than wxc-exec (and
+	// its console host) ever ran in the job. Without a job the engine cannot
+	// tell, and assumes it did.
+	var workloadStarted atomic.Bool
+	workloadStarted.Store(job == nil)
 	if job != nil {
 		onMemoryLimit := func() {
 			if memoryKilled.CompareAndSwap(false, true) {
@@ -408,28 +509,29 @@ func run(cfg config.ExecConfig) error {
 		events.Add(1)
 		go func() {
 			defer events.Done()
-			consumeJobEvents(cfg, job, launcherPID, stderr, onMemoryLimit)
+			consumeJobEvents(cfg, job, launcherPID, stderr, onMemoryLimit, &workloadStarted)
 		}()
 	}
 
-	var backstopFired bool
-	var backstopMu sync.Mutex
+	var backstopFired atomic.Bool
+	var backstop *time.Timer
 	if cfg.TimeoutMs > 0 {
 		deadline := time.Duration(cfg.TimeoutMs)*time.Millisecond + timeoutGrace
-		timer := time.AfterFunc(deadline, func() {
-			backstopMu.Lock()
-			backstopFired = true
-			backstopMu.Unlock()
+		backstop = time.AfterFunc(deadline, func() {
+			backstopFired.Store(true)
 			if job != nil {
 				_ = job.Terminate(timeoutExitCode)
 			} else {
 				_ = cmd.Process.Kill()
 			}
 		})
-		defer timer.Stop()
 	}
 
 	waitErr := cmd.Wait()
+	if backstop != nil {
+		backstop.Stop()
+	}
+	elapsed := time.Since(started)
 	_ = stderr.Close()
 	var exitErr *exec.ExitError
 	if waitErr != nil && !errors.As(waitErr, &exitErr) {
@@ -442,6 +544,10 @@ func run(cfg config.ExecConfig) error {
 		// also ends the event stream.
 		_ = job.Close()
 		events.Wait()
+		if n := job.Dropped(); n > 0 {
+			stderr.EnsureNewline()
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: %d job notifications were dropped; traceExec and limit reports may be incomplete\n", n)
+		}
 	}
 	if memoryKilled.Load() {
 		stderr.EnsureNewline()
@@ -453,27 +559,67 @@ func run(cfg config.ExecConfig) error {
 		proxy.flushViolations()
 	}
 
-	backstopMu.Lock()
-	timedOut := backstopFired
-	backstopMu.Unlock()
+	// MXC prints an error envelope only when it fails, and then exits
+	// non-zero. The workload can print a look-alike, so an envelope is
+	// believed only with a non-zero exit, and a timeout only when the
+	// engine's own clock agrees.
 	envelope := stderr.Envelope()
-	switch {
-	case envelope.IsTimeout() || timedOut:
-		if mode == mxc.ModeEnforce {
+	if exitCode == 0 {
+		envelope = nil
+	}
+	timeoutElapsed := cfg.TimeoutMs > 0 && elapsed >= time.Duration(cfg.TimeoutMs)*time.Millisecond
+	timedOut := backstopFired.Load() ||
+		(timeoutElapsed && (envelope.IsTimeout() || exitCode == mxcTimeoutExitCode))
+	if envelope.IsTimeout() && !timedOut {
+		envelope = nil // a forged timeout report
+	}
+
+	// emitResults writes the audit and diff for an enforced run. It runs on
+	// every enforce-mode exit path, so neither a forged envelope nor a
+	// failure can suppress the record of what the workload did.
+	emitResults := func() {
+		if mode != mxc.ModeEnforce {
+			return
+		}
+		if cfg.EnableAudit {
 			collectAudit(cfg, stderr, workDir, plan.SystemRoot)
+		}
+		if snapper != nil {
+			if after, err := snapper.Snapshot(); err != nil {
+				fmt.Fprintf(os.Stderr, "safer-exec: warning: post-snapshot: %v\n", err)
+			} else {
+				data, _ := json.Marshal(fsdiff.Diff(before, after))
+				writeStructured(cfg, "FSDIFF:", data)
+			}
+		}
+	}
+
+	switch {
+	case !workloadStarted.Load() && exitCode != 0:
+		// wxc-exec failed before any workload process existed: a request
+		// rejection or a container start failure, never the workload's own
+		// exit status.
+		if envelope != nil {
+			return mxcFailure(cfg, envelope)
+		}
+		return fmt.Errorf("windows sandbox: MXC exited with status %d before starting the workload; see its message above", exitCode)
+	case timedOut:
+		if mode == mxc.ModeEnforce {
+			emitResults()
 			return &ExitError{Code: timeoutExitCode}
 		}
 	case envelope != nil && !memoryKilled.Load():
 		// A workload killed for exceeding its memory limit already reported
 		// why; any MXC diagnostic about its abnormal exit is a consequence.
+		emitResults()
 		return mxcFailure(cfg, envelope)
 	}
 
 	switch mode {
 	case mxc.ModeLearn:
-		return finishLearn(cfg, plan, stderr, workDir, proxy)
+		return finishLearn(cfg, plan, workDir, proxy, protected)
 	case mxc.ModeDryRun:
-		report := readCaptureReport(stderr, workDir, plan.SystemRoot)
+		report := readCaptureReport(workDir, plan.SystemRoot)
 		result := buildDryRunResult(report.DryRunEvents(), cfg.Cmd, cfg.Args)
 		data, err := json.Marshal(result)
 		if err != nil {
@@ -483,22 +629,16 @@ func run(cfg config.ExecConfig) error {
 		return nil
 	}
 
-	if cfg.EnableAudit {
-		collectAudit(cfg, stderr, workDir, plan.SystemRoot)
-	}
-	if cfg.EnableDiff && len(diffRoots) > 0 {
-		if after, err := fsdiff.SnapshotPath(diffRoots...); err != nil {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: post-snapshot: %v\n", err)
-		} else {
-			data, _ := json.Marshal(fsdiff.Diff(before, after))
-			writeStructured(cfg, "FSDIFF:", data)
-		}
-	}
+	emitResults()
 	if exitCode != 0 {
 		return &ExitError{Code: exitCode}
 	}
 	return nil
 }
+
+// mxcTimeoutExitCode is wxc-exec's exit status when MXC's own timer stopped
+// the workload (-1 as an unsigned exit code).
+const mxcTimeoutExitCode = 0xFFFFFFFF
 
 // mxcFailure turns MXC's error envelope into the engine's error, replacing
 // MXC's generic advice where safer-exec knows the actual cause.
@@ -541,7 +681,7 @@ func emitAudit(stderr *mxc.StderrFilter, entryType, target, details string) {
 // consumeJobEvents turns job notifications into traceExec and resource-limit
 // audit entries. Console host processes the OS attaches to the workload are
 // plumbing, not workload activity, and are not reported.
-func consumeJobEvents(cfg config.ExecConfig, job *winjob.Job, launcherPID uint32, stderr *mxc.StderrFilter, onMemoryLimit func()) {
+func consumeJobEvents(cfg config.ExecConfig, job *winjob.Job, launcherPID uint32, stderr *mxc.StderrFilter, onMemoryLimit func(), workloadStarted *atomic.Bool) {
 	conhost := ""
 	if root := os.Getenv("SystemRoot"); root != "" {
 		conhost = filepath.Join(root, "System32", "conhost.exe")
@@ -550,14 +690,23 @@ func consumeJobEvents(cfg config.ExecConfig, job *winjob.Job, launcherPID uint32
 	for ev := range job.Events() {
 		switch ev.Message {
 		case winjob.MsgNewProcess:
-			if !traceExec || ev.PID == launcherPID {
+			if ev.PID == launcherPID {
 				continue
 			}
-			image := winjob.ProcessImage(ev.PID)
-			if image == "" || strings.EqualFold(image, conhost) {
+			image, ppid, ok := job.Describe(ev.PID)
+			if ok && strings.EqualFold(image, conhost) {
 				continue
 			}
-			ppid := winjob.ParentPID(ev.PID)
+			workloadStarted.Store(true)
+			if !traceExec {
+				continue
+			}
+			if !ok {
+				// Gone before it could be opened: report it rather than let
+				// a short-lived process slip past traceExec.
+				emitAudit(stderr, "process-exec", "(exited before it could be identified)", fmt.Sprintf("pid %d", ev.PID))
+				continue
+			}
 			emitAudit(stderr, "process-exec", image, fmt.Sprintf("pid %d started by pid %d", ev.PID, ppid))
 		case winjob.MsgActiveProcessLimit:
 			if cfg.EnableAudit {
@@ -572,20 +721,24 @@ func consumeJobEvents(cfg config.ExecConfig, job *winjob.Job, launcherPID uint32
 	}
 }
 
-// readCaptureReport loads the denial report named by MXC's stderr pointer,
-// falling back to the run directory when the pointer was not seen, and drops
-// the start-up denials every container process produces.
-func readCaptureReport(stderr *mxc.StderrFilter, workDir, systemRoot string) *mxc.DenialReport {
+// readCaptureReport loads the denial report MXC wrote into the run directory
+// (it stamps a run id into the requested name: denials.<id>.json) and drops
+// the start-up denials every container process produces. The capture pointer
+// MXC prints on stderr is ignored: the workload can print one too, and
+// following it would let the workload pick a file for the engine to read and
+// delete. The run directory is denied to every sandbox, so only MXC can have
+// written there.
+func readCaptureReport(workDir, systemRoot string) *mxc.DenialReport {
 	var path string
-	if ptr := stderr.CapturePointer(); ptr != nil && ptr.OutputPath != "" {
-		path = ptr.OutputPath
-	} else if matches, _ := filepath.Glob(filepath.Join(workDir, "denials.*.json")); len(matches) > 0 {
-		sort.Strings(matches)
-		for _, m := range matches {
-			if !strings.HasSuffix(strings.ToLower(m), ".verbose.json") {
-				path = m
-				break
-			}
+	matches, _ := filepath.Glob(filepath.Join(workDir, "denials.*.json"))
+	sort.Strings(matches)
+	for _, m := range matches {
+		if strings.HasSuffix(strings.ToLower(m), ".verbose.json") || !strings.EqualFold(filepath.Dir(m), workDir) {
+			continue
+		}
+		if fi, err := os.Lstat(m); err == nil && fi.Mode().IsRegular() {
+			path = m
+			break
 		}
 	}
 	if path == "" {
@@ -593,7 +746,8 @@ func readCaptureReport(stderr *mxc.StderrFilter, workDir, systemRoot string) *mx
 		return &mxc.DenialReport{}
 	}
 	report, err := mxc.ReadDenialReport(path)
-	// The reports can name sensitive paths; they never outlive the run.
+	// The reports can name sensitive paths; they never outlive the run (the
+	// run directory itself is removed when the run ends).
 	_ = os.Remove(path)
 	_ = os.Remove(mxc.VerboseSibling(path))
 	if err != nil {
@@ -611,7 +765,7 @@ func collectAudit(cfg config.ExecConfig, stderr *mxc.StderrFilter, workDir, syst
 	if !cfg.EnableAudit {
 		return
 	}
-	report := readCaptureReport(stderr, workDir, systemRoot)
+	report := readCaptureReport(workDir, systemRoot)
 	const maxAuditEntries = 1000
 	entries := report.AuditEntries()
 	if len(entries) > maxAuditEntries {
@@ -624,13 +778,14 @@ func collectAudit(cfg config.ExecConfig, stderr *mxc.StderrFilter, workDir, syst
 }
 
 // finishLearn builds, merges and emits the learned policy.
-func finishLearn(cfg config.ExecConfig, plan *mxc.Plan, stderr *mxc.StderrFilter, workDir string, proxy *egressProxy) error {
+func finishLearn(cfg config.ExecConfig, plan *mxc.Plan, workDir string, proxy *egressProxy, protected []string) error {
 	in := mxc.LearnInput{
 		Cmd:             cfg.Cmd,
 		Args:            cfg.Args,
-		Report:          readCaptureReport(stderr, workDir, plan.SystemRoot),
+		Report:          readCaptureReport(workDir, plan.SystemRoot),
 		Plan:            plan,
 		NetworkDisabled: cfg.DisableNetwork,
+		Forbidden:       protected,
 	}
 	if proxy != nil {
 		in.ProxyTargets = proxy.connectedTargets()
@@ -878,6 +1033,15 @@ func windowsRelease(build uint32) string {
 	name := "Windows 10"
 	if build >= 22000 {
 		name = "Windows 11"
+	}
+	// Server editions share client build numbers; MXC supports only
+	// Windows 11 client builds.
+	if kind, _, _ := k.GetStringValue("InstallationType"); strings.EqualFold(kind, "Server") || strings.EqualFold(kind, "Server Core") {
+		if product, _, _ := k.GetStringValue("ProductName"); product != "" {
+			name = product
+		} else {
+			name = "Windows Server"
+		}
 	}
 	if display != "" {
 		return fmt.Sprintf("%s %s (build %d.%d)", name, display, build, ubr)

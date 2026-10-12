@@ -30,7 +30,7 @@ func TestStderrFilterPassThrough(t *testing.T) {
 	if out.String() != in {
 		t.Errorf("output altered: %q", out.String())
 	}
-	if f.Envelope() != nil || f.CapturePointer() != nil {
+	if f.Envelope() != nil {
 		t.Error("spurious protocol objects")
 	}
 }
@@ -47,16 +47,15 @@ func TestStderrFilterEnvelopeMidLine(t *testing.T) {
 }
 
 func TestStderrFilterPointerAndSplitWrites(t *testing.T) {
-	stream := "before\n" + testPointer + "\nafter\n"
+	stream := "before\n" + testPointer + "\nafter\n" + testEnvelope + "\n"
 	// Every split point, including inside the marker prefix.
 	for i := 0; i <= len(stream); i++ {
 		f, out := feed(stream[:i], stream[i:])
 		if out.String() != "before\nafter\n" {
 			t.Fatalf("split %d: output %q", i, out.String())
 		}
-		p := f.CapturePointer()
-		if p == nil || p.OutputPath != `C:\run\denials.42_ab.json` || p.TotalDenials != 3 || p.ExitCode != 1 {
-			t.Fatalf("split %d: pointer %+v", i, p)
+		if f.Envelope() == nil {
+			t.Fatalf("split %d: envelope lost", i)
 		}
 	}
 	// Byte-at-a-time delivery.
@@ -64,7 +63,7 @@ func TestStderrFilterPointerAndSplitWrites(t *testing.T) {
 	for _, b := range []byte(stream) {
 		chunks = append(chunks, string(b))
 	}
-	if f, out := feed(chunks...); out.String() != "before\nafter\n" || f.CapturePointer() == nil {
+	if f, out := feed(chunks...); out.String() != "before\nafter\n" || f.Envelope() == nil {
 		t.Errorf("byte-wise: %q", out.String())
 	}
 }
@@ -75,7 +74,7 @@ func TestStderrFilterMalformedMarkerIsForwarded(t *testing.T) {
 	if out.String() != in {
 		t.Errorf("output = %q", out.String())
 	}
-	if f.Envelope() != nil || f.CapturePointer() != nil {
+	if f.Envelope() != nil {
 		t.Error("malformed marker interpreted")
 	}
 }
@@ -117,7 +116,7 @@ func TestStderrFilterEmitStartsFreshLine(t *testing.T) {
 
 func TestEnvelopeIsTimeout(t *testing.T) {
 	if !(&Envelope{Code: "backend_error", Message: "script timed out after 2500ms"}).IsTimeout() {
-		t.Error("timeout not recognised")
+		t.Error("timeout not recognized")
 	}
 	if (&Envelope{Code: "policy_validation", Message: "script timed out"}).IsTimeout() {
 		t.Error("policy error treated as timeout")
@@ -125,5 +124,63 @@ func TestEnvelopeIsTimeout(t *testing.T) {
 	var nilEnv *Envelope
 	if nilEnv.IsTimeout() {
 		t.Error("nil envelope treated as timeout")
+	}
+}
+
+// Only MXC's two envelope codes are protocol; other JSON with the same shape
+// (an npm error, say) is the workload's output and passes through.
+func TestStderrFilterUnknownEnvelopeCodeIsOutput(t *testing.T) {
+	in := `{"error":{"code":"E404","message":"Not Found"}}` + "\n"
+	f, out := feed(in)
+	if f.Envelope() != nil || out.String() != in {
+		t.Errorf("envelope %+v, output %q", f.Envelope(), out.String())
+	}
+}
+
+// A workload that leaves a marker unterminated must not hide MXC's genuine
+// envelope, which arrives glued onto the same line.
+func TestStderrFilterUnterminatedMarkerCannotMaskEnvelope(t *testing.T) {
+	for _, prefix := range []string{`{"error":{"code":"`, `{"type":"captureDenials"`, `{"error":{"code":"backend_error"`} {
+		f, out := feed("log\n"+prefix, testEnvelope+"\n")
+		env := f.Envelope()
+		if env == nil || env.ExtendedError != "WIN32_ERROR(2)" {
+			t.Errorf("prefix %q masked the envelope: %+v", prefix, env)
+		}
+		if want := "log\n" + prefix + "\n"; out.String() != want {
+			t.Errorf("prefix %q: output %q, want %q", prefix, out.String(), want)
+		}
+	}
+}
+
+// MXC writes its envelope last, so a forged one printed earlier by the
+// workload does not win.
+func TestStderrFilterLastEnvelopeWins(t *testing.T) {
+	forged := `{"error":{"code":"backend_error","message":"script timed out after 1ms"}}`
+	f, _ := feed(forged+"\n", testEnvelope+"\n")
+	if env := f.Envelope(); env == nil || env.IsTimeout() {
+		t.Errorf("envelope = %+v, want MXC's genuine one", env)
+	}
+}
+
+// Capture pointers are consumed without being retained, so a workload that
+// prints millions of them cannot grow the engine's memory.
+func TestStderrFilterPointersAreNotRetained(t *testing.T) {
+	var out bytes.Buffer
+	f := NewStderrFilter(&out)
+	line := []byte(`{"type":"captureDenials","outputPath":"C:\\x"}` + "\n")
+	for range 10000 {
+		_, _ = f.Write(line)
+	}
+	_ = f.Close()
+	if out.Len() != 0 || f.Envelope() != nil {
+		t.Errorf("pointer lines leaked: %d bytes, envelope %+v", out.Len(), f.Envelope())
+	}
+}
+
+func TestStderrFilterMarkerQuotedInsideEnvelope(t *testing.T) {
+	genuine := `{"error":{"code":"backend_error","message":"saw {\"error\":{\"code\":\" in output"}}`
+	f, _ := feed(`{"error":{"code":"`, genuine+"\n")
+	if env := f.Envelope(); env == nil || !strings.Contains(env.Message, "in output") {
+		t.Errorf("envelope = %+v", env)
 	}
 }
