@@ -2199,17 +2199,24 @@ export class SaferExec extends EventEmitter {
     effectiveWritePaths = Array.from(new Set(effectiveWritePaths));
 
     const effectiveBlockExec = [...this._blockExec];
-    try {
-      const { resolveBinaryPath } = await import('./runner.js');
-      const binPath = resolveBinaryPath();
-      if (binPath && !effectiveBlockExec.includes(binPath)) {
-        effectiveBlockExec.push(binPath);
-      }
-    } catch {}
+    // Forbid the sandboxed command from re-running safer-exec itself. Not on
+    // Windows: a container cannot create another container (the OS refuses
+    // to make a security environment from inside one), and a container can
+    // start any program it can read, so these entries would only be reported
+    // as unenforceable and fail every strict run.
+    const blockSelf = process.platform !== 'win32';
+    if (blockSelf) {
+      try {
+        const { resolveBinaryPath } = await import('./runner.js');
+        const binPath = resolveBinaryPath();
+        if (binPath && !effectiveBlockExec.includes(binPath)) {
+          effectiveBlockExec.push(binPath);
+        }
+      } catch {}
+    }
 
-    const pathEnv = process.env.PATH || '';
-    const delimiter = process.platform === 'win32' ? ';' : ':';
-    for (const p of pathEnv.split(delimiter)) {
+    const pathEnv = blockSelf ? process.env.PATH || '' : '';
+    for (const p of pathEnv.split(':')) {
       if (!p) continue;
       for (const name of ['safer-exec', 'safer-exec-rt']) {
         try {
@@ -2220,7 +2227,7 @@ export class SaferExec extends EventEmitter {
         } catch {}
       }
     }
-    for (const name of ['safer-exec', 'safer-exec-rt']) {
+    for (const name of blockSelf ? ['safer-exec', 'safer-exec-rt'] : []) {
       if (!effectiveBlockExec.includes(name)) {
         effectiveBlockExec.push(name);
       }
@@ -2472,6 +2479,9 @@ export async function saferExec(cmd, args = [], options = {}) {
 SaferExec.diagnostics = async function () {
   const { resolveBinaryPath } = await import('./runner.js');
   const binaryPath = resolveBinaryPath();
+  if (!binaryPath) {
+    throw new Error(`safer-exec: no engine binary for ${process.platform}-${process.arch}`);
+  }
   const { spawn } = await import('node:child_process');
 
   return new Promise((resolvePromise, reject) => {

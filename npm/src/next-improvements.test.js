@@ -10,6 +10,7 @@
 import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { SaferExec } from './index.js';
+import { findOnWindowsPath } from './runner.js';
 import { tmpdir } from 'node:os';
 import { writeFileSync, unlinkSync, existsSync } from 'node:fs';
 
@@ -438,6 +439,19 @@ describe('Next Improvements API', () => {
   });
 
   describe('Windows options', () => {
+    it('resolves the Windows engine from absolute PATH entries only', () => {
+      // Empty, relative and drive-less entries resolve against the current
+      // directory, where a scanned project could plant safer-exec-rt.exe.
+      strict.equal(findOnWindowsPath('safer-exec-rt.exe', { PATH: ';.;bin;\\tools;"relative\\dir"' }), undefined);
+      strict.equal(findOnWindowsPath('safer-exec-rt.exe', {}), undefined);
+    });
+
+    it('does not add self-blocking blockExec entries on Windows only', async () => {
+      const { config } = await new SaferExec()._buildConfig('node', []);
+      const selfBlocked = config.blockExec.includes('safer-exec-rt');
+      strict.equal(selfBlocked, process.platform !== 'win32');
+    });
+
     it('should default to off', async () => {
       const s = new SaferExec();
       strict.equal(s._windowsAllowDaclMutation, false);

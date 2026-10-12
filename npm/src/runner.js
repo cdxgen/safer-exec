@@ -22,7 +22,7 @@
 
 import { spawn, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, win32 } from 'node:path';
 import { readFileSync, existsSync, mkdtempSync, rmSync, copyFileSync, chmodSync, realpathSync } from 'node:fs';
 import { tmpdir, platform, arch } from 'node:os';
 import { createRequire } from 'node:module';
@@ -154,8 +154,10 @@ export function resolveBinaryPath() {
     );
   }
   if (isWindows) {
-    // PATH resolution by name; the engine finds wxc-exec.exe next to itself.
-    return 'safer-exec-rt.exe';
+    // Never hand Windows a bare name: CreateProcess searches the current
+    // directory before PATH, so a safer-exec-rt.exe planted in the project
+    // being scanned would run unsandboxed. Search absolute PATH entries only.
+    return findOnWindowsPath('safer-exec-rt.exe');
   }
   // Try PATH
   const defaultGlobalPath = '/usr/local/bin/safer-exec-rt';
@@ -165,6 +167,48 @@ export function resolveBinaryPath() {
     }
   } catch {}
   return 'safer-exec-rt';
+}
+
+/**
+ * Finds an executable in the absolute directories of PATH (Windows spells the
+ * variable in any case). Relative and empty entries are skipped because they
+ * resolve against the current directory.
+ *
+ * @param {string} name - File name including its extension
+ * @param {object} [env=process.env] - Environment to read PATH from
+ * @returns {string|undefined} The absolute path, or undefined when not found
+ */
+export function findOnWindowsPath(name, env = process.env) {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === 'PATH');
+  for (const dir of (key ? env[key] : '').split(';')) {
+    const entry = dir.trim().replace(/^"(.*)"$/, '$1');
+    if (!entry || !win32.isAbsolute(entry) || /^[\\/](?![\\/])/.test(entry)) {
+      continue;
+    }
+    const candidate = win32.join(entry, name);
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolves the engine binary or fails with an actionable message.
+ *
+ * @param {string} [override] - Explicit binary path from the caller
+ * @returns {string} The engine path
+ * @throws {Error} When no engine is available for this platform
+ */
+function requireBinaryPath(override) {
+  const binaryPath = override || resolveBinaryPath();
+  if (!binaryPath) {
+    throw new Error(
+      `safer-exec: no engine binary for ${platform()}-${arch()}. Install the matching ` +
+        '@cdxgen/safer-exec-<platform>-<arch> package or put safer-exec-rt on PATH.',
+    );
+  }
+  return binaryPath;
 }
 
 /**
@@ -211,7 +255,7 @@ export function killEngine(child) {
  * @returns {Promise<ExecResult>} The execution result
  */
 export async function run(config, options = {}) {
-  const binaryPath = options.binaryPath || resolveBinaryPath();
+  const binaryPath = requireBinaryPath(options.binaryPath);
   const timeout = options.timeout || 60000;
 
   const child = spawn(binaryPath, [], engineSpawnOptions());
@@ -543,7 +587,7 @@ export function readStructuredFile(filePath) {
  * @returns {Promise<{ exitCode: number, timedOut: boolean, fsDiff: object|null, learnedPolicy: object|null, profile: string|null }>}
  */
 export async function runPipe(config, options = {}) {
-  const binaryPath = options.binaryPath || resolveBinaryPath();
+  const binaryPath = requireBinaryPath(options.binaryPath);
   const timeout = options.timeout || 60000;
   const outStream = options.stdout === null ? null : (options.stdout ?? process.stdout);
   const errStream = options.stderr === null ? null : (options.stderr ?? process.stderr);
