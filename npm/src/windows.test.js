@@ -26,6 +26,7 @@ const isWindows = process.platform === 'win32';
 const cliPath = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
 
 let skipReason = isWindows ? '' : 'Windows only';
+let diagnostics = {};
 
 // realpathSync.native expands 8.3 short names (a runner's TEMP is often
 // C:\Users\RUNNER~1\...), matching the long names the engine reports.
@@ -45,6 +46,7 @@ describe('Windows engine (MXC)', { skip: !isWindows && 'Windows only' }, () => {
   before(async () => {
     try {
       const info = await SaferExec.diagnostics();
+      diagnostics = info;
       if (!info.features?.base_container || info.capabilities?.host_acl_mutation_required?.available) {
         skipReason = `MXC BaseContainer tier unavailable: ${JSON.stringify(info.capabilities?.mxc_probe ?? info.capabilities?.mxc_executor)}`;
       }
@@ -154,6 +156,28 @@ describe('Windows engine (MXC)', { skip: !isWindows && 'Windows only' }, () => {
       strict.doesNotMatch(res.stdout, /nested-child/);
       strict.ok(res.auditLog.some((e) => e.type === 'process-exec'), JSON.stringify(res.auditLog));
       strict.ok(res.auditLog.some((e) => e.type === 'resource-limit'), JSON.stringify(res.auditLog));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports the DLLs the workload loads with traceLibraries', async (t) => {
+    if (skipReason) return t.skip(skipReason);
+    if (!diagnostics.features?.trace_libraries) {
+      return t.skip(`library tracing unavailable: ${diagnostics.capabilities?.library_tracing?.detail}`);
+    }
+    const dir = workDir();
+    try {
+      const res = await new SaferExec()
+        .workingDir(dir)
+        .traceLibraries()
+        .suppressLibLoadStderr(true)
+        .run('cmd.exe', ['/c', 'ver']);
+      strict.equal(res.exitCode, 0, res.stderr);
+      const libs = res.auditLog.filter((e) => e.type === 'lib-load').map((e) => e.target.toLowerCase());
+      strict.ok(libs.some((p) => p.endsWith('\\system32\\ntdll.dll')), JSON.stringify(libs));
+      strict.ok(!libs.some((p) => p.endsWith('\\cmd.exe') || p.endsWith('\\wxc-exec.exe')), JSON.stringify(libs));
+      strict.doesNotMatch(res.stderr, /"lib-load"/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

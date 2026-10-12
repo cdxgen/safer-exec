@@ -451,7 +451,8 @@ func TestTranslateUnsupportedControls(t *testing.T) {
 		Cmd: "cmd", BlockJIT: true, BlockCrypto: true, TraceCrypto: true, TraceLibraries: true,
 		SeccompFilters: []config.SeccompFilterSpec{{Policy: "DEFAULT KILL"}}, TmpOverlayPaths: []string{`C:\x`},
 		BindFds: []config.BindFdSpec{{Fd: 3, Target: "/x"}}, SpoofAntiVM: true, BlockTPM: true,
-		// Linux/macOS-only knobs are ignored without noise.
+		// Linux/macOS-only knobs are ignored without noise; traceLibraries is
+		// the engine's (an ETW session), not the container's.
 		ProtectSystem: "strict", ProtectHome: "tmpfs", PrivateTmp: true, UseReaper: true, BlockInterpreters: true,
 	}
 	p := mustTranslate(t, cfg, Options{})
@@ -460,12 +461,12 @@ func TestTranslateUnsupportedControls(t *testing.T) {
 			t.Errorf("%s not reported unenforced: %v", s, p.Unenforced)
 		}
 	}
-	for _, s := range []string{"eBPF", "traceLibraries", "tmpOverlayPaths", "bindFds", "spoofAntiVM"} {
+	for _, s := range []string{"eBPF", "tmpOverlayPaths", "bindFds", "spoofAntiVM"} {
 		if !hasSubstring(p.Warnings, s) {
 			t.Errorf("%s not warned: %v", s, p.Warnings)
 		}
 	}
-	for _, s := range []string{"protectSystem", "protectHome", "privateTmp", "useReaper", "blockInterpreters"} {
+	for _, s := range []string{"protectSystem", "protectHome", "privateTmp", "useReaper", "blockInterpreters", "traceLibraries"} {
 		if hasSubstring(p.Warnings, s) || hasSubstring(p.Unenforced, s) {
 			t.Errorf("%s should be silent", s)
 		}

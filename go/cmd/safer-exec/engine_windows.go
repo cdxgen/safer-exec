@@ -19,7 +19,9 @@
 //  5. forwards the workload's output while extracting MXC's stderr protocol
 //     (error envelope, denial-report pointer);
 //  6. emits audit entries, learned policies, dry-run reports and filesystem
-//     diffs in the same formats as the macOS and Linux engines.
+//     diffs in the same formats as the macOS and Linux engines, and, with
+//     traceLibraries, the DLLs the workload loaded, from an ETW session the
+//     engine runs outside the container (internal/dlltrace).
 //
 // The workload shares wxc-exec's stderr, so nothing read from it is trusted
 // on its own: the denial report is read only from the engine's run
@@ -47,6 +49,7 @@ import (
 	"golang.org/x/sys/windows/registry"
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
+	"github.com/cdxgen/safer-exec/go/internal/dlltrace"
 	"github.com/cdxgen/safer-exec/go/internal/fsdiff"
 	"github.com/cdxgen/safer-exec/go/internal/mxc"
 	"github.com/cdxgen/safer-exec/go/internal/winjob"
@@ -460,6 +463,22 @@ func run(cfg config.ExecConfig) error {
 		defer job.Close()
 	}
 
+	// Library tracing needs its ETW session running before wxc-exec starts,
+	// so even the workload's first DLLs are recorded.
+	var libTrace *dlltrace.Session
+	if cfg.TraceLibraries {
+		libTrace, err = dlltrace.Start()
+		if err != nil {
+			if cfg.Strict {
+				return fmt.Errorf("traceLibraries: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: traceLibraries: %v; no lib-load entries will be reported\n", err)
+			libTrace = nil
+		} else {
+			defer libTrace.Stop()
+		}
+	}
+
 	stderr := mxc.NewStderrFilter(os.Stderr)
 	cmd := exec.Command(launcher, "--config", requestPath)
 	cmd.Stdin = os.Stdin
@@ -557,6 +576,9 @@ func run(cfg config.ExecConfig) error {
 	if proxy != nil && mode != mxc.ModeLearn {
 		stderr.EnsureNewline()
 		proxy.flushViolations()
+	}
+	if libTrace != nil {
+		emitLibraryLoads(libTrace, launcherPID, stderr)
 	}
 
 	// MXC prints an error envelope only when it fails, and then exits
@@ -718,6 +740,63 @@ func consumeJobEvents(cfg config.ExecConfig, job *winjob.Job, launcherPID uint32
 			}
 			onMemoryLimit()
 		}
+	}
+}
+
+// maxLibraryLoads bounds the lib-load entries one run reports; a workload
+// could otherwise load copies of a DLL under endless names.
+const maxLibraryLoads = 10000
+
+// emitLibraryLoads stops the ETW session and reports, as lib-load audit
+// entries, each image the workload's process tree loaded. wxc-exec's own
+// loads, each process's executable, and the console hosts Windows attaches
+// to the workload are left out, as traceExec leaves them out. The events come
+// from the kernel through the engine's own session, so the workload cannot
+// hide a load; it can only make many of them (and, as with every audit
+// entry, print look-alike lines on the stderr it shares with the engine).
+func emitLibraryLoads(s *dlltrace.Session, launcherPID uint32, stderr *mxc.StderrFilter) {
+	res := s.Stop()
+	stderr.EnsureNewline()
+	if res.Err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: traceLibraries: %v\n", res.Err)
+	}
+	if res.StoppedEarly {
+		fmt.Fprintln(os.Stderr, "safer-exec: warning: traceLibraries: the ETW session was stopped before the run ended; the library list is incomplete")
+	}
+	if res.Lost > 0 {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: traceLibraries: %d events were lost; the library list may be incomplete\n", res.Lost)
+	}
+	mapper := dlltrace.SystemPathMapper()
+	conhost := ""
+	if root := os.Getenv("SystemRoot"); root != "" {
+		conhost = filepath.Join(root, "System32", "conhost.exe")
+	}
+	skip := func(image string) bool {
+		return conhost != "" && strings.EqualFold(mapper.Win32Path(image), conhost)
+	}
+	loads := dlltrace.Attribute(res.Events, dlltrace.Root{PID: launcherPID, ParentPID: uint32(os.Getpid())}, skip)
+	seen := make(map[string]bool, len(loads))
+	reported := 0
+	for _, l := range loads {
+		path := mapper.Win32Path(l.Path)
+		if filepath.IsAbs(path) {
+			path = longPath(path)
+		}
+		key := strings.ToLower(path)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if reported == maxLibraryLoads {
+			fmt.Fprintf(os.Stderr, "safer-exec: warning: traceLibraries: more than %d distinct images were loaded; the rest are not reported\n", maxLibraryLoads)
+			break
+		}
+		process := "unknown process"
+		if l.Process != "" {
+			process = filepath.Base(mapper.Win32Path(l.Process))
+		}
+		emitAudit(stderr, "lib-load", path, fmt.Sprintf("loaded by %s (pid %d)", process, l.PID))
+		reported++
 	}
 }
 
@@ -974,6 +1053,12 @@ func runDiagnostics() config.DiagnosticsResult {
 		result.Capabilities["job_objects"] = config.CapabilityInfo{Available: false, Detail: jerr.Error()}
 	}
 	jobs := jerr == nil
+	libErr := dlltrace.Probe()
+	if libErr == nil {
+		result.Capabilities["library_tracing"] = config.CapabilityInfo{Available: true, Detail: "ETW image-load events (Microsoft-Windows-Kernel-Process) for traceLibraries"}
+	} else {
+		result.Capabilities["library_tracing"] = config.CapabilityInfo{Available: false, Detail: "traceLibraries: " + libErr.Error()}
+	}
 	fips := windowsFIPSEnabled()
 	result.Capabilities["fips_detection"] = config.CapabilityInfo{Available: true, Detail: fmt.Sprintf("FipsAlgorithmPolicy Enabled=%t", fips)}
 
@@ -1004,7 +1089,7 @@ func runDiagnostics() config.DiagnosticsResult {
 	result.Features["ui_restriction"] = sandbox
 	result.Features["gui_runtime_support"] = sandbox && interactive
 	result.Features["profile_validation"] = launcher != ""
-	result.Features["trace_libraries"] = false
+	result.Features["trace_libraries"] = libErr == nil
 	result.Features["trace_http_urls"] = false
 	result.Features["allow_url_rules"] = false
 	result.Features["trace_crypto"] = false

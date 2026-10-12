@@ -12,6 +12,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -23,8 +24,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
+	"github.com/cdxgen/safer-exec/go/internal/dlltrace"
 	"github.com/cdxgen/safer-exec/go/internal/mxc"
 )
 
@@ -122,6 +127,32 @@ func workload(role string, args []string) int {
 		}
 		c.Close()
 		fmt.Println("dial-ok")
+		return 0
+	case "loaddll":
+		h, err := windows.LoadLibrary(args[0])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "loaddll-failed:", err)
+			return 3
+		}
+		windows.FreeLibrary(h)
+		return 0
+	case "stopetw":
+		// Wait for the test to name the engine's ETW session, then try to
+		// stop it from inside the container.
+		var name string
+		for range 600 {
+			if b, err := os.ReadFile(args[0]); err == nil && len(b) > 0 {
+				name = string(b)
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if name == "" {
+			fmt.Println("stopetw: no session name")
+			return 3
+		}
+		err := stopTraceSession(name)
+		fmt.Println("stopetw-result:", err)
 		return 0
 	case "http":
 		resp, err := http.Get(args[0])
@@ -573,6 +604,145 @@ func TestWindowsEngineBlockForkAndTraceExec(t *testing.T) {
 	}
 }
 
+func TestWindowsEngineTraceLibraries(t *testing.T) {
+	requireMXC(t)
+	if err := dlltrace.Probe(); err != nil {
+		t.Skip(err)
+	}
+	dir := testDir(t)
+	// A copy of a system DLL under a name nothing else on the machine loads.
+	dll := filepath.Join(dir, "traced-probe.dll")
+	data, err := os.ReadFile(filepath.Join(os.Getenv("SystemRoot"), "System32", "version.dll"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dll, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := workloadConfig(t, dir, "loaddll", dll)
+	cfg.TraceLibraries = true
+	cfg.EnableAudit = true
+	res := runEngine(t, cfg)
+	if res.code != 0 {
+		t.Fatalf("workload failed: %d", res.code)
+	}
+	want, err := os.Stat(dll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	self, _ := os.Executable()
+	found, ntdll := false, false
+	for _, e := range auditEntries(res.stderr) {
+		if e.Type != "lib-load" {
+			continue
+		}
+		lower := strings.ToLower(e.Detail)
+		if strings.Contains(lower, "wxc-exec.exe") || strings.Contains(lower, "conhost.exe") {
+			t.Errorf("launcher or console host load reported: %+v", e)
+		}
+		if strings.EqualFold(e.Target, self) {
+			t.Errorf("the workload's own executable was reported: %+v", e)
+		}
+		if fi, err := os.Stat(e.Target); err == nil && os.SameFile(fi, want) {
+			found = true
+		}
+		ntdll = ntdll || strings.EqualFold(filepath.Base(e.Target), "ntdll.dll")
+	}
+	if !found || !ntdll {
+		t.Fatalf("lib-load for the workload's DLL: %v, for ntdll.dll: %v", found, ntdll)
+	}
+}
+
+// traceProperties returns an EVENT_TRACE_PROPERTIES buffer (64-bit layout)
+// with room for the session and log file names.
+func traceProperties() []byte {
+	const props, names = 120, 2 * 1024 * 2
+	b := make([]byte, props+names)
+	binary.LittleEndian.PutUint32(b[0:], uint32(len(b)))  // Wnode.BufferSize
+	binary.LittleEndian.PutUint32(b[112:], props+names/2) // LogFileNameOffset
+	binary.LittleEndian.PutUint32(b[116:], props)         // LoggerNameOffset
+	return b
+}
+
+var (
+	testAdvapi32        = windows.NewLazySystemDLL("advapi32.dll")
+	testQueryAllTracesW = testAdvapi32.NewProc("QueryAllTracesW")
+	testControlTraceW   = testAdvapi32.NewProc("ControlTraceW")
+)
+
+// traceSessions lists the running ETW sessions whose names start with prefix.
+func traceSessions(prefix string) []string {
+	const max = 64
+	bufs := make([][]byte, max)
+	ptrs := make([]uintptr, max)
+	for i := range bufs {
+		bufs[i] = traceProperties()
+		ptrs[i] = uintptr(unsafe.Pointer(&bufs[i][0]))
+	}
+	var count uint32
+	testQueryAllTracesW.Call(uintptr(unsafe.Pointer(&ptrs[0])), max, uintptr(unsafe.Pointer(&count)))
+	var out []string
+	for i := 0; i < int(count) && i < max; i++ {
+		raw := bufs[i][120 : 120+2*1024]
+		u := unsafe.Slice((*uint16)(unsafe.Pointer(&raw[0])), 1024)
+		if name := windows.UTF16ToString(u); strings.HasPrefix(name, prefix) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func stopTraceSession(name string) error {
+	p := traceProperties()
+	n, _ := windows.UTF16PtrFromString(name)
+	r, _, _ := testControlTraceW.Call(0, uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(&p[0])), 1)
+	if r != 0 {
+		return windows.Errno(r)
+	}
+	return nil
+}
+
+func TestWindowsEngineWorkloadCannotStopTraceSession(t *testing.T) {
+	requireMXC(t)
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("the test's ETW structures use the 64-bit layout")
+	}
+	if err := dlltrace.Probe(); err != nil {
+		t.Skip(err)
+	}
+	dir := testDir(t)
+	nameFile := filepath.Join(dir, "session.txt")
+	before := map[string]bool{}
+	for _, n := range traceSessions("safer-exec-dll-") {
+		before[n] = true
+	}
+	cfg := workloadConfig(t, dir, "stopetw", nameFile)
+	cfg.TraceLibraries = true
+	done := make(chan runResult, 1)
+	go func() { done <- runEngine(t, cfg) }()
+	var name string
+	for deadline := time.Now().Add(60 * time.Second); name == "" && time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		for _, n := range traceSessions("safer-exec-dll-") {
+			if !before[n] {
+				name = n
+			}
+		}
+	}
+	if name == "" {
+		t.Fatal("the engine's ETW session never appeared")
+	}
+	if err := os.WriteFile(nameFile, []byte(name), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := <-done
+	if !strings.Contains(res.stdout, "stopetw-result:") || strings.Contains(res.stdout, "stopetw-result: <nil>") {
+		t.Fatalf("the workload stopped the trace session (or did not try): %q", res.stdout)
+	}
+	if strings.Contains(res.stderr, "stopped before the run ended") {
+		t.Fatalf("the session was stopped during the run: %q", res.stderr)
+	}
+}
+
 func TestWindowsEngineMemoryLimit(t *testing.T) {
 	requireMXC(t)
 	dir := testDir(t)
@@ -797,5 +967,9 @@ func TestWindowsDiagnostics(t *testing.T) {
 	}
 	if d.Platform != "windows" || !d.Features["mxc_process_container"] || !d.Capabilities["mxc_executor"].Available {
 		t.Errorf("diagnostics = %+v", d)
+	}
+	lib, ok := d.Capabilities["library_tracing"]
+	if !ok || lib.Available != d.Features["trace_libraries"] || lib.Available != (dlltrace.Probe() == nil) {
+		t.Errorf("library_tracing = %+v, trace_libraries = %v", lib, d.Features["trace_libraries"])
 	}
 }

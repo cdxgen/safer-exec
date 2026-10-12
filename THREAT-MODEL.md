@@ -137,6 +137,7 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 | Win32k system-call disable (opt-in) | GUI subsystem kernel attack surface                              | `windowsBlockWin32k`                                                                                     |
 | Outer job object                    | Committed memory, CPU rate, active processes; tree teardown      | Limits on safer-exec's job; MXC's job nests under it; `KILL_ON_JOB_CLOSE`                                |
 | Explicit environment block          | No inherited profile environment                                 | `process.env` is always supplied, `inheritDefaultEnv` false                                              |
+| ETW session (opt-in)                | Observability only: DLLs the workload loads (`traceLibraries`)   | Microsoft-Windows-Kernel-Process image-load events, recorded by the engine outside the container         |
 
 ## 3. Threats and Attack Vectors
 
@@ -559,6 +560,10 @@ historical behavior, while the common case is fully pinned).
 **Observability gaps.** On BaseContainer hosts MXC's denial capture does not report accesses to paths outside every grant and is best-effort even for grant conflicts, so audit, learning and dry-run reports are partial and must not be treated as a complete record. Learning runs stay contained instead of using MXC's permissive mode, which lifts enforcement while recording nothing on these hosts.
 
 **Session 0.** Containers started from session 0 (services, SSH logons) cannot open the session's window station, so programs that load `user32.dll` fail to start. This fails closed.
+
+**Library tracing.** `traceLibraries` runs a real-time ETW session on the Microsoft-Windows-Kernel-Process provider in the engine, outside the container. The kernel logs the process and image-load events, so the workload cannot hide a load from the engine's record, and `TestWindowsEngineWorkloadCannotStopTraceSession` verifies that a contained process is denied when it tries to stop the session. The engine prints its entries on the stderr stream the workload also writes to, though, and the Node runner accepts any JSON line there that looks like an audit entry, so a workload can add `lib-load` lines of its own (as it can add any audit line, on every platform). It can also load many images: the engine keeps at most about a million events per run and reports at most 10,000 distinct images, and it reports anything past those bounds, and any events Windows drops, as a warning. Loads are attributed by following process starts down from `wxc-exec.exe` and matching each event to one process lifetime, so a process id that Windows reuses after a workload process exits does not pull an unrelated process into the report. Only section mappings are seen; a workload that maps a DLL's bytes by hand is not reported, so treat the list as an inventory, not a control.
+
+Starting the session needs administrator rights or the Performance Log Users group. Running the engine elevated for this does not elevate the workload: on Windows 11 25H2 (build 26200) the contained process runs with a low-integrity AppContainer token in which the Administrators group is not enabled and only `SeChangeNotifyPrivilege` and `SeIncreaseWorkingSetPrivilege` remain. Windows keeps a session running until it is stopped, even after the process that started it dies, so each session is named after the engine's process id and creation time, and every start first stops sessions whose engine no longer runs.
 
 ## 4. Platform-Aware Policies
 

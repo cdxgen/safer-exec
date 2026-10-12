@@ -284,6 +284,7 @@ When `traceLibraries()` is enabled:
 1. On **glibc Linux**, `safer-exec` injects a precompiled `rtld-audit` helper using `LD_AUDIT`. The helper intercepts runtime linker actions (specifically `la_objopen`) and reports every loaded `.so` library.
 2. On **musl Linux (Alpine)**, `safer-exec` runs an active process maps monitor that periodically scans `/proc/<pid>/maps` of the parent and all spawned subprocesses.
 3. On **macOS**, `safer-exec` parses Seatbelt audit logs under the `file-read` event type matching `.dylib` or `.framework` paths.
+4. On **Windows**, the engine records image-load events from an ETW session it runs outside the container and reports every DLL (and other loadable image, such as a Node.js addon) the workload's processes load. Each entry's `details` names the first process that loaded it. The session needs an elevated prompt or the Performance Log Users group.
 
 In all cases, library loads are streamed to `stderr` as JSON lines:
 
@@ -297,7 +298,7 @@ In all cases, library loads are streamed to `stderr` as JSON lines:
 Each entry consists of:
 
 - `type`: "lib-load" (identifies the event as a dynamic library loading event).
-- `target`: Absolute path to the shared library (`.so`, `.dylib`, or framework path).
+- `target`: Absolute path to the shared library (`.so`, `.dylib`, `.dll`, or framework path).
 
 ### CLI Example: Collecting Library Traces
 
