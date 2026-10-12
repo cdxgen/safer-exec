@@ -324,3 +324,129 @@ func TestEgressProxyConnectForwardsPipelinedPayload(t *testing.T) {
 		t.Fatal("upstream never received the pipelined payload (dropped read buffer)")
 	}
 }
+
+// A learning run may reach any public host, but never the engine's own host:
+// loopback services and link-local metadata endpoints are refused at dial
+// time (403 plus a proxy-violation entry) and are not learned.
+func TestLearningProxyRefusesHostLocalTargets(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "local service")
+	}))
+	defer srv.Close()
+	_, portStr, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := startLearningEgressProxy(config.ExecConfig{})
+	if err != nil {
+		t.Fatalf("start proxy: %v", err)
+	}
+	defer p.Close()
+
+	for _, req := range []string{
+		"CONNECT 127.0.0.1:" + portStr + " HTTP/1.1\r\nHost: 127.0.0.1:" + portStr + "\r\n\r\n",
+		"GET http://localhost:" + portStr + "/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+	} {
+		status := proxyStatusLine(t, p.port, req)
+		if !strings.Contains(status, " 403 ") {
+			t.Errorf("%q: status %q, want 403", strings.SplitN(req, "\r\n", 2)[0], status)
+		}
+	}
+	if got := p.connectedTargets(); len(got) != 0 {
+		t.Errorf("host-local targets were learned: %v", got)
+	}
+	var refused int
+	for _, v := range p.violationsSnapshot() {
+		if v.Type == "proxy-violation" && strings.Contains(v.Detail, "host-local") {
+			refused++
+		}
+	}
+	if refused != 2 {
+		t.Errorf("recorded %d host-local refusals, want 2", refused)
+	}
+
+	for ip, local := range map[string]bool{
+		"127.0.0.1": true, "::1": true, "169.254.169.254": true, "fe80::1": true,
+		"0.0.0.0": true, "224.0.0.251": true, "ff02::1": true,
+		"10.0.0.1": false, "192.168.1.10": false, "93.184.216.34": false, "2606:4700::1111": false,
+	} {
+		if got := hostLocalIP(net.ParseIP(ip)); got != local {
+			t.Errorf("hostLocalIP(%s) = %v, want %v", ip, got, local)
+		}
+	}
+}
+
+func TestNormalizeProxyHostAndRedaction(t *testing.T) {
+	for in, want := range map[string]string{
+		"Example.COM.":   "example.com",
+		"[::1]":          "::1",
+		"2001:DB8:0::1":  "2001:db8::1",
+		" registry.org ": "registry.org",
+	} {
+		if got := normalizeProxyHost(in); got != want {
+			t.Errorf("normalizeProxyHost(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for in, want := range map[string]string{
+		"http://user:secret@evil.example/path?token=1": "http://evil.example/path",
+		"https://tok@host.example:8443/a#frag":         "https://host.example:8443/a",
+		"http://plain.example":                         "http://plain.example",
+		"http://a@b@c.example/x":                       "http://c.example/x",
+	} {
+		if got := redactRequestTarget(in); got != want {
+			t.Errorf("redactRequestTarget(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Absolute-form requests may carry userinfo or a bracketed IPv6 literal with
+// no port. The destination is the bare host, and credentials never reach the
+// audit log.
+func TestEgressProxyAbsoluteFormHostParsing(t *testing.T) {
+	p, err := startEgressProxy(config.ExecConfig{
+		AllowIPs:   []string{"::1"},
+		AllowPorts: []int{80},
+	})
+	if err != nil {
+		t.Fatalf("start proxy: %v", err)
+	}
+	defer p.Close()
+
+	// Allowed: nothing may listen on [::1]:80, so a 502 (or a real answer)
+	// proves the target parsed as ::1 port 80; a 403 would mean it did not.
+	status := proxyStatusLine(t, p.port, "GET http://[::1]/probe HTTP/1.1\r\nHost: [::1]\r\nConnection: close\r\n\r\n")
+	if strings.Contains(status, " 403 ") {
+		t.Errorf("bracketed IPv6 target without a port was denied: %q", status)
+	}
+
+	status = proxyStatusLine(t, p.port, "GET http://user:hunter2@denied.example/x?k=v HTTP/1.1\r\nHost: denied.example\r\nConnection: close\r\n\r\n")
+	if !strings.Contains(status, " 403 ") {
+		t.Errorf("denied host: status %q, want 403", status)
+	}
+	for _, v := range p.violationsSnapshot() {
+		if strings.Contains(v.Target, "hunter2") || strings.Contains(v.Target, "user:") {
+			t.Errorf("credentials leaked into the audit entry: %+v", v)
+		}
+	}
+}
+
+// proxyStatusLine sends one raw request through the proxy and returns the
+// response status line.
+func proxyStatusLine(t *testing.T, proxyPort int, request string) string {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+	if _, err := io.WriteString(conn, request); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	return strings.TrimRight(line, "\r\n")
+}

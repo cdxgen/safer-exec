@@ -19,6 +19,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
@@ -118,10 +120,14 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 	return p, nil
 }
 
-// startLearningEgressProxy starts a proxy that allows every target and
+// startLearningEgressProxy starts a proxy that allows every public target and
 // records each distinct host:port it forwards (as proxy-connect entries and
 // through connectedTargets). Learning runs use it to discover the hostnames a
-// command needs; the allowlist fields of cfg are ignored.
+// command needs; the allowlist fields of cfg are ignored. Addresses that only
+// make sense on the engine's own host — loopback, link-local (including cloud
+// metadata endpoints), unspecified and multicast — are refused at dial time,
+// whatever name resolved to them, so a learning run cannot use the proxy to
+// reach host-local services or teach the next run to allow them.
 func startLearningEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 	p, err := startEgressProxy(cfg)
 	if err != nil {
@@ -248,18 +254,15 @@ func (p *egressProxy) flushViolations() {
 // proxied request target. Fail closed: with no allowed hosts or IPs every
 // target is denied.
 func (p *egressProxy) targetAllowed(host string, port int) bool {
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	p.mu.Lock()
-	learn := p.learn
-	p.mu.Unlock()
-	if learn {
+	host = normalizeProxyHost(host)
+	if p.learning() {
 		return host != "" && port > 0 && port <= 65535
 	}
-	if net.ParseIP(host) != nil {
+	if ip := net.ParseIP(host); ip != nil {
 		if !p.hasHosts && len(p.ips) == 0 {
 			return false
 		}
-		if p.ips[host] {
+		if p.ips[ip.String()] {
 			return portAllowed(p.ports, port)
 		}
 		return false
@@ -297,15 +300,76 @@ func portAllowed(ports map[int]bool, port int) bool {
 // pinned the first address forever and broke CDN failover, and the latency it
 // was working around was in fact the dropped-buffer bug fixed in handleConn.)
 func (p *egressProxy) dialTarget(host, portStr string) (net.Conn, error) {
-	return net.DialTimeout("tcp", net.JoinHostPort(host, portStr), 15*time.Second)
+	d := net.Dialer{Timeout: 15 * time.Second}
+	if p.learning() {
+		// Checked per attempted address, after resolution, so a public name
+		// that resolves to a host-local address is refused too.
+		d.Control = func(_, address string, _ syscall.RawConn) error {
+			h, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			if ip := net.ParseIP(h); ip == nil || hostLocalIP(ip) {
+				return errHostLocalTarget
+			}
+			return nil
+		}
+	}
+	return d.Dial("tcp", net.JoinHostPort(host, portStr))
+}
+
+// errHostLocalTarget marks a learning-mode dial refused because the target
+// address belongs to the engine's host rather than the network.
+var errHostLocalTarget = errors.New("host-local address refused while learning")
+
+// hostLocalIP reports addresses a learning run must not reach through the
+// proxy: loopback, link-local (169.254.0.0/16 holds cloud metadata services),
+// unspecified and multicast.
+func hostLocalIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
+}
+
+func (p *egressProxy) learning() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.learn
+}
+
+// normalizeProxyHost lower-cases a request host, strips IPv6 brackets and a
+// trailing root dot, and canonicalizes IP literals, so allowlist checks and
+// recorded targets agree on one spelling per host.
+func normalizeProxyHost(host string) string {
+	host = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(host), "["), "]")
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	return host
+}
+
+// dialFailed answers a client whose upstream dial failed: a learning-mode
+// refusal of a host-local address is a policy denial (403 plus a
+// proxy-violation entry), anything else a 502.
+func (p *egressProxy) dialFailed(conn net.Conn, subject string, err error) {
+	if errors.Is(err, errHostLocalTarget) {
+		p.recordViolationDetail(subject, "host-local address refused while learning")
+		fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\nX-Safer-Exec: egress-denied\r\n\r\n")
+		return
+	}
+	fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 }
 
 func (p *egressProxy) recordViolation(subject string) {
+	p.recordViolationDetail(subject, "egress target denied by proxy allowlist")
+}
+
+func (p *egressProxy) recordViolationDetail(subject, detail string) {
 	p.mu.Lock()
 	p.violations = append(p.violations, config.AuditEntry{
 		Type:   "proxy-violation",
 		Target: subject,
-		Detail: "egress target denied by proxy allowlist",
+		Detail: detail,
 	})
 	p.mu.Unlock()
 }
@@ -328,11 +392,22 @@ func (p *egressProxy) recordConnect(hostPort, kind string) {
 	})
 }
 
-// redactRequestTarget drops the query string and fragment from an
-// absolute-form request target before it is written to the audit log.
+// redactRequestTarget drops the query string, fragment and any userinfo
+// ("user:password@") from an absolute-form request target before it is
+// written to the audit log.
 func redactRequestTarget(target string) string {
 	if i := strings.IndexAny(target, "?#"); i >= 0 {
-		return target[:i]
+		target = target[:i]
+	}
+	if scheme, rest, ok := strings.Cut(target, "://"); ok {
+		authority, path, hasPath := strings.Cut(rest, "/")
+		if at := strings.LastIndex(authority, "@"); at >= 0 {
+			authority = authority[at+1:]
+		}
+		target = scheme + "://" + authority
+		if hasPath {
+			target += "/" + path
+		}
 	}
 	return target
 }
@@ -379,11 +454,11 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 		}
 		upstream, err := p.dialTarget(host, portStr)
 		if err != nil {
-			fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			p.dialFailed(conn, "CONNECT "+parts[1], err)
 			return
 		}
 		defer upstream.Close()
-		p.recordConnect(net.JoinHostPort(strings.ToLower(host), portStr), "connect")
+		p.recordConnect(net.JoinHostPort(normalizeProxyHost(host), portStr), "connect")
 		_ = conn.SetDeadline(time.Time{})
 		fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 		// Tunnel from `reader`, not `conn`: a client that pipelines its first
@@ -404,9 +479,14 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 			hostPort = rest[:slash]
 			path = rest[slash:]
 		}
+		// Userinfo is not part of the destination (and must not be logged).
+		if at := strings.LastIndex(hostPort, "@"); at >= 0 {
+			hostPort = hostPort[at+1:]
+		}
 		host, portStr, err := net.SplitHostPort(hostPort)
 		if err != nil {
-			host = hostPort
+			// No port: a bare name or a bracketed IPv6 literal.
+			host = strings.TrimSuffix(strings.TrimPrefix(hostPort, "["), "]")
 			if strings.HasPrefix(parts[1], "https://") {
 				portStr = "443"
 			} else {
@@ -420,11 +500,11 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 		}
 		upstream, dialErr := p.dialTarget(host, portStr)
 		if dialErr != nil {
-			fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			p.dialFailed(conn, parts[0]+" "+redactRequestTarget(parts[1]), dialErr)
 			return
 		}
 		defer upstream.Close()
-		p.recordConnect(net.JoinHostPort(strings.ToLower(host), portStr), "http")
+		p.recordConnect(net.JoinHostPort(normalizeProxyHost(host), portStr), "http")
 		_ = conn.SetDeadline(time.Time{})
 		// Rewrite the request line to origin-form; the headers and body follow
 		// untouched (the Host header the client sent is preserved) — they are
