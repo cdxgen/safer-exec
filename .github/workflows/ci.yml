@@ -1,5 +1,8 @@
 name: Build & Test
 
+# merge_group lets the merge queue re-run the required checks
+# (check-bpf-objects and test-go) on the speculative merge commit; the
+# cross-build and node jobs skip those builds via their if:.
 on:
   push:
     branches: [main]
@@ -7,10 +10,12 @@ on:
       - 'v*'
   pull_request:
     branches: [main]
+  merge_group:
   workflow_dispatch:
 permissions: {}
 jobs:
   build-go:
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -74,6 +79,7 @@ jobs:
   # build output is cached under a key derived from that script, so it is
   # rebuilt only when the pin or the build steps change.
   build-mxc:
+    if: github.event_name != 'merge_group'
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -232,6 +238,7 @@ jobs:
           echo "Graceful degradation verified."
 
   test-node:
+    if: github.event_name != 'merge_group'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
