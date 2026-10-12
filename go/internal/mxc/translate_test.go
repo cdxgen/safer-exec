@@ -446,6 +446,15 @@ func TestTranslateExecControls(t *testing.T) {
 	}
 }
 
+// Crypto tracing works on Windows (ETW and the egress proxy) and must not
+// raise the warning for Linux-only URL tracing.
+func TestTranslateTraceCryptoWithoutURLTracing(t *testing.T) {
+	p := mustTranslate(t, config.ExecConfig{Cmd: "cmd", TraceCrypto: true, ProxyEgress: true, AllowHosts: []string{"example.org"}}, Options{})
+	if hasSubstring(p.Warnings, "URL") || len(p.Unenforced) != 0 {
+		t.Errorf("warnings %v, unenforced %v", p.Warnings, p.Unenforced)
+	}
+}
+
 func TestTranslateUnsupportedControls(t *testing.T) {
 	cfg := config.ExecConfig{
 		Cmd: "cmd", BlockJIT: true, BlockCrypto: true, TraceHTTPURLs: true, TraceLibraries: true,

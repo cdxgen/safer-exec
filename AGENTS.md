@@ -402,10 +402,13 @@ identities using eBPF uretprobes on OpenSSL/GnuTLS cipher negotiation functions.
    per TLS connection. Cipher info is correlated with HTTP requests via the
    SSL\* pointer (`ConnID`).
 
-3. **CBOM output**: `writeCBOMFile()` in `engine_linux.go` produces a minimal
-   CycloneDX JSON document with `cryptographic-asset` components for each
-   detected library and cipher suite. The document uses CycloneDX 1.7
-   specification.
+3. **CBOM output**: `buildCBOM()` in `cbom.go` (all platforms) produces a
+   CycloneDX document valid against both 1.6 and 1.7: crypto libraries as
+   `library` components, algorithms with bom-refs and OIDs (`algorithmOIDs`),
+   hybrid groups split into their curve and ML-KEM, and TLS protocols whose
+   suites refer to algorithms by bom-ref. `cbom_test.go` validates it against
+   the schemas vendored in `cmd/safer-exec/testdata/cyclonedx`; keep it
+   passing when adding fields, and add an OID for any new algorithm name.
 
 4. **Cipher name parsing**: `DecomposeCipherName()` in `cipher.go` parses
    OpenSSL-style names into constituent algorithms (key exchange,
