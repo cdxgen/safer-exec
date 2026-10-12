@@ -209,9 +209,10 @@ func OverlayExecConfigToPolicy(cfg ExecConfig, policy *PolicyFile) *PolicyFile {
 	if cfg.ProxyEgress {
 		policy.ProxyEgress = true
 	}
-	if cfg.WindowsAllowDaclMutation {
-		policy.WindowsAllowDaclMutation = true
-	}
+	// WindowsAllowDaclMutation is deliberately not overlaid: it is consent
+	// given for one run on one host, and a learned policy carrying it would
+	// apply it silently wherever the file is used next. Set it in the policy
+	// file by hand when that is the intent.
 	if cfg.WindowsBlockWin32k {
 		policy.WindowsBlockWin32k = true
 	}

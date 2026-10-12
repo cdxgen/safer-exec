@@ -171,8 +171,13 @@ func TestWindowsFieldsRoundTripAndMerge(t *testing.T) {
 		t.Error("consent granted by both layers was dropped")
 	}
 
+	// A learned policy keeps the Win32k lockdown but never records one-off
+	// consent to mutate host ACLs.
 	overlaid := OverlayExecConfigToPolicy(ExecConfig{WindowsAllowDaclMutation: true, WindowsBlockWin32k: true}, &PolicyFile{})
-	if !overlaid.WindowsAllowDaclMutation || !overlaid.WindowsBlockWin32k {
-		t.Errorf("overlay dropped Windows fields: %+v", overlaid)
+	if !overlaid.WindowsBlockWin32k {
+		t.Errorf("overlay dropped the Win32k lockdown: %+v", overlaid)
+	}
+	if overlaid.WindowsAllowDaclMutation {
+		t.Errorf("overlay persisted DACL-mutation consent into the policy: %+v", overlaid)
 	}
 }
