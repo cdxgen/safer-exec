@@ -16,7 +16,7 @@ import (
 
 // launchableExts are the file types CreateProcess can start: PE images and,
 // through an implicit cmd.exe, batch scripts. Other PATHEXT entries (.ps1,
-// .py, .js, ...) are shell associations that CreateProcess does not honour.
+// .py, .js, ...) are shell associations that CreateProcess does not honor.
 var launchableExts = []string{".com", ".exe", ".bat", ".cmd"}
 
 // IsBatchFile reports whether path names a cmd.exe batch script.
@@ -124,40 +124,46 @@ func IsCmdExe(path string) bool {
 
 // ComposeCmdCommandLine renders an explicit cmd.exe invocation. cmd.exe does
 // not parse its command line with the C-runtime rules: after /C, /K or /R it
-// takes the rest of the line as a command string, and a backslash-escaped
-// quote is not an escape to it. Arguments before that switch are rendered
-// with EscapeArg; everything after it is joined with spaces and passed
-// verbatim, which is what a caller running "cmd /c <command>" means (Node's
-// shell mode and Rust's raw_arg do the same). The command string is the
-// caller's own script — argument hygiene for untrusted values is the job of
-// ComposeBatchCommandLine, used when a .bat/.cmd file is the program.
+// takes the rest of the line as one command string, and a backslash-escaped
+// quote is not an escape to it. So the arguments after that switch are joined
+// with spaces into a command string, the way Node's shell mode does: callers
+// write "cmd /c <command>" to get shell syntax (redirection, &&, quoting), and
+// the arguments are shell text, not literal argv entries. The string is
+// wrapped in one pair of quotes and /S makes cmd strip exactly that pair, so
+// quotes inside it survive however many there are. /D skips the AutoRun
+// registry hooks. Switches before /C are kept, escaped with EscapeArg; /D and
+// /S are added when absent. For untrusted values, run a .bat/.cmd file
+// instead: ComposeBatchCommandLine passes its arguments as literal data.
 func ComposeCmdCommandLine(cmdExe string, args []string) (string, error) {
 	first, err := quoteProgram(cmdExe)
 	if err != nil {
 		return "", err
 	}
-	var b strings.Builder
-	b.WriteString(first)
-	for i, a := range args {
+	for _, a := range args {
 		if strings.ContainsRune(a, 0) {
 			return "", fmt.Errorf("argument %q contains a NUL byte", a)
 		}
-		b.WriteByte(' ')
+	}
+	var b strings.Builder
+	b.WriteString(first)
+	hasSwitch := func(prefix []string, sw string) bool {
+		return slices.ContainsFunc(prefix, func(a string) bool { return strings.EqualFold(a, sw) })
+	}
+	for i, a := range args {
 		switch strings.ToLower(a) {
 		case "/c", "/k", "/r":
-			b.WriteString(a)
-			if rest := args[i+1:]; len(rest) > 0 {
-				for _, r := range rest {
-					if strings.ContainsRune(r, 0) {
-						return "", fmt.Errorf("argument %q contains a NUL byte", r)
-					}
+			for _, sw := range []string{"/d", "/s"} {
+				if !hasSwitch(args[:i], sw) {
+					b.WriteString(" " + sw)
 				}
-				b.WriteByte(' ')
-				b.WriteString(strings.Join(rest, " "))
+			}
+			b.WriteString(" " + a)
+			if rest := args[i+1:]; len(rest) > 0 {
+				b.WriteString(` "` + strings.Join(rest, " ") + `"`)
 			}
 			return b.String(), nil
 		}
-		b.WriteString(EscapeArg(a))
+		b.WriteString(" " + EscapeArg(a))
 	}
 	return b.String(), nil
 }
@@ -170,7 +176,7 @@ func ComposeCmdCommandLine(cmdExe string, args []string) (string, error) {
 // with a command line built for cmd's own rules:
 //
 //   - /d skips the AutoRun registry hooks, /e:ON keeps command extensions on
-//     (required by the %-neutralising construct below) and /v:OFF disables
+//     (required by the %-neutralizing construct below) and /v:OFF disables
 //     delayed (!VAR!) expansion;
 //   - every argument containing anything but a conservative set of safe
 //     characters is wrapped in double quotes, with embedded quotes doubled;
@@ -263,7 +269,7 @@ func appendBatchArg(b *strings.Builder, arg string) error {
 type LookPathOptions struct {
 	// PathList is the PATH value (';'-separated) to search for bare names.
 	PathList string
-	// PathExt is the PATHEXT value; only launchable extensions are honoured.
+	// PathExt is the PATHEXT value; only launchable extensions are honored.
 	PathExt string
 	// Dir resolves relative paths (names containing a separator).
 	Dir string
@@ -318,8 +324,7 @@ func LookPath(name string, opts LookPathOptions) (string, error) {
 		return "", fmt.Errorf("executable %q not found", p)
 	}
 
-	for dir := range strings.SplitSeq(opts.PathList, ";") {
-		dir = strings.Trim(strings.TrimSpace(dir), `"`)
+	for _, dir := range SplitPathList(opts.PathList) {
 		if dir == "" || !WinIsAbs(dir) {
 			continue
 		}

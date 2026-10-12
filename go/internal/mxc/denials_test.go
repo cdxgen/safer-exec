@@ -167,3 +167,58 @@ func TestCollapsePaths(t *testing.T) {
 		t.Errorf("collapse = %v", got)
 	}
 }
+
+// A workload chooses which paths it touches, so it must not be able to steer
+// a learned policy into broad, aliased or persistence grants.
+func TestLearnPolicyRejectsPoisonedPaths(t *testing.T) {
+	plan := &Plan{
+		Program:    `C:\work\proj\tool.exe`,
+		Cwd:        `C:\work\proj`,
+		SystemRoot: `C:\Windows`,
+		ReadPaths:  []string{`C:\work\proj`},
+		Request: Request{Process: Process{Env: []string{
+			`USERPROFILE=C:\Users\u`, `APPDATA=C:\Users\u\AppData\Roaming`, `LOCALAPPDATA=C:\Users\u\AppData\Local`,
+			`ProgramFiles=C:\Program Files`, `ProgramData=C:\ProgramData`,
+		}}},
+	}
+	var denials []Denial
+	for _, path := range []string{
+		`\\localhost\C$\Windows\x`, `C:\Windows.\x`, `C:\WINDOW~1\x`, `C:\work\proj\f.txt:evil`,
+		`C:\Program Files\`, `C:\ProgramData\`, `C:\Users\`, `C:\Users\u\`, `C:\Users\u\AppData\Roaming\`,
+		`C:\Users\u\.ssh\authorized_keys`, `C:\Users\u\.gitconfig`,
+		`C:\Users\u\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\x.lnk`,
+		`C:\Users\u\AppData\Local\Temp\safer-exec-mxc\run-1\request.json`,
+	} {
+		denials = append(denials, Denial{Resource: path, ResourceType: "file", AccessType: "write"})
+	}
+	denials = append(denials,
+		Denial{Resource: `C:\Users\u\.npmrc`, ResourceType: "file", AccessType: "read"},
+		Denial{Resource: `C:\work\proj\out\a.txt`, ResourceType: "file", AccessType: "write"},
+	)
+	p := LearnPolicy(LearnInput{
+		Plan:         plan,
+		Report:       &DenialReport{Denials: denials},
+		Forbidden:    []string{`C:\Users\u\AppData\Local\Temp\safer-exec-mxc`},
+		ProxyTargets: []string{"127.0.0.1:22", "[::1]:5432", "169.254.169.254:80", "localhost:8080", "registry.npmjs.org:443"},
+	})
+	if !slices.Equal(p.WritePaths, []string{`C:\work\proj\out\a.txt`}) {
+		t.Errorf("learned writes = %v", p.WritePaths)
+	}
+	if !slices.Contains(p.ReadPaths, `C:\Users\u\.npmrc`) {
+		t.Errorf("ordinary read dropped: %v", p.ReadPaths)
+	}
+	if !slices.Equal(p.AllowHosts, []string{"registry.npmjs.org"}) || len(p.AllowIPs) != 0 {
+		t.Errorf("learned network = hosts %v ips %v", p.AllowHosts, p.AllowIPs)
+	}
+}
+
+func TestShortNameComponent(t *testing.T) {
+	for part, want := range map[string]bool{
+		"PROGRA~1": true, "WINDOW~1.TXT": true, "U~12": true,
+		"foo~bar": false, "~1": false, "name~": false, "a-very-long~1": false, "plain": false,
+	} {
+		if got := shortNameComponent(part); got != want {
+			t.Errorf("shortNameComponent(%q) = %v, want %v", part, got, want)
+		}
+	}
+}

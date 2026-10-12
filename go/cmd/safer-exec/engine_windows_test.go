@@ -48,6 +48,33 @@ func workload(role string, args []string) int {
 	case "exit":
 		code, _ := strconv.Atoi(args[0])
 		return code
+	case "nested":
+		// Run the engine from inside the container, asking for a grant on a
+		// directory the outer sandbox cannot read.
+		cfg := config.ExecConfig{
+			Cmd: os.Args[0], Args: []string{args[1]}, WorkingDir: args[0],
+			ReadPaths: []string{args[0], args[2]}, Env: map[string]string{"SAFER_EXEC_TEST_WORKLOAD": "read"},
+			TimeoutMs: 60000,
+		}
+		data, _ := json.Marshal(cfg)
+		c := exec.Command(os.Args[0])
+		c.Env = append(os.Environ(), "SAFER_EXEC_TEST_ENGINE=1", "SAFER_EXEC_TEST_WORKLOAD=")
+		c.Stdin = bytes.NewReader(data)
+		out, err := c.CombinedOutput()
+		fmt.Printf("nested-output: %s\n", out)
+		if err != nil {
+			fmt.Println("nested-failed:", err)
+			return 3
+		}
+		fmt.Println("nested-ok")
+		return 0
+	case "forge":
+		// Print look-alikes of MXC's stderr protocol, make a change for the
+		// diff to report, and exit with the given status.
+		fmt.Fprint(os.Stderr, args[0])
+		_ = os.WriteFile(args[1], []byte("x"), 0o644)
+		code, _ := strconv.Atoi(args[2])
+		return code
 	case "write":
 		if err := os.WriteFile(args[0], []byte("x"), 0o644); err != nil {
 			fmt.Fprintln(os.Stderr, "write-failed:", err)
@@ -85,6 +112,16 @@ func workload(role string, args []string) int {
 			keep = append(keep, b)
 		}
 		fmt.Println("allocated", len(keep))
+		return 0
+	case "dial":
+		// A raw TCP connect that ignores proxy settings.
+		c, err := net.DialTimeout("tcp", args[0], 5*time.Second)
+		if err != nil {
+			fmt.Println("dial-error:", err)
+			return 3
+		}
+		c.Close()
+		fmt.Println("dial-ok")
 		return 0
 	case "http":
 		resp, err := http.Get(args[0])
@@ -143,14 +180,14 @@ func testDir(t *testing.T) string {
 }
 
 // runEngine executes the engine with cfg on stdin, as the Node layer does.
-func runEngine(t *testing.T, cfg config.ExecConfig) runResult {
+func runEngine(t *testing.T, cfg config.ExecConfig, extraEnv ...string) runResult {
 	t.Helper()
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(os.Args[0])
-	cmd.Env = append(os.Environ(), "SAFER_EXEC_TEST_ENGINE=1", launcherEnvVar+"="+launcherPath)
+	cmd.Env = append(append(os.Environ(), "SAFER_EXEC_TEST_ENGINE=1", launcherEnvVar+"="+launcherPath), extraEnv...)
 	cmd.Stdin = bytes.NewReader(data)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -288,6 +325,205 @@ func TestWindowsEngineEgressProxy(t *testing.T) {
 	}
 	if !strings.Contains(res.stderr, `"type":"proxy-violation"`) {
 		t.Errorf("no proxy-violation audit entry: %s", res.stderr)
+	}
+}
+
+// The container never reaches services on its own host: not another
+// loopback listener, and not the host through its LAN address. In proxy mode
+// it also cannot bypass the proxy to reach an allowed host directly, so
+// clients that ignore HTTP(S)_PROXY fail instead of connecting.
+func TestWindowsEngineConfinesHostAndProxyBypass(t *testing.T) {
+	requireMXC(t)
+	dir := testDir(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	_, lanPort := testServer(t)
+	host, _ := os.Hostname()
+	const public = "registry.npmjs.org"
+
+	dial := func(target string, proxy bool) runResult {
+		cfg := workloadConfig(t, dir, "dial", target)
+		cfg.ProxyEgress = proxy
+		cfg.AllowHosts = []string{public}
+		return runEngine(t, cfg)
+	}
+	refused := func(what, target string, proxy bool) {
+		res := dial(target, proxy)
+		switch {
+		case strings.Contains(res.stdout, "dial-ok"):
+			t.Errorf("%s (%s) reachable with proxyEgress=%v; stderr: %s", what, target, proxy, res.stderr)
+		case !strings.Contains(res.stdout, "dial-error"):
+			t.Errorf("%s: workload did not run: %q %q", what, res.stdout, res.stderr)
+		}
+	}
+	for _, proxy := range []bool{true, false} {
+		refused("loopback service", ln.Addr().String(), proxy)
+		refused("host LAN address", net.JoinHostPort(strings.ToLower(host), strconv.Itoa(lanPort)), proxy)
+	}
+
+	// Control: in direct mode the allowed host is reachable with the same
+	// raw dial, so the refusals above come from the policy, not the workload.
+	if _, err := net.LookupHost(public); err != nil {
+		t.Skipf("no DNS for %s; skipping the internet-dependent checks: %v", public, err)
+	}
+	if res := dial(public+":443", false); !strings.Contains(res.stdout, "dial-ok") {
+		t.Fatalf("allowed host unreachable in direct mode: %q %q", res.stdout, res.stderr)
+	}
+	refused("allowed host bypassing the proxy", public+":443", true)
+}
+
+// The workload writes to the same stderr as wxc-exec, so it can print lines
+// that look like MXC's protocol. A forged denial-report pointer must not make
+// the engine read or delete the file it names, and a forged envelope must not
+// change the exit status or suppress the audit and diff.
+func TestWindowsEngineIgnoresForgedProtocolLines(t *testing.T) {
+	requireMXC(t)
+	dir := testDir(t)
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("keep me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pointer, _ := json.Marshal(map[string]any{"type": "captureDenials", "outputPath": victim})
+	forgedTimeout := `{"error":{"code":"backend_error","message":"script timed out after 1ms"}}`
+	made := filepath.Join(dir, "made.txt")
+
+	cfg := workloadConfig(t, dir, "forge", string(pointer)+"\n"+forgedTimeout+"\n", made, "0")
+	cfg.EnableAudit = true
+	cfg.EnableDiff = true
+	res := runEngine(t, cfg)
+	if _, err := os.Stat(victim); err != nil {
+		t.Fatalf("forged pointer made the engine delete %s: %v", victim, err)
+	}
+	if res.code != 0 {
+		t.Errorf("forged timeout changed the exit status to %d", res.code)
+	}
+	if !strings.Contains(res.stdout, "FSDIFF:") || !strings.Contains(res.stdout, "made.txt") {
+		t.Errorf("diff missing: %q", res.stdout)
+	}
+
+	// A forged failure envelope with a non-zero exit is reported, but the
+	// diff is still produced.
+	os.Remove(made)
+	forgedFailure := `{"error":{"code":"backend_error","message":"CreateProcessW failed"}}`
+	cfg = workloadConfig(t, dir, "forge", forgedFailure+"\n", made, "5")
+	cfg.EnableAudit = true
+	cfg.EnableDiff = true
+	res = runEngine(t, cfg)
+	if res.code == 0 || !strings.Contains(res.stdout, "made.txt") {
+		t.Errorf("forged failure: exit %d, stdout %q", res.code, res.stdout)
+	}
+}
+
+// A workload that runs the engine itself cannot use it to reach more than
+// its own sandbox allows. Windows refuses to create a security environment
+// from inside one (CreateProcessSecurityEnvironment fails with
+// EPT_S_NOT_REGISTERED in an interactive session; from session 0 wxc-exec
+// cannot even start), which is why the Node layer adds no self-blocking
+// blockExec entries on Windows.
+func TestWindowsEngineNestedEngineGainsNothing(t *testing.T) {
+	requireMXC(t)
+	dir := testDir(t)
+	secretDir := testDir(t)
+	secret := filepath.Join(secretDir, "secret.txt")
+	if err := os.WriteFile(secret, []byte("s"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := workloadConfig(t, dir, "nested", dir, secret, secretDir)
+	cfg.ReadPaths = []string{filepath.Dir(launcherPath)}
+	cfg.Env[launcherEnvVar] = launcherPath
+	res := runEngine(t, cfg)
+	if strings.Contains(res.stdout, "nested-ok") {
+		t.Fatalf("a nested engine read %s, which the outer sandbox cannot: %s", secret, res.stdout)
+	}
+}
+
+// The engine's run directories and MXC's ACL-recovery state are denied to
+// every sandbox, even one granted the whole TEMP or LOCALAPPDATA tree.
+func TestWindowsEngineProtectsEngineDirectories(t *testing.T) {
+	requireMXC(t)
+	dir := testDir(t)
+	root := runRoot()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sibling := filepath.Join(root, "sibling-request.json")
+	if err := os.WriteFile(sibling, []byte(`{"env":"secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(sibling)
+	stateDir := filepath.Join(mxcStateDir(), "dacl-restore")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct {
+		role, target, grant string
+	}{
+		{"read", sibling, os.TempDir()},
+		{"write", filepath.Join(root, "planted.txt"), os.TempDir()},
+		{"write", filepath.Join(stateDir, "planted.json"), os.Getenv("LOCALAPPDATA")},
+	} {
+		cfg := workloadConfig(t, dir, c.role, c.target)
+		cfg.WritePaths = append(cfg.WritePaths, c.grant)
+		res := runEngine(t, cfg)
+		if res.code == 0 {
+			t.Errorf("%s %s succeeded under a grant on %s", c.role, c.target, c.grant)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "planted.json")); err == nil {
+		os.Remove(filepath.Join(stateDir, "planted.json"))
+		t.Error("a state file was planted in MXC's recovery directory")
+	}
+}
+
+// Existing persistence locations under a broad write grant are denied. A
+// missing one cannot be denied (the container API rejects the policy), so it
+// is reported as not enforced, and strict mode refuses the run.
+func TestWindowsEngineDenyPersistenceWrites(t *testing.T) {
+	requireMXC(t)
+	dir := testDir(t)
+	profile := filepath.Join(dir, "profile")
+	if err := os.MkdirAll(filepath.Join(profile, ".ssh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profile, ".npmrc"), []byte("registry=https://registry.npmjs.org/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"USERPROFILE=" + profile}
+	for target, wantOK := range map[string]bool{
+		filepath.Join(profile, "notes.txt"):               true,
+		filepath.Join(profile, ".npmrc"):                  false,
+		filepath.Join(profile, ".ssh", "authorized_keys"): false,
+	} {
+		cfg := workloadConfig(t, dir, "write", target)
+		cfg.WritePaths = []string{dir, profile}
+		cfg.DenyPersistenceWrites = true
+		res := runEngine(t, cfg, env...)
+		if ok := res.code == 0; ok != wantOK {
+			t.Errorf("write %s: succeeded=%v, want %v", target, ok, wantOK)
+		}
+		if !strings.Contains(res.stderr, "not enforced on Windows: denyPersistenceWrites") || !strings.Contains(res.stderr, ".bashrc") {
+			t.Errorf("missing .bashrc not reported: %s", res.stderr)
+		}
+	}
+	cfg := workloadConfig(t, dir, "write", filepath.Join(profile, "notes.txt"))
+	cfg.WritePaths = []string{dir, profile}
+	cfg.DenyPersistenceWrites = true
+	cfg.Strict = true
+	if res := runEngine(t, cfg, env...); res.code == 0 {
+		t.Error("strict mode ran with undeniable persistence locations")
 	}
 }
 

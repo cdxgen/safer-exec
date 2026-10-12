@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 // The test binary doubles as the workload: WINJOB_TEST_HELPER selects a role.
@@ -35,16 +37,18 @@ func TestMain(m *testing.M) {
 		time.Sleep(time.Duration(s) * time.Second)
 		os.Exit(0)
 	case "alloc":
+		// Commit memory with VirtualAlloc until the job refuses, then wait to
+		// be killed. (A Go heap allocation failure aborts the process, which
+		// would race the test's own termination.)
 		mb, _ := strconv.Atoi(os.Getenv("WINJOB_TEST_ARG"))
-		var keep [][]byte
 		for range mb {
-			b := make([]byte, 1<<20)
-			for i := range b {
-				b[i] = 1
+			// The job limit applies to committed memory, so committing is
+			// enough; the pages need not be touched.
+			if _, err := windows.VirtualAlloc(0, 1<<20, windows.MEM_COMMIT|windows.MEM_RESERVE, windows.PAGE_READWRITE); err != nil {
+				time.Sleep(time.Minute)
+				os.Exit(4)
 			}
-			keep = append(keep, b)
 		}
-		_ = keep
 		os.Exit(0)
 	}
 	os.Exit(99)
@@ -84,6 +88,17 @@ func TestStartRunsInsideJob(t *testing.T) {
 	}
 	if ppid := ParentPID(uint32(c.Process.Pid)); ppid != uint32(os.Getpid()) {
 		t.Errorf("ParentPID = %d, want %d", ppid, os.Getpid())
+	}
+	if img, ppid, ok := j.Describe(uint32(c.Process.Pid)); !ok || ppid != uint32(os.Getpid()) || !strings.EqualFold(filepath.Base(img), filepath.Base(os.Args[0])) {
+		t.Errorf("Describe(member) = %q %d %v", img, ppid, ok)
+	}
+	// A process outside the job (this test) is never described or killed
+	// through the job, even when its id is offered.
+	if _, _, ok := j.Describe(uint32(os.Getpid())); ok {
+		t.Error("Describe accepted a process outside the job")
+	}
+	if err := j.terminateMember(uint32(os.Getpid()), 1); err != nil {
+		t.Errorf("terminateMember(outsider) = %v", err)
 	}
 	if err := j.Terminate(42); err != nil {
 		t.Fatal(err)
@@ -231,6 +246,21 @@ func TestCloseKillsRemainingProcesses(t *testing.T) {
 	}
 	if err := j.Close(); err != nil {
 		t.Errorf("second Close: %v", err)
+	}
+	if err := j.Terminate(1); err == nil {
+		t.Error("Terminate after Close succeeded")
+	}
+	// The event stream ends after Close.
+	select {
+	case _, open := <-j.Events():
+		for open {
+			_, open = <-j.Events()
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("Events not closed after Close")
+	}
+	if j.Dropped() != 0 {
+		t.Errorf("dropped %d notifications", j.Dropped())
 	}
 }
 

@@ -170,3 +170,33 @@ func TestEnvSet(t *testing.T) {
 		t.Error("Delete is not case-insensitive")
 	}
 }
+
+func TestBuildEnvDropsDotNetAndPowerShellInjection(t *testing.T) {
+	cfg := map[string]string{
+		"DOTNET_ADDITIONAL_DEPS": `C:\x\deps.json`, "dotnet_shared_store": `C:\x`, "DOTNET_DiagnosticPorts": `\\.\pipe\x`,
+		"COMPlus_EnableDiagnostics": "1", "PSModulePath": `C:\evil`, "KEEP": "1",
+	}
+	entries, dropped := BuildEnv(EnvOptions{Host: NewEnvSet(), Config: cfg})
+	env := ParseEnviron(entries)
+	for k := range cfg {
+		_, present := env.Get(k)
+		if want := k == "KEEP"; present != want {
+			t.Errorf("%s present=%v, want %v (dropped %v)", k, present, want, dropped)
+		}
+	}
+	entries, _ = BuildEnv(EnvOptions{Host: NewEnvSet(), Config: cfg, AllowEnvs: []string{"psmodulepath"}})
+	if v, ok := ParseEnviron(entries).Get("PSModulePath"); !ok || v != `C:\evil` {
+		t.Errorf("allowEnvs did not pass PSModulePath through: %q %v", v, ok)
+	}
+}
+
+func TestBuildEnvDisablesCurrentDirectorySearch(t *testing.T) {
+	entries, _ := BuildEnv(EnvOptions{Host: NewEnvSet()})
+	if v, _ := ParseEnviron(entries).Get("NoDefaultCurrentDirectoryInExePath"); v != "1" {
+		t.Errorf("NoDefaultCurrentDirectoryInExePath = %q, want 1", v)
+	}
+	entries, _ = BuildEnv(EnvOptions{Host: NewEnvSet(), Config: map[string]string{"NODEFAULTCURRENTDIRECTORYINEXEPATH": "0"}})
+	if v, _ := ParseEnviron(entries).Get("NoDefaultCurrentDirectoryInExePath"); v != "0" {
+		t.Errorf("caller override lost: %q", v)
+	}
+}

@@ -3,6 +3,7 @@ package mxc
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"net"
 	"slices"
 	"strings"
@@ -23,6 +24,7 @@ func testHost() Host {
 		`C:\work\proj\package.json`,
 		`C:\work\proj\tool.exe`,
 		`C:\Users\u\.bashrc`,
+		`C:\Users\u\.gitconfig`,
 	}
 	dirs := []string{
 		`C:\work\proj\node_modules`,
@@ -31,6 +33,11 @@ func testHost() Host {
 		`C:\Users\u\.npm`,
 		`C:\Users\u\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup`,
 		`C:\Users\u\Documents\WindowsPowerShell`,
+		`C:\Users\u\AppData\Local\Microsoft\WindowsApps`,
+		`C:\Users\u\AppData\Roaming\npm`,
+		`C:\Users\u\.ssh`,
+		`C:\Users\u\AppData\Local\Temp\safer-exec-mxc`,
+		`C:\Users\u\AppData\Local\Microsoft\MXC`,
 	}
 	fileSet, existSet := map[string]bool{}, map[string]bool{}
 	addAncestors := func(p string) {
@@ -147,7 +154,7 @@ func TestTranslateWin32kOptIn(t *testing.T) {
 
 func TestTranslateCmdExeTakesCommandVerbatim(t *testing.T) {
 	p := mustTranslate(t, config.ExecConfig{Cmd: "cmd.exe", Args: []string{"/c", `echo hi> "out file.txt"`}}, Options{})
-	if want := `"C:\Windows\system32\cmd.exe" /c echo hi> "out file.txt"`; p.Request.Process.CommandLine != want {
+	if want := `"C:\Windows\system32\cmd.exe" /d /s /c "echo hi> "out file.txt""`; p.Request.Process.CommandLine != want {
 		t.Errorf("commandLine = %s, want %s", p.Request.Process.CommandLine, want)
 	}
 }
@@ -226,7 +233,10 @@ func TestTranslateDenyPersistenceWrites(t *testing.T) {
 	}
 	p := mustTranslate(t, cfg, Options{})
 	fs := p.Request.Filesystem
-	for _, d := range []string{`C:\Users\u\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup`, `C:\Users\u\Documents\WindowsPowerShell`, `C:\Users\u\.bashrc`} {
+	for _, d := range []string{
+		`C:\Users\u\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup`, `C:\Users\u\Documents\WindowsPowerShell`, `C:\Users\u\.bashrc`,
+		`C:\Users\u\AppData\Local\Microsoft\WindowsApps`, `C:\Users\u\AppData\Roaming\npm`, `C:\Users\u\.ssh`, `C:\Users\u\.gitconfig`,
+	} {
 		if !slices.Contains(fs.DeniedPaths, d) {
 			t.Errorf("%s not denied: %v", d, fs.DeniedPaths)
 		}
@@ -235,6 +245,10 @@ func TestTranslateDenyPersistenceWrites(t *testing.T) {
 		if strings.HasPrefix(d, `C:\ProgramData`) {
 			t.Errorf("%s denied without a covering write grant", d)
 		}
+	}
+	// Missing locations cannot be denied; they are reported instead.
+	if slices.Contains(fs.DeniedPaths, `C:\Users\u\.npmrc`) || !hasSubstring(p.Unenforced, `C:\Users\u\.npmrc`) {
+		t.Errorf("missing .npmrc: denied %v, unenforced %v", fs.DeniedPaths, p.Unenforced)
 	}
 	// An explicitly granted persistence path stays writable.
 	cfg.WritePaths = append(cfg.WritePaths, `C:\Users\u\Documents\WindowsPowerShell`)
@@ -343,16 +357,21 @@ func TestTranslateNetworkPrivateAndLoopback(t *testing.T) {
 	if len(n.Egress.Allow) != 1 || len(n.Egress.Allow[0].To) != 1 || n.Egress.Allow[0].To[0].CIDR != "10.20.30.40/32" {
 		t.Errorf("egress = %+v", n.Egress)
 	}
-	if !hasSubstring(p.Warnings, "privateNetworkClientServer") {
-		t.Errorf("warnings = %v", p.Warnings)
+	if !hasSubstring(p.Broadened, "privateNetworkClientServer") || !hasSubstring(p.Broadened, "host loopback") {
+		t.Errorf("broadened = %v", p.Broadened)
 	}
 	p = mustTranslate(t, config.ExecConfig{Cmd: "cmd", AllowLoopback: true}, Options{HostLoopbackSupported: false})
 	if p.Request.Network.Ingress.HostLoopback != ActionDeny || !hasSubstring(p.Warnings, "host loopback") {
 		t.Errorf("unsupported loopback: %+v %v", p.Request.Network.Ingress, p.Warnings)
 	}
 	p = mustTranslate(t, config.ExecConfig{Cmd: "cmd", AllowListen: []string{"127.0.0.1:3000"}}, Options{})
-	if p.Request.Network.Ingress.Default != ActionAllow {
-		t.Error("allowListen did not open ingress")
+	if p.Request.Network.Ingress.Default != ActionAllow || !hasSubstring(p.Broadened, "allowListen") {
+		t.Errorf("allowListen: ingress %+v broadened %v", p.Request.Network.Ingress, p.Broadened)
+	}
+	// A public destination needs no broadening.
+	p = mustTranslate(t, config.ExecConfig{Cmd: "cmd", AllowHosts: []string{"registry.npmjs.org"}}, Options{})
+	if len(p.Broadened) != 0 {
+		t.Errorf("public egress broadened: %v", p.Broadened)
 	}
 }
 
@@ -436,12 +455,12 @@ func TestTranslateUnsupportedControls(t *testing.T) {
 		ProtectSystem: "strict", ProtectHome: "tmpfs", PrivateTmp: true, UseReaper: true, BlockInterpreters: true,
 	}
 	p := mustTranslate(t, cfg, Options{})
-	for _, s := range []string{"blockJIT", "blockCrypto", "seccompFilters"} {
+	for _, s := range []string{"blockJIT", "blockCrypto", "seccompFilters", "blockTPM"} {
 		if !hasSubstring(p.Unenforced, s) {
 			t.Errorf("%s not reported unenforced: %v", s, p.Unenforced)
 		}
 	}
-	for _, s := range []string{"eBPF", "traceLibraries", "tmpOverlayPaths", "bindFds", "spoofAntiVM", "blockTPM"} {
+	for _, s := range []string{"eBPF", "traceLibraries", "tmpOverlayPaths", "bindFds", "spoofAntiVM"} {
 		if !hasSubstring(p.Warnings, s) {
 			t.Errorf("%s not warned: %v", s, p.Warnings)
 		}
@@ -538,5 +557,190 @@ func TestRequestJSONShape(t *testing.T) {
 	pc := m["processContainer"].(map[string]any)["captureDenials"].(map[string]any)
 	if pc["retainEtl"] != false || pc["mode"] != "block" {
 		t.Errorf("captureDenials = %v", pc)
+	}
+}
+
+// A grant spelled with Win32 aliases (trailing dots or spaces, an 8.3 short
+// name) covers the same directory, so it must trigger the same denies.
+func TestTranslatePersistenceDeniesSurviveAliasSpellings(t *testing.T) {
+	host := testHost()
+	host.LongPath = func(p string) string {
+		if strings.EqualFold(p, `C:\Users\U~1`) {
+			return `C:\Users\u`
+		}
+		return p
+	}
+	exists := host.Exists
+	host.Exists = func(p string) bool { return strings.EqualFold(p, `C:\Users\U~1`) || exists(p) }
+	want, err := Translate(config.ExecConfig{Cmd: "cmd", WritePaths: []string{`C:\Users\u`}, DenyPersistenceWrites: true}, host, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, alias := range []string{`C:\Users\u.`, `C:\Users\u. .`, `C:\Users\U~1`} {
+		p, err := Translate(config.ExecConfig{Cmd: "cmd", WritePaths: []string{alias}, DenyPersistenceWrites: true}, host, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(p.WritePaths, []string{`C:\Users\u`}) {
+			t.Errorf("%q: write grant = %v", alias, p.WritePaths)
+		}
+		if !slices.Equal(p.Request.Filesystem.DeniedPaths, want.Request.Filesystem.DeniedPaths) {
+			t.Errorf("%q: denies %v, want %v", alias, p.Request.Filesystem.DeniedPaths, want.Request.Filesystem.DeniedPaths)
+		}
+	}
+}
+
+// A redirected Documents folder (OneDrive) holds the real PowerShell
+// profiles, so it is denied as well as the default location.
+func TestTranslatePersistenceUsesDocumentsKnownFolder(t *testing.T) {
+	host := testHost()
+	host.Documents = `C:\Users\u\OneDrive\Documents`
+	exists := host.Exists
+	host.Exists = func(p string) bool { return WinHasPrefix(p, host.Documents) || exists(p) }
+	p, err := Translate(config.ExecConfig{Cmd: "cmd", WritePaths: []string{`C:\Users\u`}, DenyPersistenceWrites: true}, host, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(p.Request.Filesystem.DeniedPaths, `C:\Users\u\OneDrive\Documents\PowerShell`) {
+		t.Errorf("redirected PowerShell profile not denied: %v", p.Request.Filesystem.DeniedPaths)
+	}
+}
+
+// Engine-owned directories are denied whenever a grant reaches them, from
+// above or from inside, and left alone otherwise.
+func TestTranslateProtectedPaths(t *testing.T) {
+	protected := []string{`C:\Users\u\AppData\Local\Temp\safer-exec-mxc`, `C:\Users\u\AppData\Local\Microsoft\MXC`}
+	cases := []struct {
+		grant string
+		read  bool
+		want  []string
+	}{
+		{`C:\Users\u`, false, protected},
+		{`C:\Users\u\AppData`, true, protected},
+		{`C:\Users\u\.npm`, false, nil},
+	}
+	for _, c := range cases {
+		cfg := config.ExecConfig{Cmd: "cmd"}
+		if c.read {
+			cfg.ReadPaths = []string{c.grant}
+		} else {
+			cfg.WritePaths = []string{c.grant}
+		}
+		p := mustTranslate(t, cfg, Options{ProtectedPaths: protected})
+		var denied []string
+		if p.Request.Filesystem != nil {
+			denied = p.Request.Filesystem.DeniedPaths
+		}
+		if !slices.Equal(denied, c.want) {
+			t.Errorf("grant %s: denied %v, want %v", c.grant, denied, c.want)
+		}
+	}
+	// A grant inside a protected directory is shut by denying the directory.
+	host := testHost()
+	exists := host.Exists
+	host.Exists = func(p string) bool { return WinHasPrefix(p, protected[0]) || exists(p) }
+	p, err := Translate(config.ExecConfig{Cmd: "cmd", WritePaths: []string{protected[0] + `\run-1`}}, host, Options{ProtectedPaths: protected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(p.Request.Filesystem.DeniedPaths, protected[0]) {
+		t.Errorf("grant inside a protected path not shut: %v", p.Request.Filesystem.DeniedPaths)
+	}
+}
+
+// On MXC's ACL-modifying tier a grant cascades over the whole tree, so a
+// volume-root grant would open the drive.
+func TestTranslateRefusesVolumeRootOnCascadingTier(t *testing.T) {
+	cfg := config.ExecConfig{Cmd: "cmd", ReadPaths: []string{`C:\`}}
+	if _, err := Translate(cfg, testHost(), Options{CascadingGrants: true}); err == nil || !strings.Contains(err.Error(), "volume root") {
+		t.Errorf("err = %v, want a volume-root refusal", err)
+	}
+	if p := mustTranslate(t, cfg, Options{}); !hasSubstring(p.Warnings, "volume root") {
+		t.Errorf("BaseContainer tier: warnings %v", p.Warnings)
+	}
+}
+
+// A program kept in the profile root gets a grant on its own file, not on
+// the whole profile.
+func TestTranslateProgramInBroadDirectoryGrantsOnlyTheFile(t *testing.T) {
+	host := testHost()
+	isFile, exists := host.IsFile, host.Exists
+	host.IsFile = func(p string) bool { return strings.EqualFold(p, `C:\Users\u\tool.exe`) || isFile(p) }
+	host.Exists = func(p string) bool { return strings.EqualFold(p, `C:\Users\u\tool.exe`) || exists(p) }
+	p, err := Translate(config.ExecConfig{Cmd: `C:\Users\u\tool.exe`, WorkingDir: `C:\work\proj`}, host, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsPath(p.ReadPaths, `C:\Users\u`) || !containsPath(p.ReadPaths, `C:\Users\u\tool.exe`) {
+		t.Errorf("read grants = %v", p.ReadPaths)
+	}
+	// A program in an ordinary directory keeps the directory grant (DLLs).
+	if p := mustTranslate(t, config.ExecConfig{Cmd: `C:\tools\bin\gcc.exe`}, Options{}); !containsPath(p.ReadPaths, `C:\tools\bin`) {
+		t.Errorf("ordinary program directory not granted: %v", p.ReadPaths)
+	}
+}
+
+// The process slots a batch command's interpreters need can run any
+// program, so blockFork and exec rules are not enforced by the job limit.
+func TestTranslateBatchCommandDoesNotEnforceExecRules(t *testing.T) {
+	p := mustTranslate(t, config.ExecConfig{Cmd: "npm", BlockFork: true, BlockExec: []string{"*"}, AllowExec: []string{"node"}}, Options{})
+	for _, s := range []string{"blockFork for a batch command", "blockExec for *", "allowExec"} {
+		if !hasSubstring(p.Unenforced, s) {
+			t.Errorf("%q not reported: %v", s, p.Unenforced)
+		}
+	}
+	// The same rules on a real executable are enforced by the job limit.
+	if p := mustTranslate(t, config.ExecConfig{Cmd: "node", BlockFork: true, BlockExec: []string{"*"}}, Options{}); len(p.Unenforced) != 0 {
+		t.Errorf("executable with blockFork: %v", p.Unenforced)
+	}
+}
+
+// Absurd limits saturate instead of wrapping to "no limit".
+func TestTranslateLimitsSaturate(t *testing.T) {
+	p := mustTranslate(t, config.ExecConfig{Cmd: "node", MaxMemoryMB: 1<<44 - 32, MaxProcesses: math.MaxUint32}, Options{})
+	if p.Limits.MemoryBytes == 0 || p.Limits.MemoryBytes < 1<<40 {
+		t.Errorf("memory limit wrapped: %d", p.Limits.MemoryBytes)
+	}
+	if p.Limits.ActiveProcesses != math.MaxUint32 {
+		t.Errorf("process limit = %d, want saturation", p.Limits.ActiveProcesses)
+	}
+}
+
+func TestLookPathHonorsQuotedPathEntries(t *testing.T) {
+	isFile := func(p string) bool {
+		return strings.EqualFold(p, `C:\a;b\tool.exe`) || strings.EqualFold(p, `C:\a\tool.exe`)
+	}
+	got, err := LookPath("tool", LookPathOptions{PathList: `"C:\a;b";C:\a`, PathExt: ".EXE", Dir: `C:\w`, IsFile: isFile})
+	if err != nil || got != `C:\a;b\tool.exe` {
+		t.Errorf("LookPath = %q, %v", got, err)
+	}
+}
+
+// An interactive session's %TEMP% is often an 8.3 short path. The protected
+// run directory spelled that way must still be denied under a grant on the
+// long-named TEMP, and the other way around.
+func TestTranslateProtectedPathsMatchShortNames(t *testing.T) {
+	const long, short = `C:\Users\u\AppData\Local\Temp`, `C:\Users\U~1\AppData\Local\Temp`
+	host := testHost()
+	host.LongPath = func(p string) string {
+		if WinHasPrefix(p, `C:\Users\U~1`) {
+			return `C:\Users\u` + p[len(`C:\Users\U~1`):]
+		}
+		return p
+	}
+	exists := host.Exists
+	host.Exists = func(p string) bool { return exists(host.LongPath(p)) }
+	for _, c := range []struct{ grant, protected string }{
+		{short, short + `\safer-exec-mxc`},
+		{long, short + `\safer-exec-mxc`},
+		{short, long + `\safer-exec-mxc`},
+	} {
+		p, err := Translate(config.ExecConfig{Cmd: "cmd", WritePaths: []string{c.grant}}, host, Options{ProtectedPaths: []string{c.protected}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Request.Filesystem == nil || !slices.Contains(p.Request.Filesystem.DeniedPaths, long+`\safer-exec-mxc`) {
+			t.Errorf("grant %s, protected %s: denied %+v", c.grant, c.protected, p.Request.Filesystem)
+		}
 	}
 }

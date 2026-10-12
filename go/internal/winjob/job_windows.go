@@ -74,10 +74,55 @@ type Job struct {
 	handle windows.Handle
 	port   windows.Handle
 
+	// hmu guards handle against use after Close: operations hold it shared,
+	// Close exclusively.
+	hmu    sync.RWMutex
+	closed bool
+
+	// Notifications go from the completion port into an in-memory queue, so
+	// a slow consumer delays them instead of losing them; only a queue past
+	// maxQueuedEvents drops (and counts) further notifications.
+	qmu      sync.Mutex
+	queue    []Event
+	pumpDone bool
+	dropped  uint64
+	wake     chan struct{}
+
 	events chan Event
 	done   chan struct{}
 
 	closeOnce sync.Once
+}
+
+// maxQueuedEvents bounds the notification backlog (8 bytes each).
+const maxQueuedEvents = 1 << 16
+
+var (
+	kernel32                      = windows.NewLazySystemDLL("kernel32.dll")
+	procSetInformationJobObject   = kernel32.NewProc("SetInformationJobObject")
+	procQueryInformationJobObject = kernel32.NewProc("QueryInformationJobObject")
+	procIsProcessInJob            = kernel32.NewProc("IsProcessInJob")
+)
+
+// setJobInformation and queryJobInformation call the job APIs through
+// LazyProc.Call, whose uintptr arguments are //go:uintptrescapes: the
+// structures they point to are moved to the heap and kept alive for the
+// call. The x/sys wrappers take a plain uintptr, which lets a stack-allocated
+// structure move (stack growth) while the kernel still holds its old address.
+func setJobInformation(job windows.Handle, class uint32, info unsafe.Pointer, size uintptr) error {
+	r, _, err := procSetInformationJobObject.Call(uintptr(job), uintptr(class), uintptr(info), size)
+	if r == 0 {
+		return err
+	}
+	return nil
+}
+
+func queryJobInformation(job windows.Handle, class uint32, info unsafe.Pointer, size uintptr) error {
+	r, _, err := procQueryInformationJobObject.Call(uintptr(job), uintptr(class), uintptr(info), size, 0)
+	if r == 0 {
+		return err
+	}
+	return nil
 }
 
 type cpuRateControlInformation struct {
@@ -109,7 +154,7 @@ func New(l Limits) (*Job, error) {
 	if err != nil {
 		return nil, fmt.Errorf("CreateJobObject: %w", err)
 	}
-	j := &Job{handle: h, events: make(chan Event, 256), done: make(chan struct{})}
+	j := &Job{handle: h, events: make(chan Event), done: make(chan struct{}), wake: make(chan struct{}, 1)}
 
 	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | jobLimitDieOnUnhandledEx
@@ -121,8 +166,8 @@ func New(l Limits) (*Job, error) {
 		info.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_JOB_MEMORY
 		info.JobMemoryLimit = uintptr(l.MemoryBytes)
 	}
-	if _, err := windows.SetInformationJobObject(h, windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+	if err := setJobInformation(h, windows.JobObjectExtendedLimitInformation,
+		unsafe.Pointer(&info), unsafe.Sizeof(info)); err != nil {
 		windows.CloseHandle(h)
 		return nil, fmt.Errorf("SetInformationJobObject(limits): %w", err)
 	}
@@ -132,8 +177,8 @@ func New(l Limits) (*Job, error) {
 			ControlFlags: cpuRateControlEnable | cpuRateControlHardCap,
 			CPURate:      min(l.CPURate, 10000),
 		}
-		if _, err := windows.SetInformationJobObject(h, jobObjectCPURateControl,
-			uintptr(unsafe.Pointer(&rate)), uint32(unsafe.Sizeof(rate))); err != nil {
+		if err := setJobInformation(h, jobObjectCPURateControl,
+			unsafe.Pointer(&rate), unsafe.Sizeof(rate)); err != nil {
 			windows.CloseHandle(h)
 			return nil, fmt.Errorf("SetInformationJobObject(cpu rate): %w", err)
 		}
@@ -145,25 +190,34 @@ func New(l Limits) (*Job, error) {
 		return nil, fmt.Errorf("CreateIoCompletionPort: %w", err)
 	}
 	assoc := associateCompletionPort{CompletionKey: jobCompletionKey, CompletionPort: port}
-	if _, err := windows.SetInformationJobObject(h, windows.JobObjectAssociateCompletionPortInformation,
-		uintptr(unsafe.Pointer(&assoc)), uint32(unsafe.Sizeof(assoc))); err != nil {
+	if err := setJobInformation(h, windows.JobObjectAssociateCompletionPortInformation,
+		unsafe.Pointer(&assoc), unsafe.Sizeof(assoc)); err != nil {
 		windows.CloseHandle(port)
 		windows.CloseHandle(h)
 		return nil, fmt.Errorf("associate job completion port: %w", err)
 	}
 	j.port = port
 	go j.pump()
+	go j.deliver()
 	return j, nil
 }
 
-// Events delivers job notifications until the job is closed. The channel is
-// buffered; notifications are dropped rather than blocking the pump if the
-// consumer falls behind.
+// Events delivers job notifications, in order, until the job is closed and
+// every queued notification has been delivered. Windows itself does not
+// guarantee delivery of every job message; see Dropped for losses here.
 func (j *Job) Events() <-chan Event { return j.events }
+
+// Dropped reports how many notifications were discarded because the
+// consumer fell more than maxQueuedEvents behind.
+func (j *Job) Dropped() uint64 {
+	j.qmu.Lock()
+	defer j.qmu.Unlock()
+	return j.dropped
+}
 
 func (j *Job) pump() {
 	defer close(j.done)
-	defer close(j.events)
+	defer j.signal(true)
 	for {
 		var msg uint32
 		var key uintptr
@@ -179,9 +233,48 @@ func (j *Job) pump() {
 		}
 		// For job messages the OVERLAPPED pointer slot carries the process id.
 		ev := Event{Message: msg, PID: uint32(uintptr(unsafe.Pointer(ov)))}
-		select {
-		case j.events <- ev:
-		default:
+		j.qmu.Lock()
+		if len(j.queue) < maxQueuedEvents {
+			j.queue = append(j.queue, ev)
+		} else {
+			j.dropped++
+		}
+		j.qmu.Unlock()
+		j.signal(false)
+	}
+}
+
+// signal wakes deliver; final marks the end of the notification stream.
+func (j *Job) signal(final bool) {
+	if final {
+		j.qmu.Lock()
+		j.pumpDone = true
+		j.qmu.Unlock()
+	}
+	select {
+	case j.wake <- struct{}{}:
+	default:
+	}
+}
+
+// deliver moves queued notifications to the Events channel, closing it once
+// the pump has stopped and the queue is empty.
+func (j *Job) deliver() {
+	defer close(j.events)
+	for {
+		j.qmu.Lock()
+		batch := j.queue
+		j.queue = nil
+		done := j.pumpDone
+		j.qmu.Unlock()
+		for _, ev := range batch {
+			j.events <- ev
+		}
+		if done && len(batch) == 0 {
+			return
+		}
+		if len(batch) == 0 {
+			<-j.wake
 		}
 	}
 }
@@ -249,8 +342,16 @@ func resumeProcess(pid uint32) error {
 	return nil
 }
 
+// errClosed is returned by operations on a closed job.
+var errClosed = errors.New("job object is closed")
+
 // Terminate kills every process in the job with the given exit code.
 func (j *Job) Terminate(exitCode uint32) error {
+	j.hmu.RLock()
+	defer j.hmu.RUnlock()
+	if j.closed {
+		return errClosed
+	}
 	return windows.TerminateJobObject(j.handle, exitCode)
 }
 
@@ -265,9 +366,18 @@ type processIDList struct {
 // ProcessIDs returns the processes currently in the job, including those of
 // nested jobs.
 func (j *Job) ProcessIDs() ([]uint32, error) {
-	var l processIDList
-	if err := windows.QueryInformationJobObject(j.handle, windows.JobObjectBasicProcessIdList,
-		uintptr(unsafe.Pointer(&l)), uint32(unsafe.Sizeof(l)), nil); err != nil && err != windows.ERROR_MORE_DATA {
+	j.hmu.RLock()
+	defer j.hmu.RUnlock()
+	if j.closed {
+		return nil, errClosed
+	}
+	return j.processIDs()
+}
+
+func (j *Job) processIDs() ([]uint32, error) {
+	l := new(processIDList)
+	if err := queryJobInformation(j.handle, windows.JobObjectBasicProcessIdList,
+		unsafe.Pointer(l), unsafe.Sizeof(*l)); err != nil && err != windows.ERROR_MORE_DATA {
 		return nil, err
 	}
 	n := min(int(l.NumberOfProcessIdsInList), len(l.ProcessIDList))
@@ -283,9 +393,14 @@ func (j *Job) ProcessIDs() ([]uint32, error) {
 // started a child). Leaving the launcher alive lets it observe the
 // workload's exit and run its own teardown.
 func (j *Job) TerminateExcept(keep uint32, exitCode uint32) error {
+	j.hmu.RLock()
+	defer j.hmu.RUnlock()
+	if j.closed {
+		return errClosed
+	}
 	var lastErr error
 	for attempt := range 50 {
-		pids, err := j.ProcessIDs()
+		pids, err := j.processIDs()
 		if err != nil {
 			return err
 		}
@@ -295,7 +410,7 @@ func (j *Job) TerminateExcept(keep uint32, exitCode uint32) error {
 				continue
 			}
 			remaining++
-			if err := terminateProcess(pid, exitCode); err != nil {
+			if err := j.terminateMember(pid, exitCode); err != nil {
 				lastErr = err
 			}
 		}
@@ -317,14 +432,19 @@ func (j *Job) TerminateExcept(keep uint32, exitCode uint32) error {
 // Accounting returns the job's peak committed memory and total process
 // count so far.
 func (j *Job) Accounting() (peakJobMemory uint64, totalProcesses uint32, err error) {
+	j.hmu.RLock()
+	defer j.hmu.RUnlock()
+	if j.closed {
+		return 0, 0, errClosed
+	}
 	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-	if err = windows.QueryInformationJobObject(j.handle, windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil); err != nil {
+	if err = queryJobInformation(j.handle, windows.JobObjectExtendedLimitInformation,
+		unsafe.Pointer(&info), unsafe.Sizeof(info)); err != nil {
 		return 0, 0, err
 	}
 	var basic basicAccountingInformation
-	if err = windows.QueryInformationJobObject(j.handle, windows.JobObjectBasicAccountingInformation,
-		uintptr(unsafe.Pointer(&basic)), uint32(unsafe.Sizeof(basic)), nil); err != nil {
+	if err = queryJobInformation(j.handle, windows.JobObjectBasicAccountingInformation,
+		unsafe.Pointer(&basic), unsafe.Sizeof(basic)); err != nil {
 		return uint64(info.PeakJobMemoryUsed), 0, err
 	}
 	return uint64(info.PeakJobMemoryUsed), basic.TotalProcesses, nil
@@ -336,11 +456,13 @@ func isConsoleHostOf(pid, parent uint32) bool {
 	return ParentPID(pid) == parent && strings.EqualFold(filepath.Base(ProcessImage(pid)), "conhost.exe")
 }
 
-// terminateProcess terminates pid. A process that has already exited, or is
+// terminateMember terminates pid if, once opened, it is still a member of
+// the job: between listing the job and opening the process its id can be
+// reused by an unrelated process. A process that has already exited, or is
 // exiting (TerminateProcess then fails with ERROR_ACCESS_DENIED), counts as
 // terminated.
-func terminateProcess(pid uint32, exitCode uint32) error {
-	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.SYNCHRONIZE, false, pid)
+func (j *Job) terminateMember(pid uint32, exitCode uint32) error {
+	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.SYNCHRONIZE|processQueryLimited, false, pid)
 	if err != nil {
 		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
 			return nil // already gone
@@ -348,6 +470,9 @@ func terminateProcess(pid uint32, exitCode uint32) error {
 		return err
 	}
 	defer windows.CloseHandle(h)
+	if !j.contains(h) {
+		return nil // the id now belongs to a process outside the job
+	}
 	terr := windows.TerminateProcess(h, exitCode)
 	if terr == nil {
 		return nil
@@ -362,12 +487,45 @@ func terminateProcess(pid uint32, exitCode uint32) error {
 	return terr
 }
 
+// contains reports whether the process behind h belongs to the job
+// (including nested jobs).
+func (j *Job) contains(h windows.Handle) bool {
+	var in int32 // BOOL
+	r, _, _ := procIsProcessInJob.Call(uintptr(h), uintptr(j.handle), uintptr(unsafe.Pointer(&in)))
+	return r != 0 && in != 0
+}
+
+// Describe returns the image path and parent id of a process that is still a
+// member of the job. ok is false when the process has exited or its id now
+// belongs to a process outside the job.
+func (j *Job) Describe(pid uint32) (image string, ppid uint32, ok bool) {
+	j.hmu.RLock()
+	defer j.hmu.RUnlock()
+	if j.closed {
+		return "", 0, false
+	}
+	h, err := windows.OpenProcess(processQueryLimited, false, pid)
+	if err != nil {
+		return "", 0, false
+	}
+	defer windows.CloseHandle(h)
+	if !j.contains(h) {
+		return "", 0, false
+	}
+	image = imageOf(h)
+	return image, parentOf(h), image != ""
+}
+
 // Close releases the job. Any process still inside is killed
-// (KILL_ON_JOB_CLOSE). It is safe to call more than once.
+// (KILL_ON_JOB_CLOSE). It is safe to call more than once, and concurrently
+// with the job's other methods, which then report errClosed.
 func (j *Job) Close() error {
 	var err error
 	j.closeOnce.Do(func() {
+		j.hmu.Lock()
+		j.closed = true
 		err = windows.CloseHandle(j.handle)
+		j.hmu.Unlock()
 		if j.port != 0 {
 			_ = windows.PostQueuedCompletionStatus(j.port, 0, quitCompletionKey, nil)
 			<-j.done
@@ -385,6 +543,10 @@ func ProcessImage(pid uint32) string {
 		return ""
 	}
 	defer windows.CloseHandle(h)
+	return imageOf(h)
+}
+
+func imageOf(h windows.Handle) string {
 	buf := make([]uint16, windows.MAX_LONG_PATH)
 	n := uint32(len(buf))
 	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &n); err != nil {
@@ -400,6 +562,10 @@ func ParentPID(pid uint32) uint32 {
 		return 0
 	}
 	defer windows.CloseHandle(h)
+	return parentOf(h)
+}
+
+func parentOf(h windows.Handle) uint32 {
 	var pbi windows.PROCESS_BASIC_INFORMATION
 	var ret uint32
 	if err := windows.NtQueryInformationProcess(h, windows.ProcessBasicInformation,

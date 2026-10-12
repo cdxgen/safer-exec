@@ -1,6 +1,9 @@
 package mxc
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func TestWinIsAbs(t *testing.T) {
 	cases := map[string]bool{
@@ -143,5 +146,20 @@ func TestIsDevicePath(t *testing.T) {
 	}
 	if IsDevicePath(`\\?\C:\x`) || IsDevicePath(`C:\x`) {
 		t.Error("non-device path detected as device")
+	}
+}
+
+func TestSplitPathList(t *testing.T) {
+	cases := map[string][]string{
+		``:                               nil,
+		`C:\a;C:\b`:                      {`C:\a`, `C:\b`},
+		`"C:\Users\me\x;y\bin";C:\tools`: {`C:\Users\me\x;y\bin`, `C:\tools`},
+		`C:\a;;  C:\b  ;`:                {`C:\a`, ``, `C:\b`, ``},
+		`"C:\Program Files\Git\cmd"`:     {`C:\Program Files\Git\cmd`},
+	}
+	for in, want := range cases {
+		if got := SplitPathList(in); !slices.Equal(got, want) {
+			t.Errorf("SplitPathList(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
