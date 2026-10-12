@@ -437,3 +437,97 @@ func TestDiff_DirectoryModifiedOnlyByMode(t *testing.T) {
 		t.Errorf("mode change: modified=%+v, want only %s", d.Modified, sub)
 	}
 }
+
+// The workload can write inside the outer root, so it can replace a nested
+// root with a symlink to somewhere it was never granted. The post-run
+// snapshot (taken unsandboxed) must not follow it: the swapped root shows up
+// as one changed entry and its former contents as deleted, and nothing from
+// the link target is read or reported.
+func TestSnapshotter_NestedRootSwappedForSymlink(t *testing.T) {
+	outer := t.TempDir()
+	inner := filepath.Join(outer, "node_modules")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inner, "dep.js"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	secret := t.TempDir()
+	if err := os.WriteFile(filepath.Join(secret, "id_ed25519"), []byte("key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := fsdiff.NewSnapshotter(inner, outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.RemoveAll(inner); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, inner); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	after, err := s.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p := range after {
+		if filepath.Base(p) == "id_ed25519" {
+			t.Fatalf("post-run snapshot followed the swapped root into %s", p)
+		}
+	}
+	d := fsdiff.Diff(before, after)
+	if len(d.Modified) != 1 || d.Modified[0].Path != inner {
+		t.Errorf("modified = %+v, want only the swapped root %s", d.Modified, inner)
+	}
+	if len(d.Deleted) != 1 || d.Deleted[0].Path != filepath.Join(inner, "dep.js") {
+		t.Errorf("deleted = %+v, want the root's former contents", d.Deleted)
+	}
+	if len(d.Added) != 0 {
+		t.Errorf("added = %+v, want none", d.Added)
+	}
+}
+
+// A directory above a nested root swapped for a symlink redirects the nested
+// root too, even though the root's own last component is unchanged.
+func TestSnapshotter_IntermediateDirectorySwappedForSymlink(t *testing.T) {
+	outer := t.TempDir()
+	inner := filepath.Join(outer, "a", "b")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(elsewhere, "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(elsewhere, "b", "secret.txt"), []byte("s"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := fsdiff.NewSnapshotter(outer, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(outer, "a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(outer, "a")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	after, err := s.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p := range after {
+		if filepath.Base(p) == "secret.txt" {
+			t.Fatalf("snapshot followed a swapped parent directory into %s", p)
+		}
+	}
+}

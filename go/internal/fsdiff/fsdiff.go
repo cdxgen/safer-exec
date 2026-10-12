@@ -6,6 +6,8 @@ package fsdiff
 import (
 	"crypto/sha256"
 	"fmt"
+	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,36 +33,73 @@ type SnapshotEntry struct {
 // never collide.
 type Snapshot map[string]SnapshotEntry
 
-// SnapshotPath walks the given roots and returns a Snapshot of all files and
-// directories under them. Symlinks inside a root are recorded, not followed;
-// a root that is itself a symlink (macOS /tmp → /private/tmp) is walked
-// through to its target and reported under the given spelling. A tree
-// reachable through more than one root (a root nested in or aliasing an
-// earlier one) is recorded once, under the first root that reaches it.
-// Nonexistent roots are skipped.
+// Snapshotter takes repeated snapshots of a fixed set of roots. Each root is
+// resolved once, when the Snapshotter is created: the engine snapshots after
+// the sandboxed run with the user's full privileges, and the workload can
+// write inside the roots, so it must not be able to redirect a later walk by
+// swapping a root (or a directory above a nested root) for a symlink.
+type Snapshotter struct {
+	roots []snapRoot
+}
+
+type snapRoot struct {
+	given    string // absolute path as the caller spelled it
+	resolved string // symlink-free location pinned at creation
+}
+
+// NewSnapshotter pins the roots. A root that is itself a symlink (macOS /tmp
+// → /private/tmp) is resolved to its target and reported under the given
+// spelling. Roots that do not exist yet are ignored for the Snapshotter's
+// lifetime; anything created there is outside what was granted to watch.
+func NewSnapshotter(roots ...string) (*Snapshotter, error) {
+	s := &Snapshotter{}
+	for _, given := range roots {
+		abs, err := filepath.Abs(given)
+		if err != nil {
+			return nil, fmt.Errorf("resolve path %s: %w", given, err)
+		}
+		resolved, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			continue
+		}
+		s.roots = append(s.roots, snapRoot{given: abs, resolved: resolved})
+	}
+	return s, nil
+}
+
+// SnapshotPath is NewSnapshotter(roots...).Snapshot() for a one-off view.
 func SnapshotPath(roots ...string) (Snapshot, error) {
+	s, err := NewSnapshotter(roots...)
+	if err != nil {
+		return nil, err
+	}
+	return s.Snapshot()
+}
+
+// Snapshot walks every pinned root and records all files and directories
+// under it. Symlinks inside a root are recorded, not followed, and only
+// regular files are read for hashing. A tree reachable through more than one
+// root (a root nested in or aliasing an earlier one) is recorded once, under
+// the first root that reaches it.
+//
+// A root whose path no longer resolves to its pinned location is recorded as
+// a single entry for whatever now sits at the given path and is not walked,
+// so its earlier contents show up as deleted. The check is repeated after the
+// walk to catch a swap made while walking.
+func (s *Snapshotter) Snapshot() (Snapshot, error) {
 	snap := make(Snapshot)
 	// Resolved locations already recorded, so overlapping roots do not
 	// report the same file twice under different spellings.
 	seen := make(map[string]struct{})
 
-	for _, given := range roots {
-		root, err := filepath.Abs(given)
-		if err != nil {
-			return nil, fmt.Errorf("resolve path %s: %w", given, err)
-		}
-
-		// Skip if root doesn't exist
-		if _, err := os.Stat(root); err != nil {
+	for _, r := range s.roots {
+		if !r.intact() {
+			r.recordRedirected(snap)
 			continue
 		}
-		// filepath.Walk does not follow a symlinked root; walk its target.
-		walkRoot := root
-		if resolved, err := filepath.EvalSymlinks(root); err == nil {
-			walkRoot = resolved
-		}
-
-		err = filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
+		rootSnap := make(Snapshot)
+		rootSeen := make([]string, 0, 64)
+		err := filepath.Walk(r.resolved, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return nil // skip errors during walk
 			}
@@ -71,22 +110,23 @@ func SnapshotPath(roots ...string) (Snapshot, error) {
 				return nil
 			}
 			seen[path] = struct{}{}
+			rootSeen = append(rootSeen, path)
 
 			reported := path
-			if walkRoot != root {
-				rel, err := filepath.Rel(walkRoot, path)
+			if r.resolved != r.given {
+				rel, err := filepath.Rel(r.resolved, path)
 				if err != nil {
 					return nil
 				}
-				reported = filepath.Join(root, rel)
+				reported = filepath.Join(r.given, rel)
 			}
 
 			hash := ""
-			if !info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
-				hash = fileHash(path)
+			if info.Mode().IsRegular() {
+				hash = fileHash(path, info)
 			}
 
-			snap[reported] = SnapshotEntry{
+			rootSnap[reported] = SnapshotEntry{
 				Path:    reported,
 				Mode:    uint32(info.Mode()),
 				Size:    info.Size(),
@@ -94,15 +134,45 @@ func SnapshotPath(roots ...string) (Snapshot, error) {
 				Hash:    hash,
 				ModTime: info.ModTime().UnixNano(),
 			}
-
 			return nil
 		})
 		if err != nil {
-			return nil, fmt.Errorf("walk %s: %w", root, err)
+			return nil, fmt.Errorf("walk %s: %w", r.given, err)
 		}
+		if !r.intact() {
+			for _, p := range rootSeen {
+				delete(seen, p)
+			}
+			r.recordRedirected(snap)
+			continue
+		}
+		maps.Copy(snap, rootSnap)
 	}
 
 	return snap, nil
+}
+
+// intact reports whether the root's path still leads to its pinned location.
+func (r snapRoot) intact() bool {
+	cur, err := filepath.EvalSymlinks(r.given)
+	return err == nil && cur == r.resolved
+}
+
+// recordRedirected records what now sits at a root that no longer leads to
+// its pinned location, without following it. A root that vanished records
+// nothing.
+func (r snapRoot) recordRedirected(snap Snapshot) {
+	info, err := os.Lstat(r.given)
+	if err != nil {
+		return
+	}
+	snap[r.given] = SnapshotEntry{
+		Path:    r.given,
+		Mode:    uint32(info.Mode()),
+		Size:    info.Size(),
+		IsDir:   info.IsDir(),
+		ModTime: info.ModTime().UnixNano(),
+	}
 }
 
 // Diff compares two snapshots and returns an FSDiff report.
@@ -179,17 +249,27 @@ func sortFSDiffEntries(entries []config.FSDiffEntry) {
 // otherwise read the entire tree twice per run. Overridable in tests.
 var maxHashSize int64 = 64 << 20 // 64 MiB
 
-// fileHash computes the SHA-256 hash of a file's contents.
+// fileHash computes the SHA-256 hash of a regular file's contents. info is
+// the walk's Lstat result; the opened file must still be that same regular
+// file, so an entry swapped for a symlink, FIFO or device after the walk saw
+// it is not read (openForHash refuses to follow links or block on FIFOs).
 // Returns empty string if the file can't be read or exceeds maxHashSize.
-func fileHash(path string) string {
-	info, err := os.Stat(path)
-	if err != nil || info.Size() > maxHashSize {
+func fileHash(path string, info os.FileInfo) string {
+	if info.Size() > maxHashSize {
 		return ""
 	}
-	data, err := os.ReadFile(path)
+	f, err := openForHash(path)
 	if err != nil {
 		return ""
 	}
-	h := sha256.Sum256(data)
-	return fmt.Sprintf("%x", h)
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) || opened.Size() > maxHashSize {
+		return ""
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, io.LimitReader(f, maxHashSize+1)); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
