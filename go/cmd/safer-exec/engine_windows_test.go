@@ -12,11 +12,13 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -153,6 +155,20 @@ func workload(role string, args []string) int {
 		}
 		err := stopTraceSession(name)
 		fmt.Println("stopetw-result:", err)
+		return 0
+	case "https":
+		// A self-signed test server: verification is not the point here.
+		client := &http.Client{Transport: &http.Transport{
+			Proxy:           http.ProxyFromEnvironment,
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}}
+		resp, err := client.Get(args[0])
+		if err != nil {
+			fmt.Println("https-error:", err)
+			return 3
+		}
+		resp.Body.Close()
+		fmt.Println("https-status:", resp.StatusCode)
 		return 0
 	case "http":
 		resp, err := http.Get(args[0])
@@ -740,6 +756,68 @@ func TestWindowsEngineWorkloadCannotStopTraceSession(t *testing.T) {
 	}
 	if strings.Contains(res.stderr, "stopped before the run ended") {
 		t.Fatalf("the session was stopped during the run: %q", res.stderr)
+	}
+}
+
+// traceCrypto on Windows: the TLS parameters the egress proxy reads from
+// each tunnel's handshake, and the crypto DLLs the ETW session sees.
+func TestWindowsEngineTraceCrypto(t *testing.T) {
+	requireMXC(t)
+	dir := testDir(t)
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }))
+	srv.Listener.Close()
+	srv.Listener = ln
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	port := ln.Addr().(*net.TCPAddr).Port
+	host, _ := os.Hostname()
+	host = strings.ToLower(host)
+
+	cbom := filepath.Join(dir, "cbom.json")
+	cfg := workloadConfig(t, dir, "https", fmt.Sprintf("https://%s:%d/", host, port))
+	cfg.ProxyEgress = true
+	cfg.AllowHosts = []string{host}
+	cfg.AllowPorts = []int{port}
+	cfg.TraceCrypto = true
+	cfg.EnableAudit = true
+	cfg.CBOMOutputPath = cbom
+	res := runEngine(t, cfg)
+	if !strings.Contains(res.stdout, "https-status: 200") {
+		t.Fatalf("TLS request through the proxy failed: %q", res.stdout)
+	}
+	idx := strings.Index(res.stdout, "CRYPTO:")
+	if idx < 0 {
+		t.Fatalf("no CRYPTO result: %q", res.stdout)
+	}
+	var r config.CryptoResult
+	if err := json.Unmarshal([]byte(strings.TrimSpace(res.stdout[idx+len("CRYPTO:"):])), &r); err != nil {
+		t.Fatal(err)
+	}
+	want := net.JoinHostPort(host, strconv.Itoa(port))
+	found := false
+	for _, c := range r.Ciphers {
+		if c.Host == want && c.Protocol == "TLSv1.3" && c.Source == "proxy" && c.Group != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no proxy-observed TLS 1.3 cipher for %s: %+v", want, r.Ciphers)
+	}
+	if dlltrace.Probe() == nil {
+		cng := false
+		for _, l := range r.Libraries {
+			cng = cng || (strings.HasPrefix(l.Name, "Windows CNG") && l.Version != "" && l.Source == "etw_image_load")
+		}
+		if !cng {
+			t.Errorf("no Windows CNG library from the ETW session: %+v", r.Libraries)
+		}
+	}
+	if data, err := os.ReadFile(cbom); err != nil || !strings.Contains(string(data), `"cryptographic-asset"`) {
+		t.Errorf("CBOM not written: %v", err)
 	}
 }
 

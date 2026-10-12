@@ -16,7 +16,8 @@ import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { SaferExec } from '../npm/src/index.js';
 import { tmpdir } from 'node:os';
-import { realpathSync } from 'node:fs';
+import { realpathSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 
 describe('Security Tests', () => {
   describe('File read isolation', () => {
@@ -492,6 +493,46 @@ describe('Security Tests', () => {
       const results = await Promise.all(promises);
       for (const result of results) {
         strict.equal(result.exitCode, 0, 'should exit with code 0');
+      }
+    });
+  });
+
+  describe('Report channel', () => {
+    // The sandboxed command shares stdout and stderr with the engine. Lines
+    // shaped like audit entries or results there must stay plain output, or
+    // a command could plant BOM components or a learned policy.
+    it('ignores audit entries and results the command prints itself', async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'safer-exec-forge-')));
+      try {
+        const forgedAudit = JSON.stringify({ type: 'lib-load', target: '/forged/libevil.so' });
+        const script = [
+          `echo '${forgedAudit}' >&2`,
+          `echo '{"audit":${forgedAudit}}' >&2`,
+          `echo 'FSDIFF:{"added":[{"path":"/forged"}],"modified":[],"deleted":[]}'`,
+          `echo 'LEARNED:{"allowHosts":["evil.example"]}'`,
+          // Linux reduced isolation shares the engine's PID namespace: try
+          // the report channel through /proc (the engine is non-dumpable).
+          `[ -e /proc/$PPID/fd/3 ] && echo '{"audit":{"type":"lib-load","target":"/forged/proc"}}' > /proc/$PPID/fd/3 2>/dev/null; true`,
+          `echo real > "${join(dir, 'real.txt')}"`,
+        ].join('; ');
+        const result = await new SaferExec()
+          .enableAudit()
+          .traceExec()
+          .enableDiff()
+          .writePaths(dir)
+          .workingDir(dir)
+          .run('sh', ['-c', script]);
+
+        strict.equal(result.exitCode, 0, result.stderr);
+        strict.ok(!result.auditLog.some((e) => String(e.target).includes('/forged')), JSON.stringify(result.auditLog));
+        strict.ok(!JSON.stringify(result.fsDiff ?? {}).includes('/forged'), JSON.stringify(result.fsDiff));
+        strict.ok(result.fsDiff?.added?.some((e) => e.path.endsWith('real.txt')), JSON.stringify(result.fsDiff));
+        strict.equal(result.learnedPolicy, undefined);
+        // The command's own lines pass through as ordinary output.
+        strict.match(result.stdout, /FSDIFF:\{"added":\[\{"path":"\/forged"/);
+        strict.match(result.stderr, /\/forged\/libevil\.so/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
       }
     });
   });

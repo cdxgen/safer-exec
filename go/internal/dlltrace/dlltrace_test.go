@@ -174,3 +174,25 @@ func TestWin32Path(t *testing.T) {
 		}
 	}
 }
+
+func TestCryptoLibrary(t *testing.T) {
+	cases := map[string]string{
+		`C:\Windows\System32\bcrypt.dll`:                     "Windows CNG (bcrypt)",
+		`C:\Windows\System32\BCRYPTPRIMITIVES.DLL`:           "Windows CNG primitives (SymCrypt)",
+		`C:\Windows\System32\schannel.dll`:                   "Windows Schannel",
+		`C:\Python313\DLLs\libcrypto-3.dll`:                  "OpenSSL",
+		`C:\Program Files\Git\mingw64\bin\libssl-3-x64.dll`:  "OpenSSL",
+		`C:\tools\libgnutls-30.dll`:                          "GnuTLS",
+		`C:\app\libsodium.dll`:                               "libsodium",
+		`C:\app\wolfssl.dll`:                                 "wolfSSL",
+		`C:\Windows\System32\kernel32.dll`:                   "",
+		`C:\app\libcryptography-helpers.dll`:                 "",
+		`C:\app\libcrypto.so`:                                "",
+		`C:\app\node_modules\sodium-native\prebuilds\x.node`: "",
+	}
+	for in, want := range cases {
+		if got := CryptoLibrary(in); got != want {
+			t.Errorf("CryptoLibrary(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

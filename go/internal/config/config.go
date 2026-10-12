@@ -296,6 +296,17 @@ type ExecConfig struct {
 	// stdout carries only the raw command output with no marker pollution.
 	StructuredOutputPath string `json:"structuredOutputPath,omitempty"`
 
+	// ReportFd names the engine's report channel: a pipe the Node runner
+	// passes as an extra stdio entry (fd 3, which libuv hands to a Windows
+	// child through its CRT descriptor table). Audit entries and structured
+	// results (FSDIFF, LEARNED, CRYPTO, DRYRUN, PROFILE) then travel over it
+	// as one JSON object per line, {"audit":{...}} or
+	// {"result":"FSDIFF","data":...}, instead of over stderr and stdout,
+	// which the sandboxed workload shares and could forge lines on. The
+	// engine never lets the workload inherit it. 0 keeps the stderr/stdout
+	// protocol for engines run by hand.
+	ReportFd int `json:"reportFd,omitempty"`
+
 	// ConfigFilePath, when set, tells the --init process to read config
 	// from this file instead of the SAFER_EXEC_CONFIG environment variable.
 	// The file is created with 0600 permissions and deleted after reading.
@@ -608,6 +619,23 @@ type CipherInfo struct {
 	LibraryVersion string `json:"libraryVersion,omitempty"`
 	// PID is the host PID of the process that negotiated this cipher.
 	PID uint32 `json:"pid,omitempty"`
+	// Group is the key-exchange group (e.g. "X25519MLKEM768", "secp256r1").
+	Group string `json:"group,omitempty"`
+	// PostQuantum is set when the key exchange includes a post-quantum KEM.
+	PostQuantum bool `json:"postQuantum,omitempty"`
+	// Host is the proxy target ("host:port") the connection went to.
+	Host string `json:"host,omitempty"`
+	// ServerName is the SNI the client sent; with ECH it is the outer name.
+	ServerName string `json:"serverName,omitempty"`
+	// ECH is set when the client offered Encrypted Client Hello.
+	ECH bool `json:"ech,omitempty"`
+	// ServerKey is the server certificate's public key ("RSA-2048"), visible
+	// only up to TLS 1.2.
+	ServerKey string `json:"serverKey,omitempty"`
+	// CertSignature is the server certificate's signature algorithm.
+	CertSignature string `json:"certSignature,omitempty"`
+	// Source is how the cipher was observed: "ebpf_uprobe" or "proxy".
+	Source string `json:"source,omitempty"`
 }
 
 // CryptoOperation describes a single cryptographic operation observed via

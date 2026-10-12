@@ -448,7 +448,7 @@ func TestTranslateExecControls(t *testing.T) {
 
 func TestTranslateUnsupportedControls(t *testing.T) {
 	cfg := config.ExecConfig{
-		Cmd: "cmd", BlockJIT: true, BlockCrypto: true, TraceCrypto: true, TraceLibraries: true,
+		Cmd: "cmd", BlockJIT: true, BlockCrypto: true, TraceHTTPURLs: true, TraceLibraries: true,
 		SeccompFilters: []config.SeccompFilterSpec{{Policy: "DEFAULT KILL"}}, TmpOverlayPaths: []string{`C:\x`},
 		BindFds: []config.BindFdSpec{{Fd: 3, Target: "/x"}}, SpoofAntiVM: true, BlockTPM: true,
 		// Linux/macOS-only knobs are ignored without noise; traceLibraries is

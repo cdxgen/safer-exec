@@ -872,8 +872,11 @@ func (p *Plan) collectUnenforced(cfg config.ExecConfig, host Host, env *EnvSet, 
 		}
 	}
 
-	if cfg.TraceHTTPURLs || cfg.TraceCrypto || cfg.CBOMOutputPath != "" || len(cfg.AllowCiphers) > 0 {
-		p.Warnings = append(p.Warnings, "HTTP URL and crypto tracing use eBPF and are only supported on Linux; these settings are ignored on Windows")
+	if cfg.TraceHTTPURLs || len(cfg.AllowURLRules) > 0 {
+		p.Warnings = append(p.Warnings, "HTTP URL tracing and URL rules use eBPF and are only supported on Linux; these settings are ignored on Windows")
+	}
+	if cfg.CryptoProbeMode == "operations" {
+		p.Warnings = append(p.Warnings, "crypto operation tracing (cryptoProbeMode operations) uses eBPF and is only supported on Linux; Windows reports crypto DLLs and TLS parameters")
 	}
 	if len(cfg.TmpOverlayPaths) > 0 {
 		p.Warnings = append(p.Warnings, "tmpOverlayPaths are not supported on Windows; those paths are not writable")

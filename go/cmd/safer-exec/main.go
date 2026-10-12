@@ -110,6 +110,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := openReport(cfg.ReportFd); err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: %v\n", reportOpenError(err))
+		os.Exit(1)
+	}
+
 	// Sanitize environment variables by default
 	cfg.Env = config.SanitizeEnv(cfg.Env, cfg.AllowEnvs)
 
