@@ -42,7 +42,7 @@ import (
 )
 
 // version is the engine's release, reported by --version and in the CBOM.
-const version = "1.1.1"
+const version = "1.1.2"
 
 type ExitError struct {
 	Code int
