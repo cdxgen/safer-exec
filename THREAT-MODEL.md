@@ -13,8 +13,8 @@ This document covers the sandboxing guarantees, attack surfaces, and failure mod
 - **macOS engine** generates Seatbelt profiles, applies RLIMIT quotas, and runs commands through `sandbox-exec`.
 - **Linux engine** uses namespace isolation, bind mounts, `pivot_root`, seccomp-bpf filters, Landlock network confinement, and cgroup v2 resource quotas.
 - **Windows engine** translates the config into an MXC request (`go/internal/mxc/`) and runs the command through the MXC executor `wxc-exec.exe` inside a job object (`go/internal/winjob/`).
-- **Learner** (`go/internal/learner/`) traces process behavior via strace (Linux) or Seatbelt trace rules (macOS) to generate policies.
-- **Filesystem diff** (`go/internal/fsdiff/`) captures file mutations via OverlayFS (Linux) or pre/post snapshots with SHA-256 hashes (macOS).
+- **Learner** (`go/internal/learner/`) traces process behavior via strace (Linux) or Seatbelt trace rules (macOS) to generate policies. On Windows a learning run stays contained and the policy is built from MXC's denial capture and the recording egress proxy (`go/internal/mxc/denials.go`).
+- **Filesystem diff** (`go/internal/fsdiff/`) compares snapshots of the write paths taken before and after the run, with SHA-256 hashes for regular files, on every platform.
 
 ### Execution Flow
 
@@ -146,9 +146,9 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 **Impact:** The command reaches an unintended host. The Seatbelt and Landlock rules only filter by IP, not by hostname.
 
-**Mitigation:** The Node.js layer resolves all `allowHosts` to IPs before spawning the Go binary. Note, however, that neither platform enforces a remote-IP allowlist at the sandbox layer — see §3.3. Host resolution is used to derive the set of allowed ports and to drive eBPF URL observability on Linux, not to pin connections to specific IPs.
+**Mitigation:** The Node.js layer resolves all `allowHosts` to IPs before spawning the Go binary. On Linux and macOS the sandbox cannot enforce a remote-IP allowlist (§3.3); there, host resolution derives the set of allowed ports and drives eBPF URL observability on Linux. On Windows the engine resolves `allowHosts` itself and installs per-container WFP rules for exactly those addresses (§3.18), so a spoofed answer at start-up decides which addresses are reachable for the whole run.
 
-**Residual risk:** Because egress is filtered by port rather than by IP (§3.3), DNS spoofing/rebinding does not change the effective exposure: any host is already reachable on an allowed port. For strict egress control, use `disableNetwork` or an external firewall/eBPF egress policy.
+**Residual risk:** On Linux and macOS, because egress is filtered by port rather than by IP (§3.3), DNS spoofing or rebinding does not change the effective exposure: any host is already reachable on an allowed port. On Windows a poisoned resolution opens the poisoned address instead of the real one. For strict egress control, use `disableNetwork`, `proxyEgress` (hostnames checked at CONNECT time), or an external firewall/eBPF egress policy.
 
 ### 3.2 Filesystem Escapes
 
@@ -163,6 +163,7 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 - **Linux:** A tmpfs root is mounted. Read paths are bind-mounted read-only. Write paths are bind-mounted read-write. The process only sees mounted paths plus `/proc` and `/sys`.
 - **macOS:** The Seatbelt profile allows file reads and writes for all paths by default, then adds explicit subpath rules for the specified paths. The base `system.sb` profile is imported.
+- **Windows:** The BaseContainer sees only granted paths plus the read-only `%SystemRoot%`; everything else, including Program Files and the user profile, is invisible. See §3.18.
 
 **Mitigation:** By default, `safer-exec` avoids blanket allows and instead restricts macOS file operations to a standard minimal set. When no custom paths are specified, the sandbox profile generates rules allowing reading of standard system directories and the working directory, and restricts write access exclusively to temporary directories (e.g. `/tmp`, `/private/tmp`). If explicit read/write paths are supplied, only those paths (plus system directories) are permitted.
 
@@ -176,8 +177,9 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 
 - **Linux:** A new network namespace is created when `disableNetwork` is true — this is the only mechanism that fully severs egress. When the network is not disabled, Landlock restricts TCP connections to the configured ports. Landlock filters by port, **not** by IP.
 - **macOS:** Seatbelt port filtering uses `remote ip "*:PORT"` patterns.
+- **Windows:** Per-container WFP rules allow only the `/32` and `/128` addresses the allowed hosts resolved to, on the allowed TCP ports (default 80 and 443). In `proxyEgress` mode only the loopback proxy is reachable.
 
-**Egress is filtered by port, not by host/IP (important).** Neither Landlock
+**On Linux and macOS, egress is filtered by port, not by host/IP (important).** Neither Landlock
 (Linux) nor Seatbelt (macOS) can pin outbound connections to a specific remote IP
 address: Landlock has no IP-level rule type, and Seatbelt's `(remote ip ...)`
 filter only accepts `*` or `localhost` as the host. Consequently `allowHosts` /
@@ -194,9 +196,12 @@ an attacker server over 443). When host-pinning is requested:
 
 **Residual risk:**
 
-- Within an allowed port, any remote host is reachable on both platforms. True
-  per-IP egress confinement requires `disableNetwork` (full cut) or a
+- On Linux and macOS, any remote host is reachable on an allowed port. True
+  per-IP egress confinement there requires `disableNetwork` (full cut) or a
   host-level firewall/eBPF egress policy outside `safer-exec`.
+- On Windows, other sites served from an allowed address (CDNs, shared cloud
+  front ends) are reachable too; use `proxyEgress` when the hostname itself
+  must be enforced.
 
 ### 3.4 Resource Exhaustion
 
@@ -208,6 +213,7 @@ an attacker server over 443). When host-pinning is requested:
 
 - **Linux:** cgroup v2 enforces `memory.max`, `cpu.max`, and `pids.max`.
 - **macOS:** RLIMIT quotas enforce `RLIMIT_AS` (address space), `RLIMIT_CPU` (CPU seconds), and `RLIMIT_NPROC` (process count).
+- **Windows:** A job object around the launcher enforces job-wide committed memory, a CPU-rate hard cap and the active-process count; see §3.18.
 
 **Residual risk:**
 
@@ -227,6 +233,8 @@ an attacker server over 443). When host-pinning is requested:
 - **Loader-control keys** — variables that steer the dynamic loader or a language runtime and so enable code injection: `DYLD_*` and `LD_*` (any member, e.g. `DYLD_INSERT_LIBRARIES`, `LD_PRELOAD`, `LD_AUDIT`), plus `DEVELOPER_DIR` (CoreSymbolication external-dylib path), `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `PYTHONPATH`, `RUBYOPT`, `PERL5LIB`, `GCONV_PATH`, `GIT_SSH_COMMAND`, and similar. These are stripped even though they do not match a credential pattern.
 
 A key listed in `allowEnvs()` bypasses **both** filters — it is the single, deliberate opt-in for passing either a credential or a loader-control variable through. The Go engine repeats this filtering as a backstop, so a policy or caller that sets a loader-control variable directly in `env` cannot smuggle it past the strip without also allow-listing it.
+
+**Windows:** Names are compared case-insensitively, the inherited baseline adds the variables Windows programs need to start (`SystemRoot`, `PATHEXT`, the profile folders), and the engine additionally strips variables that load code into .NET or PowerShell processes. See §3.18.
 
 **Residual risk:** PATH, HOME, and other safe defaults are inherited even when a custom environment is set. The filter inspects key names, not values. Allow-listing a loader-control variable (e.g. for an instrumentation harness) re-enables its injection capability by design; this is an explicit operator decision. macOS additionally strips `DYLD_*` for SIP-protected/restricted target binaries at the kernel level regardless of this layer.
 
@@ -400,7 +408,7 @@ privileged caches.
 
 ### 3.9 Learning Mode
 
-**Threat:** Learning mode runs the command without sandbox restrictions, then generates a policy from observed behavior.
+**Threat:** On Linux and macOS, learning mode runs the command without sandbox restrictions, then generates a policy from observed behavior. On Windows the run stays contained. On every platform the command decides what it touches, so it can try to steer the learned policy toward broader grants.
 
 **Impact:** The learned policy may be incomplete if the command behaves differently under observation (Heisenberg effect) or if the strace/trace parser misses certain syscalls.
 
@@ -409,8 +417,9 @@ privileged caches.
 - **Linux with strace:** Traces openat, open, readlink, connect, sendto, recvfrom, stat variants, and access. Parses the output to extract file paths and network connections.
 - **Linux without strace:** Takes pre/post filesystem snapshots and scans /proc/net/tcp for network connections.
 - **macOS:** Uses Seatbelt trace rules to log file reads, file writes, network outbound, and process exec to a trace file.
+- **Windows:** Runs contained with MXC denial capture and a recording egress proxy. The proxy refuses loopback, link-local (cloud metadata) and multicast destinations. The learned policy drops paths spelled through aliases (UNC, 8.3 names, trailing dots, streams), drive roots, the profile and its AppData roots, Program Files, ProgramData, `%SystemRoot%`, the engine's own directories, and write access to persistence locations. One-off consent such as `windowsAllowDaclMutation` is never copied into the learned policy.
 
-**Residual risk:** The strace-based learner may miss indirect file accesses (e.g., files accessed through memory-mapped I/O). The basic learner only captures network connections active at the moment of the /proc/net/tcp scan, missing transient connections.
+**Residual risk:** Review learned policies before enforcing them; they record what the command attempted, not what it needs. The strace-based learner may miss indirect file accesses (e.g., files accessed through memory-mapped I/O). The basic learner only captures network connections active at the moment of the /proc/net/tcp scan, missing transient connections.
 
 ### 3.10 Filesystem Diff
 
@@ -418,12 +427,13 @@ privileged caches.
 
 **Impact:** Incorrect understanding of what files the command modified.
 
-**How it works:**
+**How it works:** On every platform the engine snapshots the write paths before and after the run and compares SHA-256 hashes (regular files up to 64 MiB), sizes, modification times and permission modes. Directories count as modified only when their mode changes. The engine takes the post-run snapshot with the user's full privileges after the sandboxed command, which could write inside the roots, has finished. The snapshotter is therefore built not to be steered by it:
 
-- **Linux:** OverlayFS captures writes in an upper directory. The diff compares pre/post snapshots.
-- **macOS:** Pre/post snapshots walk the write paths and compare SHA-256 hashes, file sizes, and permission modes.
+- Each root is resolved once, before the command starts. A root that the command later replaces with a symlink, or whose parent directory it replaces, is recorded as a single changed entry and never walked, so the diff cannot be pointed at `$HOME`, `/` or a device.
+- Symlinks inside a root are recorded, not followed, and only regular files are opened for hashing, without following a final symlink and without blocking on a FIFO.
+- A tree reachable through more than one root is recorded once.
 
-**Residual risk:** The diff only covers configured write paths. Changes to files outside those paths are not captured. The snapshot walks skip symlinks and special files.
+**Residual risk:** The diff only covers configured write paths. Changes to files outside those paths are not captured. A command still running when the post-run snapshot starts (a detached child on macOS) can swap a directory during the walk; the root check repeated after the walk discards such a root, but the engine may already have read files it reached.
 
 ### 3.11 Process Escape
 
@@ -447,7 +457,7 @@ privileged caches.
 A new network namespace is created when `disableNetwork` is true. This prevents the sandboxed process from observing host network interfaces, listening sockets, or network connection state. When a new network namespace is active, explicit `allowHosts` / `allowPorts` configuration is required for outbound connectivity.
 
 **Network Port Listening Restriction:**
-By default, the sandboxed process is prevented from listening on any network port (including local loopback `lo`) on both macOS and Linux. Listening or binding to specific IP addresses or ports must be explicitly permitted using `allowListen` / `--allow-listen`.
+By default, the sandboxed process is prevented from listening on any network port (including local loopback `lo`) on macOS, Linux and Windows. Listening or binding to specific IP addresses or ports must be explicitly permitted using `allowListen` / `--allow-listen`.
 
 **macOS escape paths:**
 
@@ -524,19 +534,29 @@ historical behavior, while the common case is fully pinned).
 
 ### 3.18 Windows Engine (MXC)
 
-**Containment tier.** The guarantees above hold on the BaseContainer tier (Windows 11 24H2/25H2 with the August 2026 servicing update, or later). On older builds MXC can fall back to an AppContainer tier that grants access by adding ACEs to the host security descriptors of the policy paths. The engine probes the host on every run and refuses that tier unless the caller sets `windowsAllowDaclMutation`, because the ACEs outlive an abnormally terminated launcher. Under the BFS tier no host ACLs are modified.
+**Containment tier.** The guarantees in this section hold on the BaseContainer tier (Windows 11 24H2, 25H2 or 26H1 with the August 2026 servicing update, or later; Windows Server is not on MXC's supported list). On older builds MXC falls back to an AppContainer tier that grants access by adding entries to the access control lists of the granted paths on the host. The engine probes the host on every run and refuses that tier unless the caller sets `windowsAllowDaclMutation`. On that tier a grant applies to the whole tree below it, so the engine also refuses drive-root grants there. MXC restores the original ACLs at the end of a run and, if it was killed first, replays its saved backups on the next start. The shipped executor does not include MXC's bind-filter tier.
 
-**Executor integrity.** `wxc-exec.exe` runs with the caller's privileges and creates the container, so it is trusted like the engine itself: it ships next to `safer-exec-rt.exe` in the platform package and is built from a pinned MXC commit. `SAFER_EXEC_MXC_EXEC` must name an absolute path. MXC's elevating helpers (`winhttp-proxy-shim.exe`, `plm.exe`, `wxc-host-prep.exe`) are not shipped, so no run can trigger a UAC prompt; tiers that need them fail instead. MXC's own debug and override variables (`MXC_*`, `WXC_*`, e.g. `MXC_FORCE_TIER`) are removed from the executor's environment so they cannot select a tier other than the one the probe vetted.
+**Executor integrity.** `wxc-exec.exe` runs with the caller's privileges and creates the container, so it is trusted like the engine itself. It ships next to `safer-exec-rt.exe` in the platform package and is built from a pinned MXC commit. The engine looks for it only there or at the absolute path in `SAFER_EXEC_MXC_EXEC`, never on `PATH`, and the Node layer never resolves the engine by bare name (Windows would search the current directory first). MXC's elevating helpers (`winhttp-proxy-shim.exe`, `plm.exe`, `wxc-host-prep.exe`) are not shipped, so no run can trigger a UAC prompt. MXC's debug and override variables (`MXC_*`, `WXC_*`, for example `MXC_FORCE_TIER`) are removed from the executor's environment so they cannot select a tier other than the one the probe vetted.
 
-**Command-line injection.** MXC passes `process.commandLine` to `CreateProcessW`. The engine resolves the executable itself (absolute `PATH` entries only, no current-directory search, only `.com/.exe/.bat/.cmd`), always quotes the program path, and escapes arguments for `CommandLineToArgvW`. Batch files are run through an explicit `%SystemRoot%\System32\cmd.exe /d /e:ON /v:OFF /c` taken from the host environment (a caller-supplied `SYSTEMROOT` cannot redirect it), with cmd-specific quoting, `%` neutralised and CR/LF rejected — the CVE-2024-24576 class. A batch script that expands its own arguments unquoted (`%~1`) can still be injected by its arguments; that is a property of the script.
+**Engine-owned files.** Each run keeps its MXC request (which carries the workload's environment) and the denial report in a directory under `%TEMP%\safer-exec-mxc`. MXC replays ACL backups from `%LOCALAPPDATA%\Microsoft\MXC` on every start. The engine creates both directories and every request denies them to the container whenever a grant would reach them, so neither this sandbox nor a concurrent one with a broad `TEMP` or `LOCALAPPDATA` grant can read another run's request, rewrite a request or report, or plant ACL backups.
 
-**Network.** Direct-egress rules pin the addresses `allowHosts` resolve to when the run starts; a host whose addresses rotate may become unreachable, but no other host becomes reachable. In proxy mode the container may reach only the proxy endpoint, but because safer-exec's proxy has no package or AppContainer identity, MXC's identity-less mode is used: host loopback is allowed in both directions and the private-network capability (which also admits private-network inbound connections) is granted. `allowListen` and private-network destinations grant the same bidirectional capability. Only HTTP(S) clients that honour the WinHTTP or environment proxy settings can use the proxy; other egress is blocked.
+**Shared stderr.** The workload writes to the same stderr handle as `wxc-exec.exe`, so it can print lines that look like MXC's protocol. The engine therefore ignores MXC's denial-report pointer and reads the report only from its own run directory. It accepts an error envelope only with MXC's two error codes and a non-zero exit, and a timeout only when its own clock agrees. A workload that leaves a marker unterminated cannot hide MXC's real envelope. Audit and diff output are produced on every enforce-mode exit path, so a forged failure cannot suppress them. A non-zero exit before any workload process existed is reported as an MXC failure, not as the workload's status.
 
-**Resource limits.** Job limits apply to the launcher too, so 32 MB is added to the memory limit for it. Windows fails allocations past a job memory limit instead of killing the process; the engine terminates the workload (exit 137) on the first limit notification so a runtime cannot wedge in its out-of-memory path. I/O rate limits are not enforced.
+**Command-line injection.** MXC passes `process.commandLine` to `CreateProcessW`. The engine resolves the executable itself (absolute `PATH` entries only, quoted entries honored, no current-directory search, only `.com/.exe/.bat/.cmd`), always quotes the program path, and escapes arguments for `CommandLineToArgvW`. Batch files run through an explicit `%SystemRoot%\System32\cmd.exe /d /e:ON /v:OFF /c` taken from the host environment (a caller-supplied `SYSTEMROOT` cannot redirect it), with cmd-specific quoting, `%` neutralized and CR/LF rejected: the CVE-2024-24576 class. A batch script that expands its own arguments unquoted (`%~1`) can still be injected by its arguments; that is a property of the script. When the command is `cmd.exe` itself, the arguments after `/c`, `/k` or `/r` form one shell command string (`cmd /d /s /c "..."`), so they are shell syntax, not data. The workload environment sets `NoDefaultCurrentDirectoryInExePath=1`, so batch shims and child processes do not pick up programs planted in the working directory.
 
-**Exec control.** There is no per-executable exec filter. `blockExec` entries are enforced only when the executable is unreachable inside the container; `blockFork` is enforced by the active-process limit, which allows a `.bat`/`.cmd` command two additional `cmd.exe` interpreter processes.
+**Environment.** Besides the cross-platform loader-control filtering (§3.5), the engine removes variables that load code into .NET or PowerShell processes unless they are named in `allowEnvs`: CLR and CoreCLR profilers, `DOTNET_STARTUP_HOOKS`, `DOTNET_ADDITIONAL_DEPS`, `DOTNET_SHARED_STORE`, `DOTNET_DiagnosticPorts`, every `COMPlus_*` setting, `__COMPAT_LAYER` and `PSModulePath`.
 
-**Observability gaps.** On BaseContainer hosts MXC's denial capture does not report accesses to paths outside every grant and is best-effort even for grant conflicts, so audit, learning and dry-run reports are partial and must not be treated as a complete record. Learning runs stay contained (deny-and-record) instead of using MXC's permissive mode, which lifts enforcement while recording nothing on these hosts.
+**Network.** Direct-egress rules allow only the addresses the hosts resolved to at start. Other hostnames served from those addresses (CDN or shared cloud front ends) stay reachable; use `proxyEgress` when the hostname itself must be enforced. In proxy mode the container may reach only the proxy endpoint. safer-exec's proxy has no package or AppContainer identity, so MXC's identity-less mode is used. MXC documents that mode as weaker because host loopback is allowed and the bidirectional private-network capability is granted, but the engine test `TestWindowsEngineConfinesHostAndProxyBypass` verifies on Windows 11 25H2 that WFP still keeps other loopback listeners, the host's LAN address and allowed hosts dialed directly out of reach. `allowListen`, private-network destinations and `allowLoopback` need capabilities Windows cannot scope as narrowly as requested; the engine reports them as broader than requested, and `strict` refuses them. The learning proxy refuses loopback, link-local and multicast destinations.
+
+**Persistence locations.** `denyPersistenceWrites` denies existing Startup folders, PowerShell profile directories (including a redirected Documents folder), per-user `PATH` directories and shell, git, npm and SSH configuration under broader write grants. A Windows container cannot deny a path that does not exist (the container API rejects the policy), so a missing location stays creatable; the engine reports it as not enforced and `strict` refuses the run.
+
+**Resource limits.** Job limits apply to the launcher too, so 32 MB is added to the memory limit for it; a workload that fills the job can still starve the launcher. Windows fails allocations past a job memory limit instead of killing the process, so the engine terminates the workload (exit 137) on the first limit notification. Job notifications are queued in the engine rather than dropped, but Windows does not guarantee their delivery; dropped notifications are reported. Processes are killed only after the engine confirms they are still members of the job, so a reused process id cannot point it at an unrelated process. I/O rate limits are not enforced.
+
+**Exec control.** There is no per-executable exec filter. An absolute-path `blockExec` entry is enforced when that path is unreachable inside the container. A bare name means "the program `PATH` finds" and is enforced when no `PATH` directory readable in the container contains it; a copy stored elsewhere under a grant can still be started by its full path, as on macOS. `blockFork` on an executable is enforced by the active-process limit, which then enforces every exec rule. A `.bat` or `.cmd` command needs two extra process slots for its `cmd.exe` interpreters, and any program the script starts can use them, so `blockFork` and exec rules on a batch command are reported as not enforced.
+
+**Win32k.** MXC disables Win32k system calls by default, but common runtimes (Node.js, Java) cannot start without `user32.dll`, so safer-exec turns the block off unless the caller sets `windowsBlockWin32k`. By default the workload can therefore reach the Win32k kernel attack surface. Enable the block for console-only workloads. Clipboard and input injection stay blocked either way.
+
+**Observability gaps.** On BaseContainer hosts MXC's denial capture does not report accesses to paths outside every grant and is best-effort even for grant conflicts, so audit, learning and dry-run reports are partial and must not be treated as a complete record. Learning runs stay contained instead of using MXC's permissive mode, which lifts enforcement while recording nothing on these hosts.
 
 **Session 0.** Containers started from session 0 (services, SSH logons) cannot open the session's window station, so programs that load `user32.dll` fail to start. This fails closed.
 
@@ -572,14 +592,14 @@ This section analyzes advanced threat vectors, escape techniques, and how `safer
 | **eBPF/LSM/Perf Monitoring**       | Attackers load eBPF probes, performance monitors (`perf_event_open`), or uprobes to spy on memory, environment variables, or other processes.                                            | **Mitigated**: Seccomp blocks `bpf`, `perf_event_open`, `userfaultfd`, and `keyctl` system calls by default.                                                                                                                                             |
 | **Privilege Escalation**           | Processes use `setuid`, `setgid`, or `setcap` to gain elevated access or modify attributes.                                                                                              | **Mitigated**: Seccomp blocks all `setuid`, `setgid`, `capset`, and `setxattr` / extended attribute manipulation syscalls by default.                                                                                                                    |
 | **UDP Socket Evasion**             | Landlock limits network rules to TCP. Attackers use UDP or RAW sockets to bypass restrictions.                                                                                           | **Mitigated**: Active network namespace unsharing (`CLONE_NEWNET`) cuts off all socket families (UDP, Netlink, RAW) entirely.                                                                                                                            |
-| **Sandbox Tool Reuse**             | Attackers execute `safer-exec` or `safer-exec-rt` to spawn secondary escaped tasks.                                                                                                      | **Mitigated**: Default `BlockExec` rules automatically register and forbid the execution of the sandbox binary itself.                                                                                                                                   |
+| **Sandbox Tool Reuse**             | Attackers execute `safer-exec` or `safer-exec-rt` to spawn secondary escaped tasks.                                                                                                      | **Mitigated**: On Linux and macOS, default `BlockExec` rules automatically register and forbid the execution of the sandbox binary itself. On Windows, a container cannot create another one: `CreateProcessSecurityEnvironment` fails from inside a BaseContainer (verified by `TestWindowsEngineNestedEngineGainsNothing`), so no self-blocking entries are added. |
 
 ## 5. Assumptions
 
 1. The Go binary itself is not tampered with. It is statically compiled and shipped with the npm package.
 2. The host OS provides working namespace, mount, and cgroup v2 support on Linux.
 3. The host OS provides `sandbox-exec` on macOS.
-4. On Windows, the host provides the BaseContainer API and the MXC executor shipped with the platform package is not tampered with.
+4. On Windows, the host provides the BaseContainer API and the MXC executor shipped with the platform package is not tampered with. A caller who consents to MXC's ACL-modifying fallback tier (`windowsAllowDaclMutation`) accepts that host ACLs change for the duration of each run.
 5. DNS resolution returns correct results during the execution window.
 6. The target command is a standard executable, not a shell script that modifies its own environment before running.
 

@@ -43,19 +43,20 @@ go/                           — Go engine (platform-specific sandboxing)
     engine_linux_*_syscall.go — Architecture-specific syscall constants
     engine_darwin_test.go     — macOS engine tests
     engine_linux_test.go      — Linux engine tests
+    engine_windows_test.go    — Windows engine tests (re-exec the test binary as engine and workload)
    internal/
     config/                   — ExecConfig JSON contract (shared by all layers)
     learner/                  — Linux strace-based behavioral learner
     learnermac/               — macOS Seatbelt trace parser (learning mode)
     fsdiff/                   — Filesystem snapshot + SHA-256 diff utilities
     httptrace/                — eBPF HTTP URL + crypto tracing (Linux-only)
+      bpf/                    — BPF C source + pre-compiled objects
+      cipher.go               — Cipher name parser + IANA registry mapping
+      cipher_test.go          — Cipher decomposition tests
     mxc/                      — ExecConfig → MXC request translation (host-independent,
                                 Windows path rules, argv/batch quoting, env, denial reports,
                                 stderr protocol); unit-tested on every platform
     winjob/                   — Windows job objects (limits, suspended start, notifications)
-      bpf/                    — BPF C source + pre-compiled objects
-      cipher.go               — Cipher name parser + IANA registry mapping
-      cipher_test.go          — Cipher decomposition tests
 apparmor/                     — AppArmor profile for unprivileged user namespace creation
   safer-exec                  — Bundled AppArmor profile
 npm/
@@ -115,7 +116,12 @@ The Windows engine needs the MXC executor `wxc-exec.exe` next to `safer-exec-rt.
 (or `SAFER_EXEC_MXC_EXEC=<absolute path>`). Build it from the pinned MXC commit with
 `pwsh .github/scripts/build-mxc.ps1 -Arch x64|arm64` (Rust toolchain + MSVC required).
 Windows integration tests (`engine_windows_test.go`, `npm/src/windows.test.js`) skip
-themselves when the executor or the BaseContainer API is unavailable.
+themselves unless the probe reports MXC's BaseContainer tier: no executor, no
+BaseContainer API (older builds, Windows Server), or a host where MXC would fall back
+to modifying file ACLs. Programs that load `user32.dll` (Node.js) need an interactive
+session; over SSH (session 0) run such checks through a scheduled task with `/it`.
+Most Node suites use POSIX tools and paths, so the Windows CI job runs an explicit list
+of portable suites plus `windows.test.js`.
 
 ### Run Tests
 
@@ -316,11 +322,16 @@ Tests: `npm/src/hooks.test.js`, `npm/src/harness.test.js`, `tests/hooks.test.js`
 
 The `resolveBinaryPath()` function in `runner.js` locates the Go engine binary. It searches in this priority order:
 
-1. `go/bin/safer-exec-rt-{platform}-{arch}` (platform-specific local build)
+1. `go/bin/safer-exec-rt-{platform}-{arch}` (platform-specific local build; `.exe` and `windows` on Windows)
 2. `go/bin/safer-exec-rt` (generic local build)
 3. Platform-specific npm optional dependencies in `node_modules`
 4. `/usr/local/bin/safer-exec-rt` (system-wide install; auto-bootstraps from node_modules if running as root)
 5. Bare string `'safer-exec-rt'` (PATH resolution fallback)
+
+On Windows, steps 4 and 5 are replaced by a search of the absolute `PATH` entries for
+`safer-exec-rt.exe` (`findOnWindowsPath`): Windows searches the current directory
+before `PATH` for a bare name, which would run a binary planted in the scanned project.
+If nothing is found, `run()` fails with an error naming the missing package.
 
 ### Testing
 
@@ -340,13 +351,13 @@ The `resolveBinaryPath()` function in `runner.js` locates the Go engine binary. 
 1. Add field to `ExecConfig` in `go/internal/config/config.go`
 2. Implement in `engine_darwin.go` (Seatbelt rule or RLIMIT)
 3. Implement in `engine_linux.go` (namespace, seccomp, Landlock, or cgroup)
-3a. Map it in `internal/mxc/translate.go` for Windows — or list it in `Plan.Unenforced` (restrictions) / `Plan.Warnings` (observability) so strict mode fails closed
-4. Add method to `SaferExec` class in `npm/src/index.js`
-5. If the feature has user-facing config, add the field to `PolicyFile` in `config.go` and the `applyPolicyFile` method in `index.js`
-6. Add CLI flag in `npm/src/cli.js`
-7. **Add test fixtures** — Create unit tests in `npm/src/` and integration tests in `tests/`.
-8. Add tests to both platform test files and Node.js tests
-9. **Update documentation** (update README.md to describe the new configuration settings, CLI flags, and API methods)
+4. Map it in `internal/mxc/translate.go` for Windows, or list it in `Plan.Unenforced` (restrictions Windows cannot enforce), `Plan.Broadened` (grants Windows must widen) or `Plan.Warnings` (observability) so strict mode fails closed
+5. Add method to `SaferExec` class in `npm/src/index.js`
+6. If the feature has user-facing config, add the field to `PolicyFile` in `config.go` and the `applyPolicyFile` method in `index.js`
+7. Add CLI flag in `npm/src/cli.js`
+8. **Add test fixtures** — Create unit tests in `npm/src/` and integration tests in `tests/`.
+9. Add tests to every platform's engine test file and to the Node.js tests
+10. **Update documentation** (update README.md to describe the new configuration settings, CLI flags, and API methods)
 
 ### Adding a New Ecosystem Policy
 
@@ -420,4 +431,5 @@ Key guarantees:
 
 - **macOS**: Seatbelt `(deny default)` + `system.sb` import
 - **Linux**: User namespace + mount namespace (MS_SLAVE propagation control) + seccomp-bpf blocking escape syscalls + Landlock network/filesystem confinement + submount read-only enforcement + `/proc` dangerous entry hardening + minimal `/dev` setup + fd-based TOCTTOU-safe bind mounts + PID 1 reaper with zombie reaping
-- Both platforms enforce resource quotas (memory, CPU, process count, I/O)
+- **Windows**: MXC BaseContainer (deny-by-default filesystem grants, per-container WFP egress) inside a job object; the engine treats MXC's shared stderr as untrusted and denies its own run and state directories to every container
+- All three enforce memory, CPU and process-count quotas; Linux also limits I/O
