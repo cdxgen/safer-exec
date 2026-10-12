@@ -1,6 +1,10 @@
 # Go binaries
 go/bin/
 
+# MXC source and build output from .github/scripts/build-mxc.ps1
+mxc-src/
+mxc-bin/
+
 # Node modules
 node_modules/
 
