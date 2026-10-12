@@ -890,6 +890,54 @@ func (p *Plan) collectUnenforced(cfg config.ExecConfig, host Host, env *EnvSet, 
 	if cfg.BlockTPM {
 		p.Unenforced = append(p.Unenforced, "blockTPM (the container has no TPM device grant, but access through the TPM Base Services is not verified)")
 	}
+
+	// Linux isolation controls. The container already hides the profile and
+	// the host's temp directory, so protectHome and privateTmp hold until a
+	// grant reaches into them. Linux drops or covers such grants; Windows
+	// keeps them, so the control is not enforced. protectSystem and
+	// useReaper need nothing: %SystemRoot% is read-only inside the container
+	// and the job object ends the whole process tree.
+	if mode := cfg.ProtectHome; mode == "read-only" || mode == "tmpfs" {
+		if profile, _ := host.Env.Get("USERPROFILE"); WinIsAbs(profile) {
+			grants := [][]string{p.WritePaths}
+			if mode == "tmpfs" {
+				grants = append(grants, p.ReadPaths)
+			}
+			if exposed := grantsReaching(canon(WinClean(profile)), grants...); len(exposed) > 0 {
+				p.Unenforced = append(p.Unenforced, fmt.Sprintf("protectHome %s for %s (granted inside the user profile; a Windows container cannot replace the profile or make part of it read-only)", mode, strings.Join(exposed, ", ")))
+			}
+		}
+	}
+	if cfg.PrivateTmp {
+		var exposed []string
+		for _, name := range []string{"TEMP", "TMP"} {
+			if dir, _ := host.Env.Get(name); WinIsAbs(dir) {
+				for _, g := range grantsReaching(canon(WinClean(dir)), p.WritePaths, p.ReadPaths) {
+					exposed = appendUniquePath(exposed, g)
+				}
+			}
+		}
+		if len(exposed) > 0 {
+			p.Unenforced = append(p.Unenforced, fmt.Sprintf("privateTmp for %s (granted inside the host's temp directory; a Windows container has no private one)", strings.Join(exposed, ", ")))
+		}
+	}
+	// blockInterpreters stays silent, as on Linux: it counters interpreters
+	// that macOS signs with sandbox and task-port exemptions, which other
+	// platforms do not have, and the built-in policies set it everywhere.
+}
+
+// grantsReaching returns the grants that expose part of dir: dir itself, a
+// path inside it, or an ancestor whose grant cascades over it.
+func grantsReaching(dir string, lists ...[]string) []string {
+	var out []string
+	for _, list := range lists {
+		for _, g := range list {
+			if WinHasPrefix(g, dir) || coveredBy(dir, []string{g}) {
+				out = appendUniquePath(out, g)
+			}
+		}
+	}
+	return out
 }
 
 // execBlocked reports whether a blockExec entry is unreachable inside the

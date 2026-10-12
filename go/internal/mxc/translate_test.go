@@ -451,8 +451,11 @@ func TestTranslateUnsupportedControls(t *testing.T) {
 		Cmd: "cmd", BlockJIT: true, BlockCrypto: true, TraceHTTPURLs: true, TraceLibraries: true,
 		SeccompFilters: []config.SeccompFilterSpec{{Policy: "DEFAULT KILL"}}, TmpOverlayPaths: []string{`C:\x`},
 		BindFds: []config.BindFdSpec{{Fd: 3, Target: "/x"}}, SpoofAntiVM: true, BlockTPM: true,
-		// Linux/macOS-only knobs are ignored without noise; traceLibraries is
-		// the engine's (an ETW session), not the container's.
+		// The container already gives what protectHome and privateTmp ask for
+		// while no grant reaches the profile or the temp directory
+		// (TestTranslateIsolationControls); blockInterpreters counters a
+		// macOS-only exemption; traceLibraries is the engine's (an ETW
+		// session), not the container's.
 		ProtectSystem: "strict", ProtectHome: "tmpfs", PrivateTmp: true, UseReaper: true, BlockInterpreters: true,
 	}
 	p := mustTranslate(t, cfg, Options{})
@@ -470,6 +473,62 @@ func TestTranslateUnsupportedControls(t *testing.T) {
 		if hasSubstring(p.Warnings, s) || hasSubstring(p.Unenforced, s) {
 			t.Errorf("%s should be silent", s)
 		}
+	}
+}
+
+// protectHome and privateTmp hold in a Windows container until a grant
+// reaches the profile or the host's temp directory (cdxgen/safer-exec#4).
+func TestTranslateIsolationControls(t *testing.T) {
+	const temp = `C:\Users\u\AppData\Local\Temp`
+	host := testHost()
+	host.Env.Set("TEMP", temp)
+	host.Env.Set("TMP", temp)
+	translate := func(cfg config.ExecConfig) *Plan {
+		t.Helper()
+		cfg.Cmd = "cmd"
+		p, err := Translate(cfg, host, Options{})
+		if err != nil {
+			t.Fatalf("Translate: %v", err)
+		}
+		return p
+	}
+	unenforced := func(p *Plan, prefix string) string {
+		for _, u := range p.Unenforced {
+			if strings.HasPrefix(u, prefix) {
+				return u
+			}
+		}
+		return ""
+	}
+	cases := []struct {
+		name string
+		cfg  config.ExecConfig
+		want string // unenforced entry, "" when the control holds
+	}{
+		{"tmpfs home, no grant in the profile", config.ExecConfig{ProtectHome: "tmpfs", WritePaths: []string{`C:\work\data`}}, ""},
+		{"tmpfs home, read grant in the profile", config.ExecConfig{ProtectHome: "tmpfs", ReadPaths: []string{`C:\Users\u\.npm`}}, `protectHome tmpfs for C:\Users\u\.npm`},
+		{"read-only home, read grant in the profile", config.ExecConfig{ProtectHome: "read-only", ReadPaths: []string{`C:\Users\u\.npm`}}, ""},
+		{"read-only home, write grant in the profile", config.ExecConfig{ProtectHome: "read-only", WritePaths: []string{`C:\Users\u\.npm`}}, `protectHome read-only for C:\Users\u\.npm`},
+		{"home off", config.ExecConfig{ProtectHome: "off", WritePaths: []string{`C:\Users\u\.npm`}}, ""},
+		{"private tmp, temp not granted", config.ExecConfig{PrivateTmp: true}, ""},
+		{"private tmp, temp granted", config.ExecConfig{PrivateTmp: true, WritePaths: []string{temp}}, `privateTmp for ` + temp},
+		{"private tmp, ancestor of temp granted", config.ExecConfig{PrivateTmp: true, ReadPaths: []string{`C:\Users\u\AppData`}}, `privateTmp for C:\Users\u\AppData`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := translate(c.cfg)
+			prefix := "protectHome"
+			if c.cfg.PrivateTmp {
+				prefix = "privateTmp"
+			}
+			got := unenforced(p, prefix)
+			if c.want == "" && got != "" {
+				t.Fatalf("reported %q, want nothing: %v", got, p.Unenforced)
+			}
+			if c.want != "" && !strings.HasPrefix(got, c.want+" (") {
+				t.Fatalf("got %q, want %q: %v", got, c.want, p.Unenforced)
+			}
+		})
 	}
 }
 

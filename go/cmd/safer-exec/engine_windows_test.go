@@ -1000,6 +1000,25 @@ func TestWindowsEngineStrictRejectsUnenforceable(t *testing.T) {
 	}
 }
 
+// t.TempDir() lies in the host's temp directory, which the workload is then
+// granted: privateTmp does not hold, and saying nothing hid that
+// (cdxgen/safer-exec#4).
+func TestWindowsEnginePrivateTmpWithTempGrant(t *testing.T) {
+	requireMXC(t)
+	dir := testDir(t)
+	cfg := workloadConfig(t, dir, "echo")
+	cfg.PrivateTmp = true
+	res := runEngine(t, cfg)
+	if res.code != 0 || !strings.Contains(res.stderr, "not enforced on Windows: privateTmp for ") {
+		t.Fatalf("privateTmp with a temp grant: %d %q", res.code, res.stderr)
+	}
+	cfg.Strict = true
+	res = runEngine(t, cfg)
+	if res.code == 0 || !strings.Contains(res.stderr, "not enforceable on Windows: privateTmp for ") {
+		t.Fatalf("strict run accepted privateTmp: %d %q", res.code, res.stderr)
+	}
+}
+
 func TestWindowsEngineLockFiles(t *testing.T) {
 	requireMXC(t)
 	dir := testDir(t)
