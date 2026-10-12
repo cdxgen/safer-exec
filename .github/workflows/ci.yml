@@ -390,7 +390,8 @@ jobs:
       # stops partway (for example, a new package without a trusted
       # publisher configured yet) can be re-run without "version exists"
       # failures. New package names need a first manual publish and a
-      # trusted-publisher entry on npmjs.com before OIDC publishing works.
+      # trusted-publisher entry on npmjs.com before OIDC publishing works;
+      # .github/scripts/npm-bootstrap does both.
       - name: Publish packages
         run: |
           set -euo pipefail
