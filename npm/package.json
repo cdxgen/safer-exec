@@ -1,6 +1,6 @@
 {
   "name": "@cdxgen/safer-exec",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "type": "module",
   "main": "./src/index.js",
   "bin": {
@@ -48,12 +48,12 @@
   "description": "OS-level sandboxing with tracing, auditing, crypto tracing (CBOM), and learning mode for arbitrary binaries.",
   "homepage": "https://github.com/cdxgen/safer-exec#readme",
   "optionalDependencies": {
-    "@cdxgen/safer-exec-darwin-arm64": "1.1.1",
-    "@cdxgen/safer-exec-darwin-amd64": "1.1.1",
-    "@cdxgen/safer-exec-linux-amd64": "1.1.1",
-    "@cdxgen/safer-exec-linux-arm64": "1.1.1",
-    "@cdxgen/safer-exec-windows-amd64": "1.1.1",
-    "@cdxgen/safer-exec-windows-arm64": "1.1.1"
+    "@cdxgen/safer-exec-darwin-arm64": "1.1.2",
+    "@cdxgen/safer-exec-darwin-amd64": "1.1.2",
+    "@cdxgen/safer-exec-linux-amd64": "1.1.2",
+    "@cdxgen/safer-exec-linux-arm64": "1.1.2",
+    "@cdxgen/safer-exec-windows-amd64": "1.1.2",
+    "@cdxgen/safer-exec-windows-arm64": "1.1.2"
   },
   "engines": {
     "node": ">=20.0.0"
