@@ -27,8 +27,10 @@ const cliPath = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
 
 let skipReason = isWindows ? '' : 'Windows only';
 
+// realpathSync.native expands 8.3 short names (a runner's TEMP is often
+// C:\Users\RUNNER~1\...), matching the long names the engine reports.
 function workDir() {
-  return realpathSync(mkdtempSync(join(tmpdir(), 'safer-exec-win-')));
+  return realpathSync.native(mkdtempSync(join(tmpdir(), 'safer-exec-win-')));
 }
 
 function runCli(...args) {
