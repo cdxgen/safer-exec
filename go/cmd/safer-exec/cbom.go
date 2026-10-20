@@ -72,9 +72,12 @@ type cbomCryptoProps struct {
 // (1.7 adds serialNumber, the fingerprint object and certificateExtensions,
 // which the hashes in version, the bom-ref and the properties stand in for).
 type cbomCertProps struct {
-	SubjectName       string `json:"subjectName,omitempty"`
-	IssuerName        string `json:"issuerName,omitempty"`
-	CertificateFormat string `json:"certificateFormat,omitempty"`
+	SubjectName         string `json:"subjectName,omitempty"`
+	IssuerName          string `json:"issuerName,omitempty"`
+	NotValidBefore      string `json:"notValidBefore,omitempty"`
+	NotValidAfter       string `json:"notValidAfter,omitempty"`
+	SubjectPublicKeyRef string `json:"subjectPublicKeyRef,omitempty"`
+	CertificateFormat   string `json:"certificateFormat,omitempty"`
 }
 
 // cbomRelatedMaterialProps describes a public key by SPKI.
@@ -254,43 +257,54 @@ func (b *cbomBuilder) library(name, version, path string) string {
 // and returns its bom-ref, crypto/certificate/<name>@sha256:<certSha256>.
 // The whole-DER hash doubles as the version and the cdx:crypto:fingerprint
 // property; the SPKI hash is what distrust lists (Go's CVE-2026-111943 set)
-// and pins match on. Fields the observed chain cannot fill — occurrences,
-// validity, serial, extensions — are left out rather than invented.
+// and pins match on. The serial number and extensions have no 1.6 field and
+// are left out.
 func (b *cbomBuilder) certificate(e config.CertChainEntry) string {
-	ref := "crypto/certificate/" + url.PathEscape(e.Name) + "@sha256:" + e.CertSha256
+	props := []cbomProperty{
+		{Name: "cdx:crypto:spkiSha256", Value: e.SpkiSha256},
+		{Name: "cdx:crypto:fingerprint", Value: e.CertSha256},
+		{Name: "cdx:crypto:certRole", Value: certRole(e)},
+		{Name: "cdx:crypto:selfSigned", Value: strconv.FormatBool(e.SelfSigned)},
+		{Name: "cdx:crypto:isCA", Value: strconv.FormatBool(e.IsCA)},
+	}
+	if e.SignatureAlgorithm != "" {
+		props = append(props, cbomProperty{Name: "cdx:crypto:signatureAlgorithm", Value: e.SignatureAlgorithm})
+	}
+	props = append(props, cbomProperty{Name: "cdx:crypto:sourceType", Value: "observed-tls"})
 	return b.add(cbomComponent{
 		Type:    "cryptographic-asset",
-		BomRef:  ref,
+		BomRef:  "crypto/certificate/" + encodeURIComponent(e.Name) + "@sha256:" + e.CertSha256,
 		Name:    e.Name,
 		Version: e.CertSha256,
 		CryptoProperties: &cbomCryptoProps{
 			AssetType: "certificate",
 			CertificateProperties: &cbomCertProps{
-				SubjectName:       e.Subject,
-				IssuerName:        e.Issuer,
-				CertificateFormat: "X.509",
+				SubjectName:         e.Subject,
+				IssuerName:          e.Issuer,
+				NotValidBefore:      e.NotValidBefore,
+				NotValidAfter:       e.NotValidAfter,
+				SubjectPublicKeyRef: publicKeyRef(e),
+				CertificateFormat:   "X.509",
 			},
 		},
-		Properties: []cbomProperty{
-			{Name: "cdx:crypto:spkiSha256", Value: e.SpkiSha256},
-			{Name: "cdx:crypto:fingerprint", Value: e.CertSha256},
-			{Name: "cdx:crypto:certRole", Value: certRole(e)},
-			{Name: "cdx:crypto:selfSigned", Value: strconv.FormatBool(e.SelfSigned)},
-			{Name: "cdx:crypto:isCA", Value: strconv.FormatBool(e.IsCA)},
-		},
+		Properties: props,
 	})
 }
 
+// publicKeyRef is the bom-ref of a chain certificate's public key,
+// crypto/public-key/<name>@spki-sha256:<spkiSha256>.
+func publicKeyRef(e config.CertChainEntry) string {
+	return "crypto/public-key/" + encodeURIComponent(e.KeyName) + "@spki-sha256:" + e.SpkiSha256
+}
+
 // publicKey adds the public-key component of a chain certificate's key and
-// returns its bom-ref, crypto/public-key/<name>@spki-sha256:<spkiSha256>.
-// Cross-signed or re-issued certificates share the key and therefore the
-// component. The 1.7 fingerprint object has no 1.6 counterpart, so the digest
-// travels as properties.
+// returns its bom-ref. Cross-signed or re-issued certificates share the key
+// and therefore the component. The 1.7 fingerprint object has no 1.6
+// counterpart, so the digest travels as properties.
 func (b *cbomBuilder) publicKey(e config.CertChainEntry) string {
-	ref := "crypto/public-key/" + url.PathEscape(e.KeyName) + "@spki-sha256:" + e.SpkiSha256
 	return b.add(cbomComponent{
 		Type:   "cryptographic-asset",
-		BomRef: ref,
+		BomRef: publicKeyRef(e),
 		Name:   e.KeyName,
 		CryptoProperties: &cbomCryptoProps{
 			AssetType: "related-crypto-material",
@@ -303,8 +317,37 @@ func (b *cbomBuilder) publicKey(e config.CertChainEntry) string {
 		Properties: []cbomProperty{
 			{Name: "cdx:crypto:spkiSha256", Value: e.SpkiSha256},
 			{Name: "cdx:crypto:spkiSha256Base64", Value: e.SpkiSha256Base64},
+			{Name: "cdx:crypto:sourceType", Value: "certificate"},
 		},
 	})
+}
+
+// occur records location as an occurrence of the component ref, once.
+func (b *cbomBuilder) occur(ref, location string) {
+	c := &b.doc.Components[b.index[ref]]
+	if c.Evidence == nil {
+		c.Evidence = &cbomEvidence{}
+	}
+	if !slices.Contains(c.Evidence.Occurrences, cbomOccurrence{Location: location}) {
+		c.Evidence.Occurrences = append(c.Evidence.Occurrences, cbomOccurrence{Location: location})
+	}
+}
+
+// encodeURIComponent escapes s as JavaScript's encodeURIComponent does, so a
+// certificate's bom-ref here is the one cdxgen builds for it: every byte
+// except A-Z a-z 0-9 - _ . ! ~ * ' ( ) becomes %XX. url.PathEscape differs
+// (it keeps : @ & = + $ and escapes ! * ' ( )).
+func encodeURIComponent(s string) string {
+	var sb strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || strings.IndexByte("-_.!~*'()", c) >= 0 {
+			sb.WriteByte(c)
+		} else {
+			fmt.Fprintf(&sb, "%%%02X", c)
+		}
+	}
+	return sb.String()
 }
 
 // certRole classifies a chain certificate: a self-signed CA is a root, any
@@ -424,12 +467,18 @@ func buildCBOM(r *config.CryptoResult) cbomDoc {
 			}
 
 			// The chain the server presented (TLS ≤ 1.2) becomes certificate
-			// and public-key components linked from this protocol component;
-			// a key shared by cross-signed twins is one component.
+			// and public-key components linked from this protocol component,
+			// with the server as an occurrence of each, so a distrusted key
+			// leads to the servers that presented it. A key shared by
+			// cross-signed twins is one component.
 			var chainRefs []string
 			for _, e := range c.Chain {
 				certRef := b.certificate(e)
 				keyRef := b.publicKey(e)
+				if c.Host != "" {
+					b.occur(certRef, "tls://"+c.Host)
+					b.occur(keyRef, "tls://"+c.Host)
+				}
 				b.provide(certRef, keyRef)
 				chainRefs = append(chainRefs, certRef, keyRef)
 			}

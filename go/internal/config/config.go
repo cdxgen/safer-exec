@@ -644,7 +644,8 @@ type CipherInfo struct {
 
 // CertChainEntry is one certificate of the chain a server presented in a
 // TLS ≤ 1.2 handshake. The SPKI SHA-256 is the digest SPKI pins and distrust
-// lists (Go's CVE-2026-111943 set) key on.
+// lists (Go's CVE-2026-111943 set) key on. Its fields match
+// tlsobserve.ChainCert one for one, in the same order.
 type CertChainEntry struct {
 	// Name is the certificate's component name: the subject CN, else the
 	// first subject RDN value, else the subject string.
@@ -652,6 +653,13 @@ type CertChainEntry struct {
 	// Subject and Issuer are the RFC 4514 name strings.
 	Subject string `json:"subject,omitempty"`
 	Issuer  string `json:"issuer,omitempty"`
+	// SerialNumber is lowercase hex without leading zeros.
+	SerialNumber string `json:"serialNumber,omitempty"`
+	// NotValidBefore and NotValidAfter are the validity bounds, RFC 3339 UTC.
+	NotValidBefore string `json:"notValidBefore,omitempty"`
+	NotValidAfter  string `json:"notValidAfter,omitempty"`
+	// SignatureAlgorithm is the issuer's signature algorithm ("SHA256-RSA").
+	SignatureAlgorithm string `json:"signatureAlgorithm,omitempty"`
 	// CertSha256 is SHA-256 over the whole DER certificate; SpkiSha256 over
 	// the DER SubjectPublicKeyInfo. Both lowercase hex.
 	CertSha256 string `json:"certSha256,omitempty"`

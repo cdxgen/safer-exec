@@ -288,18 +288,7 @@ func proxyCipherInfo(target string, h tlsobserve.Handshake) config.CipherInfo {
 		Source:         "proxy",
 	}
 	for _, cc := range h.Chain {
-		info.Chain = append(info.Chain, config.CertChainEntry{
-			Name:             cc.Name,
-			Subject:          cc.Subject,
-			Issuer:           cc.Issuer,
-			CertSha256:       cc.CertSha256,
-			SpkiSha256:       cc.SpkiSha256,
-			SpkiSha256Base64: cc.SpkiSha256Base64,
-			KeyName:          cc.KeyName,
-			KeyBits:          cc.KeyBits,
-			IsCA:             cc.IsCA,
-			SelfSigned:       cc.SelfSigned,
-		})
+		info.Chain = append(info.Chain, config.CertChainEntry(cc))
 	}
 	if s.Known {
 		info.IANAName = s.Name

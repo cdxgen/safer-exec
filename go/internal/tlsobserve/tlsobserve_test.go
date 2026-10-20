@@ -290,6 +290,10 @@ func TestTLS12RecordsFullChain(t *testing.T) {
 		if got.KeyName != "ECDSA-P256" || got.KeyBits != 256 {
 			t.Errorf("chain[%d] key = %s/%d", i, got.KeyName, got.KeyBits)
 		}
+		if got.SerialNumber != cert.SerialNumber.Text(16) || got.SignatureAlgorithm != "ECDSA-SHA256" ||
+			got.NotValidBefore != cert.NotBefore.UTC().Format(time.RFC3339) || got.NotValidAfter != cert.NotAfter.UTC().Format(time.RFC3339) {
+			t.Errorf("chain[%d] serial/validity/signature = %+v", i, got)
+		}
 	}
 	// Existing fields still describe the first certificate (the leaf).
 	if hs.ServerKey != "ECDSA-P-256" || hs.CertSignature != "ECDSA-SHA256" {
@@ -338,37 +342,11 @@ func TestTLS12ChainStopsAtTenCertificates(t *testing.T) {
 // the certificates that fit. Fat certificates (a large unknown extension)
 // make four of them overrun the budget.
 func TestTLS12ChainStopsAtByteBudget(t *testing.T) {
-	fatCert := func(t *testing.T, cn string) []byte {
-		key := keygen(t)
-		tmpl := &x509.Certificate{
-			SerialNumber: big.NewInt(1),
-			Subject:      pkix.Name{CommonName: cn},
-			NotBefore:    time.Now().Add(-time.Hour),
-			NotAfter:     time.Now().Add(time.Hour),
-			ExtraExtensions: []pkix.Extension{{
-				Id:    asn1.ObjectIdentifier{2, 5, 29, 99},
-				Value: make([]byte, 20<<10),
-			}},
-		}
-		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return der
-	}
-	var body []byte
 	var ders [][]byte
 	for i := range 4 {
-		der := fatCert(t, fmt.Sprintf("fat-%d", i))
-		ders = append(ders, der)
-		body = append(body, byte(len(der)>>16), byte(len(der)>>8), byte(len(der)))
-		body = append(body, der...)
+		ders = append(ders, fatCert(t, fmt.Sprintf("fat-%d", i), 20<<10))
 	}
-	obs := New(nil)
-	_, _ = obs.Server().Write(serverHelloRecord())
-	_, _ = obs.Server().Write(handshakeRecords(msgCertificate, append([]byte{byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}, body...)))
-	obs.Close()
-	hs, _ := obs.Result()
+	hs := observeCertificates(ders...)
 	var total int
 	for _, der := range ders {
 		total += len(der)
@@ -382,6 +360,56 @@ func TestTLS12ChainStopsAtByteBudget(t *testing.T) {
 	if hs.Chain[0].Name != "fat-0" || hs.Chain[2].Name != "fat-2" || hs.ServerKey != "ECDSA-P-256" {
 		t.Fatalf("chain = %+v", hs.Chain)
 	}
+}
+
+// A leaf larger than the whole chain budget still fills ServerKey and
+// CertSignature, as before chains were recorded, but is not a chain record.
+func TestTLS12OversizedLeafKeepsServerKey(t *testing.T) {
+	hs := observeCertificates(fatCert(t, "fat-leaf", maxChainBytes))
+	if hs.ServerKey != "ECDSA-P-256" || hs.CertSignature != "ECDSA-SHA256" {
+		t.Errorf("leaf fields: serverKey %q certSignature %q", hs.ServerKey, hs.CertSignature)
+	}
+	if hs.Chain != nil {
+		t.Errorf("chain = %+v, want none past the budget", hs.Chain)
+	}
+}
+
+// fatCert is a self-signed certificate made at least pad bytes large by an
+// unknown extension.
+func fatCert(t *testing.T, cn string, pad int) []byte {
+	t.Helper()
+	key := keygen(t)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		ExtraExtensions: []pkix.Extension{{
+			Id:    asn1.ObjectIdentifier{2, 5, 29, 99},
+			Value: make([]byte, pad),
+		}},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return der
+}
+
+// observeCertificates feeds a TLS 1.2 ServerHello and a Certificate message
+// carrying ders to an observer and returns what it recorded.
+func observeCertificates(ders ...[]byte) Handshake {
+	var body []byte
+	for _, der := range ders {
+		body = append(body, byte(len(der)>>16), byte(len(der)>>8), byte(len(der)))
+		body = append(body, der...)
+	}
+	obs := New(nil)
+	_, _ = obs.Server().Write(serverHelloRecord())
+	_, _ = obs.Server().Write(handshakeRecords(msgCertificate, append([]byte{byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}, body...)))
+	obs.Close()
+	hs, _ := obs.Result()
+	return hs
 }
 
 // Malformed certificate lists stop the walk without a panic, keeping what
@@ -433,7 +461,7 @@ func serverHelloRecord() []byte {
 	body := []byte{3, 3}
 	body = append(body, make([]byte, 32)...)
 	body = append(body, 0)          // session id
-	body = append(body, 0x00, 0x2f) // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+	body = append(body, 0x00, 0x2f) // TLS_RSA_WITH_AES_128_CBC_SHA
 	body = append(body, 0)          // compression
 	body = append(body, 0, 0)       // extensions
 	return handshakeRecords(msgServerHello, body)

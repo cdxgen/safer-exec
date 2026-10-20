@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 // Handshake is what the cleartext part of one handshake revealed.
@@ -58,13 +59,20 @@ type Handshake struct {
 // ChainCert is one certificate of the chain a server presented. The hashes
 // identify the certificate for SPKI-based distrust lists: SpkiSha256 is the
 // same digest Go's crypto/x509 distrust list (CVE-2026-111943) and SPKI pins
-// are built from.
+// are built from. config.CertChainEntry has the same fields in the same
+// order, so the proxy converts one into the other directly.
 type ChainCert struct {
 	// Name is the certificate's component name: the subject CN, else the
 	// first subject RDN value, else the subject string.
 	Name string
 	// Subject and Issuer are the RFC 4514 name strings.
 	Subject, Issuer string
+	// SerialNumber is lowercase hex without leading zeros.
+	SerialNumber string
+	// NotValidBefore and NotValidAfter are the validity bounds, RFC 3339 UTC.
+	NotValidBefore, NotValidAfter string
+	// SignatureAlgorithm is the issuer's signature algorithm ("SHA256-RSA").
+	SignatureAlgorithm string
 	// CertSha256 is SHA-256 over the whole DER certificate; SpkiSha256 over
 	// the DER SubjectPublicKeyInfo. Both lowercase hex.
 	CertSha256, SpkiSha256 string
@@ -516,48 +524,45 @@ func parseServerHello(body []byte, hs *Handshake) (retry, ok bool) {
 // certificates, the server's own first. Every entry becomes a chain record
 // until a bound (maxChainCerts entries, maxChainBytes of certificate bytes)
 // or a malformed entry stops the walk, which keeps what already parsed. The
-// first certificate also fills ServerKey and CertSignature.
+// first certificate also fills ServerKey and CertSignature, whatever its
+// size, as it did before chains were recorded.
 func parseCertificate(body []byte, hs *Handshake) {
 	r := reader{b: body}
 	list := reader{b: r.n(r.u24())}
-	var total int
-	for !list.bad && len(list.b) > 0 {
-		if len(hs.Chain) >= maxChainCerts || total >= maxChainBytes {
-			return
-		}
+	total := 0
+	for len(list.b) > 0 && len(hs.Chain) < maxChainCerts {
 		der := list.n(list.u24())
 		if list.bad || len(der) == 0 {
 			return
 		}
-		total += len(der)
-		if total > maxChainBytes {
+		leaf := total == 0
+		if total += len(der); total > maxChainBytes && !leaf {
 			return
 		}
 		cert, err := x509.ParseCertificate(der)
 		if err != nil {
 			return
 		}
-		if len(hs.Chain) == 0 {
+		if leaf {
 			hs.CertSignature = cert.SignatureAlgorithm.String()
 			hs.ServerKey = serverKeyString(cert)
+		}
+		if total > maxChainBytes {
+			return
 		}
 		hs.Chain = append(hs.Chain, chainCert(cert))
 	}
 }
 
-// serverKeyString names a certificate's public key ("RSA-2048",
-// "ECDSA-P-256", "Ed25519").
+// serverKeyString is the ServerKey form of a certificate's key: the
+// publicKeyID name, except that ECDSA keys keep the curve's own name
+// ("ECDSA-P-256"), as ServerKey always has.
 func serverKeyString(cert *x509.Certificate) string {
-	switch k := cert.PublicKey.(type) {
-	case *rsa.PublicKey:
-		return fmt.Sprintf("RSA-%d", k.N.BitLen())
-	case *ecdsa.PublicKey:
+	if k, ok := cert.PublicKey.(*ecdsa.PublicKey); ok {
 		return "ECDSA-" + k.Curve.Params().Name
-	case ed25519.PublicKey:
-		return "Ed25519"
-	default:
-		return cert.PublicKeyAlgorithm.String()
 	}
+	name, _ := publicKeyID(cert)
+	return name
 }
 
 // chainCert records the identity fields and hashes of one presented
@@ -567,16 +572,20 @@ func chainCert(cert *x509.Certificate) ChainCert {
 	spkiSum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
 	name, bits := publicKeyID(cert)
 	return ChainCert{
-		Name:             certName(cert),
-		Subject:          cert.Subject.String(),
-		Issuer:           cert.Issuer.String(),
-		CertSha256:       hex.EncodeToString(certSum[:]),
-		SpkiSha256:       hex.EncodeToString(spkiSum[:]),
-		SpkiSha256Base64: base64.StdEncoding.EncodeToString(spkiSum[:]),
-		KeyName:          name,
-		KeyBits:          bits,
-		IsCA:             cert.IsCA,
-		SelfSigned:       bytes.Equal(cert.RawSubject, cert.RawIssuer) && cert.CheckSignatureFrom(cert) == nil,
+		Name:               certName(cert),
+		Subject:            cert.Subject.String(),
+		Issuer:             cert.Issuer.String(),
+		SerialNumber:       cert.SerialNumber.Text(16),
+		NotValidBefore:     cert.NotBefore.UTC().Format(time.RFC3339),
+		NotValidAfter:      cert.NotAfter.UTC().Format(time.RFC3339),
+		SignatureAlgorithm: cert.SignatureAlgorithm.String(),
+		CertSha256:         hex.EncodeToString(certSum[:]),
+		SpkiSha256:         hex.EncodeToString(spkiSum[:]),
+		SpkiSha256Base64:   base64.StdEncoding.EncodeToString(spkiSum[:]),
+		KeyName:            name,
+		KeyBits:            bits,
+		IsCA:               cert.IsCA,
+		SelfSigned:         bytes.Equal(cert.RawSubject, cert.RawIssuer) && cert.CheckSignatureFrom(cert) == nil,
 	}
 }
 

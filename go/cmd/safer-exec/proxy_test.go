@@ -2,17 +2,12 @@ package main
 
 import (
 	"bufio"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/hex"
 	"fmt"
 	"io"
-	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -525,44 +520,10 @@ func TestEgressProxyRecordsTLSParameters(t *testing.T) {
 // (leaf first) plus the parsed leaf, intermediate and root.
 func proxyChainPKI(t *testing.T) (tls.Certificate, *x509.Certificate, *x509.Certificate, *x509.Certificate) {
 	t.Helper()
-	key := func() *ecdsa.PrivateKey {
-		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return k
-	}
-	issue := func(cn string, isCA bool, k *ecdsa.PrivateKey, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) *x509.Certificate {
-		tmpl := &x509.Certificate{
-			SerialNumber:          big.NewInt(time.Now().UnixNano()),
-			Subject:               pkix.Name{CommonName: cn},
-			DNSNames:              []string{"observe.test"},
-			NotBefore:             time.Now().Add(-time.Hour),
-			NotAfter:              time.Now().Add(time.Hour),
-			KeyUsage:              x509.KeyUsageDigitalSignature,
-			BasicConstraintsValid: true,
-			IsCA:                  isCA,
-		}
-		if isCA {
-			tmpl.KeyUsage = x509.KeyUsageCertSign
-		}
-		if parent == nil {
-			parent, parentKey = tmpl, k
-		}
-		der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &k.PublicKey, parentKey)
-		if err != nil {
-			t.Fatal(err)
-		}
-		cert, err := x509.ParseCertificate(der)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return cert
-	}
-	rootKey, interKey, leafKey := key(), key(), key()
-	root := issue("proxy-test-root-ca", true, rootKey, nil, nil)
-	inter := issue("proxy-test-intermediate", true, interKey, root, rootKey)
-	leaf := issue("proxy-test-leaf", false, leafKey, inter, interKey)
+	rootKey, interKey, leafKey := testKey(t), testKey(t), testKey(t)
+	root := testCert(t, "proxy-test-root-ca", true, rootKey, nil, nil)
+	inter := testCert(t, "proxy-test-intermediate", true, interKey, root, rootKey)
+	leaf := testCert(t, "proxy-test-leaf", false, leafKey, inter, interKey)
 	server := tls.Certificate{
 		Certificate: [][]byte{leaf.Raw, inter.Raw, root.Raw},
 		PrivateKey:  leafKey,
