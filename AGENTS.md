@@ -61,7 +61,7 @@ go/                           — Go engine (platform-specific sandboxing)
                                 stderr protocol); unit-tested on every platform
     winjob/                   — Windows job objects (limits, suspended start, notifications)
     tlsobserve/               — passive reader of TLS handshakes in egress-proxy tunnels (version,
-                                suite, key-exchange group, TLS ≤1.2 server key) for traceCrypto
+                                suite, key-exchange group, TLS ≤1.2 server key and certificate chain) for traceCrypto
     dlltrace/                 — Windows DLL load tracing: an ETW session on Microsoft-Windows-Kernel-Process
                                 (session_windows.go) and the portable attribution of image loads to the
                                 workload's process tree and kernel-to-Win32 path mapping (dlltrace.go)
@@ -405,8 +405,14 @@ identities using eBPF uretprobes on OpenSSL/GnuTLS cipher negotiation functions.
 3. **CBOM output**: `buildCBOM()` in `cbom.go` (all platforms) produces a
    CycloneDX document valid against both 1.6 and 1.7: crypto libraries as
    `library` components, algorithms with bom-refs and OIDs (`algorithmOIDs`),
-   hybrid groups split into their curve and ML-KEM, and TLS protocols whose
-   suites refer to algorithms by bom-ref. `cbom_test.go` validates it against
+   hybrid groups split into their curve and ML-KEM, TLS protocols whose
+   suites refer to algorithms by bom-ref, and the certificates and public keys
+   of presented TLS ≤ 1.2 chains (bom-refs as cdxgen builds them, so keep
+   `encodeURIComponent` in step with JavaScript's). Post-quantum certificate
+   algorithms are named from `pqAlgorithms` in `internal/tlsobserve/names.go`
+   by OID, never from `crypto/x509`, whose coverage varies by Go release;
+   extend that table (and `testdata/pqc/gen.sh`) when a new one is
+   standardised. `cbom_test.go` validates it against
    the schemas vendored in `cmd/safer-exec/testdata/cyclonedx`; keep it
    passing when adding fields, and add an OID for any new algorithm name.
 

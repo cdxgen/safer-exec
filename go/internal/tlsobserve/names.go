@@ -85,6 +85,61 @@ func GroupKeyExchange(g uint16) string {
 	return "ECDHE"
 }
 
+// PQAlgorithm is a post-quantum algorithm as certificates identify it: ML-DSA
+// (FIPS 204, RFC 9881), SLH-DSA (FIPS 205, RFC 9909) and ML-KEM (FIPS 203,
+// RFC 9935). The same OID names an ML-DSA or SLH-DSA key and its signature.
+type PQAlgorithm struct {
+	Name, OID string
+	// Primitive is "signature" or "kem"; ParameterSet the FIPS parameter set
+	// ("65", "SHA2-128s", "768"); NISTLevel the NIST security category.
+	Primitive, ParameterSet string
+	NISTLevel               int
+}
+
+// pqAlgorithms lists every parameter set the three standards define. Names
+// come from these OIDs, not from crypto/x509, whose knowledge depends on the
+// Go release (1.26 knows none of them, 1.27 ML-DSA only).
+var pqAlgorithms = []PQAlgorithm{
+	{"ML-DSA-44", "2.16.840.1.101.3.4.3.17", "signature", "44", 2},
+	{"ML-DSA-65", "2.16.840.1.101.3.4.3.18", "signature", "65", 3},
+	{"ML-DSA-87", "2.16.840.1.101.3.4.3.19", "signature", "87", 5},
+	{"SLH-DSA-SHA2-128s", "2.16.840.1.101.3.4.3.20", "signature", "SHA2-128s", 1},
+	{"SLH-DSA-SHA2-128f", "2.16.840.1.101.3.4.3.21", "signature", "SHA2-128f", 1},
+	{"SLH-DSA-SHA2-192s", "2.16.840.1.101.3.4.3.22", "signature", "SHA2-192s", 3},
+	{"SLH-DSA-SHA2-192f", "2.16.840.1.101.3.4.3.23", "signature", "SHA2-192f", 3},
+	{"SLH-DSA-SHA2-256s", "2.16.840.1.101.3.4.3.24", "signature", "SHA2-256s", 5},
+	{"SLH-DSA-SHA2-256f", "2.16.840.1.101.3.4.3.25", "signature", "SHA2-256f", 5},
+	{"SLH-DSA-SHAKE-128s", "2.16.840.1.101.3.4.3.26", "signature", "SHAKE-128s", 1},
+	{"SLH-DSA-SHAKE-128f", "2.16.840.1.101.3.4.3.27", "signature", "SHAKE-128f", 1},
+	{"SLH-DSA-SHAKE-192s", "2.16.840.1.101.3.4.3.28", "signature", "SHAKE-192s", 3},
+	{"SLH-DSA-SHAKE-192f", "2.16.840.1.101.3.4.3.29", "signature", "SHAKE-192f", 3},
+	{"SLH-DSA-SHAKE-256s", "2.16.840.1.101.3.4.3.30", "signature", "SHAKE-256s", 5},
+	{"SLH-DSA-SHAKE-256f", "2.16.840.1.101.3.4.3.31", "signature", "SHAKE-256f", 5},
+	{"ML-KEM-512", "2.16.840.1.101.3.4.4.1", "kem", "512", 1},
+	{"ML-KEM-768", "2.16.840.1.101.3.4.4.2", "kem", "768", 3},
+	{"ML-KEM-1024", "2.16.840.1.101.3.4.4.3", "kem", "1024", 5},
+}
+
+// PostQuantumAlgorithm looks a post-quantum algorithm up by name.
+func PostQuantumAlgorithm(name string) (PQAlgorithm, bool) {
+	for _, a := range pqAlgorithms {
+		if a.Name == name {
+			return a, true
+		}
+	}
+	return PQAlgorithm{}, false
+}
+
+// pqAlgorithmByOID looks a post-quantum algorithm up by dotted OID.
+func pqAlgorithmByOID(oid string) (PQAlgorithm, bool) {
+	for _, a := range pqAlgorithms {
+		if a.OID == oid {
+			return a, true
+		}
+	}
+	return PQAlgorithm{}, false
+}
+
 // extraSuites names suites crypto/tls does not know (it implements no DHE or
 // CCM suite).
 var extraSuites = map[uint16]string{

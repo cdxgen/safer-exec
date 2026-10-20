@@ -1,7 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"math"
 	"os"
@@ -10,6 +17,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,8 +29,12 @@ import (
 // cbomFixture covers every source the CBOM is built from: TLS 1.3 and 1.2
 // suites from the egress proxy (hybrid and classical groups, RSA, ECDSA and
 // Ed25519 server keys, finite-field groups), a suite the Linux tracer
-// attributed to a library, and traced operations.
-func cbomFixture() *config.CryptoResult {
+// attributed to a library, and traced operations. The two TLS 1.2 proxy
+// suites carry the certificate chains their servers presented (cbomChains:
+// two roots and one intermediate key certified by both, so the chains share a
+// cross-signed SPKI).
+func cbomFixture(t *testing.T) *config.CryptoResult {
+	chainA, chainB := cbomChains(t)
 	return &config.CryptoResult{
 		Platform: "linux",
 		Libraries: []config.CryptoLibrary{
@@ -40,9 +52,11 @@ func cbomFixture() *config.CryptoResult {
 			{Name: "TLS_AES_128_GCM_SHA256", IANAName: "TLS_AES_128_GCM_SHA256", IANAID: 0x1301, Protocol: "TLSv1.3", Encryption: "AES", EncryptionBits: 128, Mode: "GCM", Hash: "SHA256",
 				Group: "X25519Kyber768Draft00", PostQuantum: true, Source: "proxy"},
 			{Name: "ECDHE-RSA-AES128-GCM-SHA256", IANAName: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", IANAID: 0xC02F, Protocol: "TLSv1.2", KeyExchange: "ECDHE", Authentication: "RSA",
-				Encryption: "AES", EncryptionBits: 128, Mode: "GCM", Hash: "SHA256", Group: "secp256r1", ServerKey: "RSA-2048", Source: "proxy"},
+				Encryption: "AES", EncryptionBits: 128, Mode: "GCM", Hash: "SHA256", Group: "secp256r1", ServerKey: "RSA-2048", Source: "proxy",
+				Host: "a.cbom.test:443", Chain: chainA},
 			{Name: "ECDHE-ECDSA-AES256-CCM", IANAName: "TLS_ECDHE_ECDSA_WITH_AES_256_CCM", IANAID: 0xC0AD, Protocol: "TLSv1.2", KeyExchange: "ECDHE", Authentication: "ECDSA",
-				Encryption: "AES", EncryptionBits: 256, Mode: "CCM", Group: "brainpoolP256r1tls13", ServerKey: "ECDSA-P-256", Source: "proxy"},
+				Encryption: "AES", EncryptionBits: 256, Mode: "CCM", Group: "brainpoolP256r1tls13", ServerKey: "ECDSA-P-256", Source: "proxy",
+				Host: "b.cbom.test:443", Chain: chainB},
 			{Name: "DHE-RSA-AES256-CBC-SHA", IANAName: "TLS_DHE_RSA_WITH_AES_256_CBC_SHA", IANAID: 0x0039, Protocol: "TLSv1.2", KeyExchange: "DHE", Authentication: "RSA",
 				Encryption: "AES", EncryptionBits: 256, Mode: "CBC", Hash: "SHA1", Group: "DH-2048", ServerKey: "Ed25519", Source: "proxy"},
 			{Name: "DES-CBC3-SHA", IANAName: "TLS_RSA_WITH_3DES_EDE_CBC_SHA", IANAID: 0x000A, Protocol: "TLSv1.2", KeyExchange: "RSA", Authentication: "RSA",
@@ -60,6 +74,64 @@ func cbomFixture() *config.CryptoResult {
 	}
 }
 
+// cbomChains generates a small PKI: rootA and rootB, one intermediate key
+// certified by both (intA, intB — a cross-signed twin pair sharing one SPKI),
+// and a leaf issued under intA whose name needs bom-ref escaping. Every hash
+// in the returned entries is computed from the generated certificates.
+func cbomChains(t *testing.T) (chainA, chainB []config.CertChainEntry) {
+	t.Helper()
+	rootAKey, rootBKey, intKey, leafKey := testKey(t), testKey(t), testKey(t), testKey(t)
+	rootA := testCert(t, "cbom-test-root-a", true, rootAKey, nil, nil)
+	rootB := testCert(t, "cbom-test-root-b", true, rootBKey, nil, nil)
+	intA := testCert(t, "cbom-test-intermediate", true, intKey, rootA, rootAKey)
+	intB := testCert(t, "cbom-test-intermediate", true, intKey, rootB, rootBKey)
+	leaf := testCert(t, "cbom-test-leaf (Let's: a@b+c)", false, leafKey, intA, intKey)
+	return chainEntries(leaf, intA, rootA), chainEntries(intB, rootB)
+}
+
+// chainEntries maps generated certificates to the observed-chain form. It
+// mirrors what tlsobserve records, computing every hash from the DER.
+func chainEntries(certs ...*x509.Certificate) []config.CertChainEntry {
+	out := make([]config.CertChainEntry, 0, len(certs))
+	for _, cert := range certs {
+		certSum := sha256.Sum256(cert.Raw)
+		spkiSum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+		bits := cert.PublicKey.(*ecdsa.PublicKey).Curve.Params().BitSize
+		out = append(out, config.CertChainEntry{
+			Name:                  cert.Subject.CommonName,
+			Subject:               cert.Subject.String(),
+			Issuer:                cert.Issuer.String(),
+			SerialNumber:          cert.SerialNumber.Text(16),
+			NotValidBefore:        cert.NotBefore.UTC().Format(time.RFC3339),
+			NotValidAfter:         cert.NotAfter.UTC().Format(time.RFC3339),
+			Version:               cert.Version,
+			SignatureAlgorithm:    cert.SignatureAlgorithm.String(),
+			SignatureAlgorithmOid: "1.2.840.10045.4.3.2",
+			CertSha256:            hex.EncodeToString(certSum[:]),
+			SpkiSha256:            hex.EncodeToString(spkiSum[:]),
+			SpkiSha256Base64:      base64.StdEncoding.EncodeToString(spkiSum[:]),
+			KeyName:               fmt.Sprintf("ECDSA-P%d", bits),
+			KeyBits:               bits,
+			KeyAlgorithmOid:       "1.2.840.10045.2.1",
+			IsCA:                  cert.IsCA,
+			SelfSigned:            bytes.Equal(cert.RawSubject, cert.RawIssuer) && cert.CheckSignatureFrom(cert) == nil,
+		})
+	}
+	return out
+}
+
+// fixtureChains returns the chains cbomFixture's TLS 1.2 suites carry, in
+// order, with the host each was presented by.
+func fixtureChains(r *config.CryptoResult) (chains [][]config.CertChainEntry, hosts []string) {
+	for _, c := range r.Ciphers {
+		if c.Chain != nil {
+			chains = append(chains, c.Chain)
+			hosts = append(hosts, c.Host)
+		}
+	}
+	return chains, hosts
+}
+
 func cbomJSON(t *testing.T, r *config.CryptoResult) any {
 	t.Helper()
 	data, err := json.Marshal(buildCBOM(r))
@@ -75,7 +147,7 @@ func cbomJSON(t *testing.T, r *config.CryptoResult) any {
 
 func TestCBOMValidatesAgainstCycloneDX(t *testing.T) {
 	schemas := loadCycloneDXSchemas(t)
-	for _, r := range []*config.CryptoResult{cbomFixture(), {Platform: "darwin"}} {
+	for _, r := range []*config.CryptoResult{cbomFixture(t), {Platform: "darwin"}} {
 		doc := cbomJSON(t, r)
 		for _, schema := range []string{"bom-1.6.schema.json", "bom-1.7.schema.json"} {
 			if errs := schemas.validate(schema, doc); len(errs) > 0 {
@@ -86,7 +158,7 @@ func TestCBOMValidatesAgainstCycloneDX(t *testing.T) {
 }
 
 func TestCBOMContents(t *testing.T) {
-	doc := buildCBOM(cbomFixture())
+	doc := buildCBOM(cbomFixture(t))
 	byRef := map[string]cbomComponent{}
 	byName := map[string]cbomComponent{}
 	for _, c := range doc.Components {
@@ -195,6 +267,293 @@ func TestCBOMContents(t *testing.T) {
 	}
 	if doc.Metadata == nil || doc.Metadata.Tools.Components[0].Version != version {
 		t.Errorf("metadata = %+v", doc.Metadata)
+	}
+}
+
+// propValue returns a component's cdx:crypto property.
+func propValue(c cbomComponent, name string) (string, bool) {
+	for _, p := range c.Properties {
+		if p.Name == name {
+			return p.Value, true
+		}
+	}
+	return "", false
+}
+
+// The presented chains become certificate and public-key components: one per
+// certificate, one per distinct SPKI (the cross-signed twins share a key), in
+// the bom-ref formats cdxgen uses, linked from the TLS protocol component and
+// from each certificate to its key, with the presenting servers as
+// occurrences.
+func TestCBOMCertificateAndPublicKeyComponents(t *testing.T) {
+	r := cbomFixture(t)
+	chains, hosts := fixtureChains(r)
+	chainA, chainB := chains[0], chains[1]
+	doc := buildCBOM(r)
+	byRef := map[string]cbomComponent{}
+	for _, c := range doc.Components {
+		byRef[c.BomRef] = c
+	}
+	certRef := func(e config.CertChainEntry) string {
+		return "crypto/certificate/" + encodeURIComponent(e.Name) + "@sha256:" + e.CertSha256
+	}
+	keyRef := func(e config.CertChainEntry) string {
+		return "crypto/public-key/" + encodeURIComponent(e.KeyName) + "@spki-sha256:" + e.SpkiSha256
+	}
+	locations := func(c cbomComponent) []string {
+		var out []string
+		if c.Evidence != nil {
+			for _, o := range c.Evidence.Occurrences {
+				out = append(out, o.Location)
+			}
+		}
+		return out
+	}
+
+	// The leaf's name carries characters url.PathEscape and JavaScript's
+	// encodeURIComponent treat differently; the ref must be cdxgen's.
+	if want := "crypto/certificate/cbom-test-leaf%20(Let's%3A%20a%40b%2Bc)@sha256:" + chainA[0].CertSha256; certRef(chainA[0]) != want {
+		t.Fatalf("leaf bom-ref = %s, want %s", certRef(chainA[0]), want)
+	}
+	wantRoles := []string{"leaf", "intermediate", "root"}
+	for i, e := range chainA {
+		c, ok := byRef[certRef(e)]
+		if !ok {
+			t.Fatalf("chainA[%d]: no certificate component %s", i, certRef(e))
+		}
+		if c.Type != "cryptographic-asset" || c.Version != e.CertSha256 || c.Name != e.Name {
+			t.Errorf("chainA[%d] component = %+v", i, c)
+		}
+		cp := c.CryptoProperties
+		if cp == nil || cp.AssetType != "certificate" || cp.CertificateProperties == nil {
+			t.Fatalf("chainA[%d] cryptoProperties = %+v", i, cp)
+		}
+		want := cbomCertProps{
+			SubjectName:         e.Subject,
+			IssuerName:          e.Issuer,
+			NotValidBefore:      e.NotValidBefore,
+			NotValidAfter:       e.NotValidAfter,
+			SubjectPublicKeyRef: keyRef(e),
+			CertificateFormat:   "X.509",
+		}
+		if *cp.CertificateProperties != want {
+			t.Errorf("chainA[%d] certificateProperties = %+v, want %+v", i, *cp.CertificateProperties, want)
+		}
+		for name, want := range map[string]string{
+			"cdx:crypto:spkiSha256":         e.SpkiSha256,
+			"cdx:crypto:fingerprint":        e.CertSha256,
+			"cdx:crypto:certRole":           wantRoles[i],
+			"cdx:crypto:selfSigned":         strconv.FormatBool(e.SelfSigned),
+			"cdx:crypto:isCA":               strconv.FormatBool(e.IsCA),
+			"cdx:crypto:signatureAlgorithm": "ECDSA-SHA256",
+			"cdx:crypto:sourceType":         "observed-tls",
+		} {
+			if got, ok := propValue(c, name); !ok || got != want {
+				t.Errorf("chainA[%d] %s = %q, want %q", i, name, got, want)
+			}
+		}
+		if got := locations(c); !slices.Equal(got, []string{"tls://" + hosts[0]}) {
+			t.Errorf("chainA[%d] occurrences = %v", i, got)
+		}
+	}
+	if role, _ := propValue(byRef[certRef(chainB[0])], "cdx:crypto:certRole"); role != "intermediate" {
+		t.Errorf("cross-signed twin role = %q, want intermediate", role)
+	}
+
+	// One public-key component per distinct SPKI: leaf, shared intermediate
+	// key, rootA, rootB. The shared key was presented by both servers.
+	keyRefs := map[string]bool{}
+	for _, e := range append(slices.Clone(chainA), chainB...) {
+		ref := keyRef(e)
+		c, ok := byRef[ref]
+		if !ok {
+			t.Fatalf("no public-key component %s", ref)
+		}
+		keyRefs[ref] = true
+		rcm := c.CryptoProperties.RelatedCryptoMaterialProps
+		if c.CryptoProperties.AssetType != "related-crypto-material" || rcm == nil || rcm.Type != "public-key" || rcm.Format != "SPKI" || rcm.Size != 256 {
+			t.Errorf("public key %s = %+v", ref, c.CryptoProperties)
+		}
+		if got, ok := propValue(c, "cdx:crypto:spkiSha256Base64"); !ok || got != e.SpkiSha256Base64 {
+			t.Errorf("public key %s pin property = %q", ref, got)
+		}
+		if got, _ := propValue(c, "cdx:crypto:sourceType"); got != "certificate" {
+			t.Errorf("public key %s sourceType = %q", ref, got)
+		}
+	}
+	if len(keyRefs) != 4 {
+		t.Errorf("%d public-key components, want 4 (the twins must share one): %v", len(keyRefs), keyRefs)
+	}
+	if got := locations(byRef[keyRef(chainB[0])]); !slices.Equal(got, []string{"tls://" + hosts[0], "tls://" + hosts[1]}) {
+		t.Errorf("shared intermediate key occurrences = %v", got)
+	}
+
+	// The TLS 1.2 protocol component provides every chain asset, and each
+	// certificate provides its public key.
+	provides := map[string][]string{}
+	for _, d := range doc.Dependencies {
+		provides[d.Ref] = d.Provides
+	}
+	tls12 := provides["crypto/protocol/tls@1.2"]
+	for _, e := range append(slices.Clone(chainA), chainB...) {
+		if !slices.Contains(tls12, certRef(e)) || !slices.Contains(tls12, keyRef(e)) {
+			t.Errorf("TLS 1.2 does not provide %s and its key", certRef(e))
+		}
+		if got := provides[certRef(e)]; !slices.Equal(got, []string{keyRef(e)}) {
+			t.Errorf("certificate %s provides %v, want [%s]", certRef(e), got, keyRef(e))
+		}
+	}
+}
+
+// pqChainEntry maps a certificate generated by
+// internal/tlsobserve/testdata/pqc/gen.sh to its observed-chain entry. The
+// hashes come from the DER; the names and OIDs are the ones tlsobserve's
+// TestPostQuantumChainNames checks against the same files.
+func pqChainEntry(t *testing.T, file, key, keyOID, sig, sigOID string, selfSigned, unverified bool) config.CertChainEntry {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "internal", "tlsobserve", "testdata", "pqc", file+".pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(data)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certSum := sha256.Sum256(cert.Raw)
+	spkiSum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+	return config.CertChainEntry{
+		Name: cert.Subject.CommonName, Subject: cert.Subject.String(), Issuer: cert.Issuer.String(),
+		SerialNumber: cert.SerialNumber.Text(16), Version: cert.Version,
+		NotValidBefore: cert.NotBefore.UTC().Format(time.RFC3339), NotValidAfter: cert.NotAfter.UTC().Format(time.RFC3339),
+		SignatureAlgorithm: sig, SignatureAlgorithmOid: sigOID,
+		CertSha256: hex.EncodeToString(certSum[:]), SpkiSha256: hex.EncodeToString(spkiSum[:]),
+		SpkiSha256Base64: base64.StdEncoding.EncodeToString(spkiSum[:]),
+		KeyName:          key, KeyAlgorithmOid: keyOID, IsCA: cert.IsCA, SelfSigned: selfSigned, SelfSignedUnverified: unverified,
+	}
+}
+
+// Post-quantum chain certificates link their keys to algorithm components
+// that carry the OID, parameter set and NIST level; a root whose signature
+// could not be checked is still a root; a key named by an unknown OID gets
+// no algorithm component. The CBOM stays valid against 1.6 and 1.7.
+func TestCBOMPostQuantumChain(t *testing.T) {
+	chain := []config.CertChainEntry{
+		pqChainEntry(t, "ecdsa-leaf", "ECDSA-P256", "1.2.840.10045.2.1", "ML-DSA-44", "2.16.840.1.101.3.4.3.17", false, false),
+		pqChainEntry(t, "mldsa44-int", "ML-DSA-44", "2.16.840.1.101.3.4.3.17", "ML-DSA-65", "2.16.840.1.101.3.4.3.18", false, false),
+		pqChainEntry(t, "mldsa65-root", "ML-DSA-65", "2.16.840.1.101.3.4.3.18", "ML-DSA-65", "2.16.840.1.101.3.4.3.18", true, false),
+	}
+	slh := pqChainEntry(t, "slhdsa-root", "SLH-DSA-SHA2-128s", "2.16.840.1.101.3.4.3.20", "SLH-DSA-SHA2-128s", "2.16.840.1.101.3.4.3.20", true, true)
+	unknown := slh
+	unknown.KeyName, unknown.KeyAlgorithmOid, unknown.SpkiSha256 = "1.3.6.1.4.1.99999.1", "1.3.6.1.4.1.99999.1", strings.Repeat("ab", 32)
+	r := &config.CryptoResult{Platform: "darwin", Ciphers: []config.CipherInfo{
+		{Name: "ECDHE-ECDSA-AES128-GCM-SHA256", IANAName: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", IANAID: 0xC02B, Protocol: "TLSv1.2",
+			ServerKey: "ECDSA-P-256", Source: "proxy", Host: "pq.observe.test:443", Chain: chain},
+		{Name: "ECDHE-ECDSA-AES128-GCM-SHA256", IANAName: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", IANAID: 0xC02B, Protocol: "TLSv1.2",
+			ServerKey: "ECDSA-P-256", Source: "proxy", Host: "slh.observe.test:443", Chain: []config.CertChainEntry{slh, unknown}},
+	}}
+	schemas := loadCycloneDXSchemas(t)
+	for _, schema := range []string{"bom-1.6.schema.json", "bom-1.7.schema.json"} {
+		if errs := schemas.validate(schema, cbomJSON(t, r)); len(errs) > 0 {
+			t.Errorf("%s: %v", schema, errs)
+		}
+	}
+	doc := buildCBOM(r)
+	byRef := map[string]cbomComponent{}
+	for _, c := range doc.Components {
+		byRef[c.BomRef] = c
+	}
+	for _, w := range []struct {
+		key    config.CertChainEntry
+		alg    string
+		params string
+		level  int
+	}{
+		{chain[0], "crypto/algorithm/ECDSA-P-256@1.2.840.10045.2.1", "P-256", 0},
+		{chain[1], "crypto/algorithm/ML-DSA-44@2.16.840.1.101.3.4.3.17", "44", 2},
+		{chain[2], "crypto/algorithm/ML-DSA-65@2.16.840.1.101.3.4.3.18", "65", 3},
+		{slh, "crypto/algorithm/SLH-DSA-SHA2-128s@2.16.840.1.101.3.4.3.20", "SHA2-128s", 1},
+	} {
+		key := byRef[publicKeyRef(w.key)]
+		rcm := key.CryptoProperties.RelatedCryptoMaterialProps
+		if key.Name != w.key.KeyName || rcm.AlgorithmRef != w.alg || rcm.Size != w.key.KeyBits {
+			t.Errorf("key %s = %+v", w.key.KeyName, rcm)
+		}
+		if got, _ := propValue(key, "cdx:crypto:publicKeyAlgorithmOid"); got != w.key.KeyAlgorithmOid {
+			t.Errorf("key %s OID property = %q", w.key.KeyName, got)
+		}
+		alg, ok := byRef[w.alg]
+		if !ok {
+			t.Fatalf("no algorithm component %s", w.alg)
+		}
+		if ap := alg.CryptoProperties.AlgorithmProperties; ap.Primitive != "signature" || ap.ParameterSetIdentifier != w.params || ap.NistQuantumSecurityLevel != w.level {
+			t.Errorf("algorithm %s = %+v", w.alg, ap)
+		}
+	}
+	for _, w := range []struct {
+		e                    config.CertChainEntry
+		role, sigOID         string
+		unverified, hasUnver bool
+	}{
+		{chain[0], "leaf", "2.16.840.1.101.3.4.3.17", false, false},
+		{chain[1], "intermediate", "2.16.840.1.101.3.4.3.18", false, false},
+		{chain[2], "root", "2.16.840.1.101.3.4.3.18", false, false},
+		{slh, "root", "2.16.840.1.101.3.4.3.20", true, true},
+	} {
+		c := byRef["crypto/certificate/"+encodeURIComponent(w.e.Name)+"@sha256:"+w.e.CertSha256]
+		if role, _ := propValue(c, "cdx:crypto:certRole"); role != w.role {
+			t.Errorf("%s role = %q, want %q", w.e.Name, role, w.role)
+		}
+		if oid, _ := propValue(c, "cdx:crypto:signatureAlgorithmOid"); oid != w.sigOID {
+			t.Errorf("%s signature OID = %q", w.e.Name, oid)
+		}
+		if v, ok := propValue(c, "cdx:crypto:selfSignedUnverified"); ok != w.hasUnver || (ok && v != "true") {
+			t.Errorf("%s selfSignedUnverified = %q (present %v)", w.e.Name, v, ok)
+		}
+	}
+	if rcm := byRef[publicKeyRef(unknown)].CryptoProperties.RelatedCryptoMaterialProps; rcm.AlgorithmRef != "" {
+		t.Errorf("unknown key links algorithm %s", rcm.AlgorithmRef)
+	}
+	for _, c := range doc.Components {
+		if strings.HasPrefix(c.BomRef, "crypto/algorithm/1.") {
+			t.Errorf("algorithm component named by OID: %s", c.BomRef)
+		}
+	}
+}
+
+// encodeURIComponent must agree with JavaScript's byte for byte (expected
+// values from Node.js), or cdxgen and safer-exec name one certificate twice.
+func TestEncodeURIComponent(t *testing.T) {
+	for in, want := range map[string]string{
+		"R3":                    "R3",
+		"-_.!~*'()":             "-_.!~*'()",
+		"a/b;c,d?e=f&g$h#i%j":   "a%2Fb%3Bc%2Cd%3Fe%3Df%26g%24h%23i%25j",
+		"Arany (Class Gold) Fő": "Arany%20(Class%20Gold)%20F%C5%91",
+		"RSA-2048":              "RSA-2048",
+	} {
+		if got := encodeURIComponent(in); got != want {
+			t.Errorf("encodeURIComponent(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Building the CBOM twice from the same observations yields identical bytes
+// once the metadata timestamp is set aside: no map-iteration order reaches
+// the output.
+func TestCBOMDeterministic(t *testing.T) {
+	r := cbomFixture(t)
+	docs := make([][]byte, 2)
+	for i := range docs {
+		doc := buildCBOM(r)
+		doc.Metadata.Timestamp = ""
+		data, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		docs[i] = data
+	}
+	if !bytes.Equal(docs[0], docs[1]) {
+		t.Fatal("two builds of the same result differ")
 	}
 }
 

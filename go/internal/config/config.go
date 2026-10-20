@@ -634,8 +634,57 @@ type CipherInfo struct {
 	ServerKey string `json:"serverKey,omitempty"`
 	// CertSignature is the server certificate's signature algorithm.
 	CertSignature string `json:"certSignature,omitempty"`
+	// Chain is the certificate chain the server presented, leaf first,
+	// visible only up to TLS 1.2 (the observer cannot read the encrypted
+	// TLS 1.3 Certificate message).
+	Chain []CertChainEntry `json:"chain,omitempty"`
 	// Source is how the cipher was observed: "ebpf_uprobe" or "proxy".
 	Source string `json:"source,omitempty"`
+}
+
+// CertChainEntry is one certificate of the chain a server presented in a
+// TLS ≤ 1.2 handshake. The SPKI SHA-256 is the digest SPKI pins and distrust
+// lists (Go's CVE-2026-111943 set) key on. Its fields match
+// tlsobserve.ChainCert one for one, in the same order.
+type CertChainEntry struct {
+	// Name is the certificate's component name: the subject CN, else the
+	// first subject RDN value, else the subject string.
+	Name string `json:"name,omitempty"`
+	// Subject and Issuer are the RFC 4514 name strings.
+	Subject string `json:"subject,omitempty"`
+	Issuer  string `json:"issuer,omitempty"`
+	// SerialNumber is lowercase hex without leading zeros.
+	SerialNumber string `json:"serialNumber,omitempty"`
+	// NotValidBefore and NotValidAfter are the validity bounds, RFC 3339 UTC.
+	NotValidBefore string `json:"notValidBefore,omitempty"`
+	NotValidAfter  string `json:"notValidAfter,omitempty"`
+	// Version is the X.509 version (1 or 3).
+	Version int `json:"version,omitempty"`
+	// SignatureAlgorithm is the issuer's signature algorithm ("SHA256-RSA",
+	// "ML-DSA-65"), or its dotted OID when unknown; SignatureAlgorithmOid is
+	// that OID.
+	SignatureAlgorithm    string `json:"signatureAlgorithm,omitempty"`
+	SignatureAlgorithmOid string `json:"signatureAlgorithmOid,omitempty"`
+	// CertSha256 is SHA-256 over the whole DER certificate; SpkiSha256 over
+	// the DER SubjectPublicKeyInfo. Both lowercase hex.
+	CertSha256 string `json:"certSha256,omitempty"`
+	SpkiSha256 string `json:"spkiSha256,omitempty"`
+	// SpkiSha256Base64 is the SPKI digest in the RFC 7469 pin-sha256 form.
+	SpkiSha256Base64 string `json:"spkiSha256Base64,omitempty"`
+	// KeyName names the public key algorithm and size ("RSA-2048",
+	// "ECDSA-P256", "Ed25519", "ML-DSA-65"), or is its dotted OID when
+	// unknown; KeyBits is its size in bits (absent for post-quantum keys);
+	// KeyAlgorithmOid is the SubjectPublicKeyInfo algorithm OID.
+	KeyName         string `json:"keyName,omitempty"`
+	KeyBits         int    `json:"keyBits,omitempty"`
+	KeyAlgorithmOid string `json:"keyAlgorithmOid,omitempty"`
+	// IsCA is the basicConstraints CA flag; SelfSigned means the subject and
+	// issuer DER are equal and the self-signature verifies.
+	// SelfSignedUnverified means the signature could not be checked and the
+	// certificate counts as self-signed because it is self-issued.
+	IsCA                 bool `json:"isCA,omitempty"`
+	SelfSigned           bool `json:"selfSigned,omitempty"`
+	SelfSignedUnverified bool `json:"selfSignedUnverified,omitempty"`
 }
 
 // CryptoOperation describes a single cryptographic operation observed via
