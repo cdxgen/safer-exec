@@ -1,0 +1,16 @@
+go/internal/tlsobserve/tlsobserve.go
+  h_0926447d100ad2 9-10,18,20,22,49-52,58-83,106-110,514-519,523-544,546-587,589-600,603,605-606,608,610
+go/internal/tlsobserve/tlsobserve_test.go
+  h_0926447d100ad2 4,9,13-14,16-17,141,175-179,181-452,454,466
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e010adf8be84fba4a3369eda23cbc9a183480978",
+  "prompts": {},
+  "humans": {
+    "h_0926447d100ad2": {
+      "author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
