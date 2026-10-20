@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
+	"github.com/cdxgen/safer-exec/go/internal/tlsobserve"
 )
 
 // cbomDoc is a CycloneDX CBOM. It uses only fields that CycloneDX 1.6 and 1.7
@@ -82,9 +83,10 @@ type cbomCertProps struct {
 
 // cbomRelatedMaterialProps describes a public key by SPKI.
 type cbomRelatedMaterialProps struct {
-	Type   string `json:"type"`
-	Size   int    `json:"size,omitempty"`
-	Format string `json:"format,omitempty"`
+	Type         string `json:"type"`
+	AlgorithmRef string `json:"algorithmRef,omitempty"`
+	Size         int    `json:"size,omitempty"`
+	Format       string `json:"format,omitempty"`
 }
 
 type cbomAlgoProps struct {
@@ -93,8 +95,9 @@ type cbomAlgoProps struct {
 	Mode                   string   `json:"mode,omitempty"`
 	CryptoFunctions        []string `json:"cryptoFunctions,omitempty"`
 	ClassicalSecurityLevel int      `json:"classicalSecurityLevel,omitempty"`
-	// NistQuantumSecurityLevel is set for ML-KEM (ML-KEM-512 is level 1,
-	// -768 level 3, -1024 level 5).
+	// NistQuantumSecurityLevel is set for the post-quantum algorithms
+	// (ML-KEM-512 is level 1, -768 level 3, -1024 level 5; ML-DSA and
+	// SLH-DSA likewise by parameter set).
 	NistQuantumSecurityLevel int `json:"nistQuantumSecurityLevel,omitempty"`
 }
 
@@ -267,8 +270,14 @@ func (b *cbomBuilder) certificate(e config.CertChainEntry) string {
 		{Name: "cdx:crypto:selfSigned", Value: strconv.FormatBool(e.SelfSigned)},
 		{Name: "cdx:crypto:isCA", Value: strconv.FormatBool(e.IsCA)},
 	}
+	if e.SelfSignedUnverified {
+		props = append(props, cbomProperty{Name: "cdx:crypto:selfSignedUnverified", Value: "true"})
+	}
 	if e.SignatureAlgorithm != "" {
 		props = append(props, cbomProperty{Name: "cdx:crypto:signatureAlgorithm", Value: e.SignatureAlgorithm})
+	}
+	if e.SignatureAlgorithmOid != "" {
+		props = append(props, cbomProperty{Name: "cdx:crypto:signatureAlgorithmOid", Value: e.SignatureAlgorithmOid})
 	}
 	props = append(props, cbomProperty{Name: "cdx:crypto:sourceType", Value: "observed-tls"})
 	return b.add(cbomComponent{
@@ -299,9 +308,18 @@ func publicKeyRef(e config.CertChainEntry) string {
 
 // publicKey adds the public-key component of a chain certificate's key and
 // returns its bom-ref. Cross-signed or re-issued certificates share the key
-// and therefore the component. The 1.7 fingerprint object has no 1.6
+// and therefore the component. algRef is the key's algorithm component, ""
+// when the algorithm is unknown. The 1.7 fingerprint object has no 1.6
 // counterpart, so the digest travels as properties.
-func (b *cbomBuilder) publicKey(e config.CertChainEntry) string {
+func (b *cbomBuilder) publicKey(e config.CertChainEntry, algRef string) string {
+	props := []cbomProperty{
+		{Name: "cdx:crypto:spkiSha256", Value: e.SpkiSha256},
+		{Name: "cdx:crypto:spkiSha256Base64", Value: e.SpkiSha256Base64},
+	}
+	if e.KeyAlgorithmOid != "" {
+		props = append(props, cbomProperty{Name: "cdx:crypto:publicKeyAlgorithmOid", Value: e.KeyAlgorithmOid})
+	}
+	props = append(props, cbomProperty{Name: "cdx:crypto:sourceType", Value: "certificate"})
 	return b.add(cbomComponent{
 		Type:   "cryptographic-asset",
 		BomRef: publicKeyRef(e),
@@ -309,16 +327,13 @@ func (b *cbomBuilder) publicKey(e config.CertChainEntry) string {
 		CryptoProperties: &cbomCryptoProps{
 			AssetType: "related-crypto-material",
 			RelatedCryptoMaterialProps: &cbomRelatedMaterialProps{
-				Type:   "public-key",
-				Size:   e.KeyBits,
-				Format: "SPKI",
+				Type:         "public-key",
+				AlgorithmRef: algRef,
+				Size:         e.KeyBits,
+				Format:       "SPKI",
 			},
 		},
-		Properties: []cbomProperty{
-			{Name: "cdx:crypto:spkiSha256", Value: e.SpkiSha256},
-			{Name: "cdx:crypto:spkiSha256Base64", Value: e.SpkiSha256Base64},
-			{Name: "cdx:crypto:sourceType", Value: "certificate"},
-		},
+		Properties: props,
 	})
 }
 
@@ -350,11 +365,12 @@ func encodeURIComponent(s string) string {
 	return sb.String()
 }
 
-// certRole classifies a chain certificate: a self-signed CA is a root, any
-// other CA an intermediate, everything else a leaf.
+// certRole classifies a chain certificate: a self-signed CA (or version 1
+// certificate, which has no CA flag) is a root, any other CA an
+// intermediate, everything else a leaf.
 func certRole(e config.CertChainEntry) string {
 	switch {
-	case e.IsCA && e.SelfSigned:
+	case e.SelfSigned && (e.IsCA || e.Version == 1):
 		return "root"
 	case e.IsCA:
 		return "intermediate"
@@ -419,8 +435,8 @@ func buildCBOM(r *config.CryptoResult) cbomDoc {
 		for _, a := range groupAlgorithms(c.Group) {
 			addRef(b.algorithm(a))
 		}
-		if c.ServerKey != "" {
-			addRef(b.algorithm(serverKeyAlgorithm(c.ServerKey)))
+		if a, ok := keyAlgorithm(c.ServerKey); ok {
+			addRef(b.algorithm(a))
 		}
 
 		var protoRef string
@@ -474,7 +490,11 @@ func buildCBOM(r *config.CryptoResult) cbomDoc {
 			var chainRefs []string
 			for _, e := range c.Chain {
 				certRef := b.certificate(e)
-				keyRef := b.publicKey(e)
+				var algRef string
+				if a, ok := keyAlgorithm(e.KeyName); ok {
+					algRef = b.algorithm(a)
+				}
+				keyRef := b.publicKey(e, algRef)
 				if c.Host != "" {
 					b.occur(certRef, "tls://"+c.Host)
 					b.occur(keyRef, "tls://"+c.Host)
@@ -636,13 +656,33 @@ func groupAlgorithms(group string) []cbomAlgorithm {
 	return append([]cbomAlgorithm{curve}, out...)
 }
 
-// serverKeyAlgorithm describes a server certificate key ("RSA-2048",
-// "ECDSA-P-256", "Ed25519"), which signs the TLS 1.2 key exchange.
-func serverKeyAlgorithm(key string) cbomAlgorithm {
+// keyAlgorithm describes the algorithm of a certificate key: the server key
+// that signs a TLS 1.2 key exchange ("RSA-2048", "ECDSA-P-256", "Ed25519")
+// or a presented chain certificate's key ("ECDSA-P256" is named as the
+// server key form, so both share one component). Post-quantum keys carry
+// their OID, parameter set and NIST level. A key named by a dotted OID, or
+// not named at all, has no algorithm component.
+func keyAlgorithm(key string) (cbomAlgorithm, bool) {
+	if pq, ok := tlsobserve.PostQuantumAlgorithm(key); ok {
+		fns := []string{"verify"}
+		if pq.Primitive == "kem" {
+			fns = []string{"encapsulate"}
+		}
+		return cbomAlgorithm{name: pq.Name, oid: pq.OID, props: cbomAlgoProps{
+			Primitive: pq.Primitive, ParameterSetIdentifier: pq.ParameterSet, CryptoFunctions: fns,
+			NistQuantumSecurityLevel: pq.NISTLevel,
+		}}, true
+	}
+	if key == "" || strings.Trim(key, "0123456789.") == "" {
+		return cbomAlgorithm{}, false
+	}
+	if bits, ok := strings.CutPrefix(key, "ECDSA-P"); ok && !strings.HasPrefix(bits, "-") {
+		key = "ECDSA-P-" + bits
+	}
 	family, params, _ := strings.Cut(key, "-")
 	return cbomAlgorithm{name: key, oid: algorithmOIDs[family], props: cbomAlgoProps{
 		Primitive: "signature", ParameterSetIdentifier: params, CryptoFunctions: []string{"verify"},
-	}}
+	}}, true
 }
 
 // writeCBOMFile writes the CBOM of a run's crypto observations to path.

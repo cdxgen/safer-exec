@@ -658,8 +658,13 @@ type CertChainEntry struct {
 	// NotValidBefore and NotValidAfter are the validity bounds, RFC 3339 UTC.
 	NotValidBefore string `json:"notValidBefore,omitempty"`
 	NotValidAfter  string `json:"notValidAfter,omitempty"`
-	// SignatureAlgorithm is the issuer's signature algorithm ("SHA256-RSA").
-	SignatureAlgorithm string `json:"signatureAlgorithm,omitempty"`
+	// Version is the X.509 version (1 or 3).
+	Version int `json:"version,omitempty"`
+	// SignatureAlgorithm is the issuer's signature algorithm ("SHA256-RSA",
+	// "ML-DSA-65"), or its dotted OID when unknown; SignatureAlgorithmOid is
+	// that OID.
+	SignatureAlgorithm    string `json:"signatureAlgorithm,omitempty"`
+	SignatureAlgorithmOid string `json:"signatureAlgorithmOid,omitempty"`
 	// CertSha256 is SHA-256 over the whole DER certificate; SpkiSha256 over
 	// the DER SubjectPublicKeyInfo. Both lowercase hex.
 	CertSha256 string `json:"certSha256,omitempty"`
@@ -667,13 +672,19 @@ type CertChainEntry struct {
 	// SpkiSha256Base64 is the SPKI digest in the RFC 7469 pin-sha256 form.
 	SpkiSha256Base64 string `json:"spkiSha256Base64,omitempty"`
 	// KeyName names the public key algorithm and size ("RSA-2048",
-	// "ECDSA-P256", "Ed25519"); KeyBits is its size in bits.
-	KeyName string `json:"keyName,omitempty"`
-	KeyBits int    `json:"keyBits,omitempty"`
+	// "ECDSA-P256", "Ed25519", "ML-DSA-65"), or is its dotted OID when
+	// unknown; KeyBits is its size in bits (absent for post-quantum keys);
+	// KeyAlgorithmOid is the SubjectPublicKeyInfo algorithm OID.
+	KeyName         string `json:"keyName,omitempty"`
+	KeyBits         int    `json:"keyBits,omitempty"`
+	KeyAlgorithmOid string `json:"keyAlgorithmOid,omitempty"`
 	// IsCA is the basicConstraints CA flag; SelfSigned means the subject and
 	// issuer DER are equal and the self-signature verifies.
-	IsCA       bool `json:"isCA,omitempty"`
-	SelfSigned bool `json:"selfSigned,omitempty"`
+	// SelfSignedUnverified means the signature could not be checked and the
+	// certificate counts as self-signed because it is self-issued.
+	IsCA                 bool `json:"isCA,omitempty"`
+	SelfSigned           bool `json:"selfSigned,omitempty"`
+	SelfSignedUnverified bool `json:"selfSignedUnverified,omitempty"`
 }
 
 // CryptoOperation describes a single cryptographic operation observed via

@@ -408,7 +408,11 @@ identities using eBPF uretprobes on OpenSSL/GnuTLS cipher negotiation functions.
    hybrid groups split into their curve and ML-KEM, TLS protocols whose
    suites refer to algorithms by bom-ref, and the certificates and public keys
    of presented TLS ≤ 1.2 chains (bom-refs as cdxgen builds them, so keep
-   `encodeURIComponent` in step with JavaScript's). `cbom_test.go` validates it against
+   `encodeURIComponent` in step with JavaScript's). Post-quantum certificate
+   algorithms are named from `pqAlgorithms` in `internal/tlsobserve/names.go`
+   by OID, never from `crypto/x509`, whose coverage varies by Go release;
+   extend that table (and `testdata/pqc/gen.sh`) when a new one is
+   standardised. `cbom_test.go` validates it against
    the schemas vendored in `cmd/safer-exec/testdata/cyclonedx`; keep it
    passing when adding fields, and add an OID for any new algorithm name.
 

@@ -17,9 +17,12 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -71,8 +74,12 @@ type ChainCert struct {
 	SerialNumber string
 	// NotValidBefore and NotValidAfter are the validity bounds, RFC 3339 UTC.
 	NotValidBefore, NotValidAfter string
-	// SignatureAlgorithm is the issuer's signature algorithm ("SHA256-RSA").
-	SignatureAlgorithm string
+	// Version is the X.509 version (1 or 3).
+	Version int
+	// SignatureAlgorithm is the issuer's signature algorithm ("SHA256-RSA",
+	// "ML-DSA-65"), or its dotted OID when unknown; SignatureAlgorithmOid is
+	// that OID.
+	SignatureAlgorithm, SignatureAlgorithmOid string
 	// CertSha256 is SHA-256 over the whole DER certificate; SpkiSha256 over
 	// the DER SubjectPublicKeyInfo. Both lowercase hex.
 	CertSha256, SpkiSha256 string
@@ -80,13 +87,17 @@ type ChainCert struct {
 	// (standard base64 of the same digest bytes).
 	SpkiSha256Base64 string
 	// KeyName names the public key algorithm and size ("RSA-2048",
-	// "ECDSA-P256", "Ed25519"); KeyBits is its size in bits, 0 when the
-	// algorithm has no meaningful size.
-	KeyName string
-	KeyBits int
+	// "ECDSA-P256", "Ed25519", "ML-DSA-65"), or is its dotted OID when
+	// unknown; KeyBits is its size in bits, 0 for post-quantum and unknown
+	// keys; KeyAlgorithmOid is the SubjectPublicKeyInfo algorithm OID.
+	KeyName         string
+	KeyBits         int
+	KeyAlgorithmOid string
 	// IsCA is the basicConstraints CA flag. SelfSigned means the subject and
-	// issuer DER are equal and the self-signature verifies.
-	IsCA, SelfSigned bool
+	// issuer DER are equal and the self-signature verifies;
+	// SelfSignedUnverified that the signature could not be checked and the
+	// certificate counts as self-signed because it is self-issued.
+	IsCA, SelfSigned, SelfSignedUnverified bool
 }
 
 const (
@@ -544,7 +555,7 @@ func parseCertificate(body []byte, hs *Handshake) {
 			return
 		}
 		if leaf {
-			hs.CertSignature = cert.SignatureAlgorithm.String()
+			hs.CertSignature, _ = signatureAlgorithmID(cert)
 			hs.ServerKey = serverKeyString(cert)
 		}
 		if total > maxChainBytes {
@@ -561,7 +572,7 @@ func serverKeyString(cert *x509.Certificate) string {
 	if k, ok := cert.PublicKey.(*ecdsa.PublicKey); ok {
 		return "ECDSA-" + k.Curve.Params().Name
 	}
-	name, _ := publicKeyID(cert)
+	name, _, _ := publicKeyID(cert)
 	return name
 }
 
@@ -570,23 +581,54 @@ func serverKeyString(cert *x509.Certificate) string {
 func chainCert(cert *x509.Certificate) ChainCert {
 	certSum := sha256.Sum256(cert.Raw)
 	spkiSum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
-	name, bits := publicKeyID(cert)
+	keyName, keyBits, keyOID := publicKeyID(cert)
+	sigName, sigOID := signatureAlgorithmID(cert)
+	self, unverified := selfSigned(cert)
 	return ChainCert{
-		Name:               certName(cert),
-		Subject:            cert.Subject.String(),
-		Issuer:             cert.Issuer.String(),
-		SerialNumber:       cert.SerialNumber.Text(16),
-		NotValidBefore:     cert.NotBefore.UTC().Format(time.RFC3339),
-		NotValidAfter:      cert.NotAfter.UTC().Format(time.RFC3339),
-		SignatureAlgorithm: cert.SignatureAlgorithm.String(),
-		CertSha256:         hex.EncodeToString(certSum[:]),
-		SpkiSha256:         hex.EncodeToString(spkiSum[:]),
-		SpkiSha256Base64:   base64.StdEncoding.EncodeToString(spkiSum[:]),
-		KeyName:            name,
-		KeyBits:            bits,
-		IsCA:               cert.IsCA,
-		SelfSigned:         bytes.Equal(cert.RawSubject, cert.RawIssuer) && cert.CheckSignatureFrom(cert) == nil,
+		Name:                  certName(cert),
+		Subject:               cert.Subject.String(),
+		Issuer:                cert.Issuer.String(),
+		SerialNumber:          cert.SerialNumber.Text(16),
+		NotValidBefore:        cert.NotBefore.UTC().Format(time.RFC3339),
+		NotValidAfter:         cert.NotAfter.UTC().Format(time.RFC3339),
+		Version:               cert.Version,
+		SignatureAlgorithm:    sigName,
+		SignatureAlgorithmOid: sigOID,
+		CertSha256:            hex.EncodeToString(certSum[:]),
+		SpkiSha256:            hex.EncodeToString(spkiSum[:]),
+		SpkiSha256Base64:      base64.StdEncoding.EncodeToString(spkiSum[:]),
+		KeyName:               keyName,
+		KeyBits:               keyBits,
+		KeyAlgorithmOid:       keyOID,
+		IsCA:                  cert.IsCA,
+		SelfSigned:            self,
+		SelfSignedUnverified:  unverified,
 	}
+}
+
+// selfSigned reports whether cert signed itself: its subject and issuer are
+// the same name and the signature verifies under its own key. CheckSignature
+// is used, not CheckSignatureFrom, which also refuses SHA-1 signatures and
+// signers that are not CAs. When the signature cannot be checked (an
+// algorithm this Go release does not implement, or MD5), a self-issued
+// certificate — equal names, and an authority key identifier that is absent
+// or equals the subject key identifier — counts as self-signed, unverified.
+func selfSigned(cert *x509.Certificate) (signed, unverified bool) {
+	if !bytes.Equal(cert.RawSubject, cert.RawIssuer) {
+		return false, false
+	}
+	err := cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature)
+	if err == nil {
+		return true, false
+	}
+	var insecure x509.InsecureAlgorithmError
+	if !errors.Is(err, x509.ErrUnsupportedAlgorithm) && !errors.As(err, &insecure) {
+		return false, false
+	}
+	if len(cert.AuthorityKeyId) > 0 && !bytes.Equal(cert.AuthorityKeyId, cert.SubjectKeyId) {
+		return false, false
+	}
+	return true, true
 }
 
 // certName is the certificate's component name: the subject CN, else the
@@ -604,20 +646,57 @@ func certName(cert *x509.Certificate) string {
 }
 
 // publicKeyID names a certificate's public key the way a CBOM public-key
-// component does ("RSA-2048", "ECDSA-P256", "Ed25519"), with its size in
-// bits (0 when the algorithm has no meaningful size).
-func publicKeyID(cert *x509.Certificate) (string, int) {
+// component does ("RSA-2048", "ECDSA-P256", "Ed25519", "ML-DSA-65"), with
+// its size in bits (0 for post-quantum and unknown keys) and the dotted OID
+// of its SubjectPublicKeyInfo algorithm. Post-quantum keys are named from
+// that OID, so the name does not depend on what this Go release parses; a
+// key no name is known for is named by the OID itself.
+func publicKeyID(cert *x509.Certificate) (name string, bits int, oid string) {
+	var spki struct {
+		Algorithm pkix.AlgorithmIdentifier
+		Key       asn1.BitString
+	}
+	if _, err := asn1.Unmarshal(cert.RawSubjectPublicKeyInfo, &spki); err == nil {
+		oid = spki.Algorithm.Algorithm.String()
+	}
+	if a, ok := pqAlgorithmByOID(oid); ok {
+		return a.Name, 0, oid
+	}
 	switch k := cert.PublicKey.(type) {
 	case *rsa.PublicKey:
-		return fmt.Sprintf("RSA-%d", k.N.BitLen()), k.N.BitLen()
+		return fmt.Sprintf("RSA-%d", k.N.BitLen()), k.N.BitLen(), oid
 	case *ecdsa.PublicKey:
 		bits := k.Curve.Params().BitSize
-		return fmt.Sprintf("ECDSA-P%d", bits), bits
+		return fmt.Sprintf("ECDSA-P%d", bits), bits, oid
 	case ed25519.PublicKey:
-		return "Ed25519", 256
-	default:
-		return cert.PublicKeyAlgorithm.String(), 0
+		return "Ed25519", 256, oid
 	}
+	if cert.PublicKeyAlgorithm != x509.UnknownPublicKeyAlgorithm || oid == "" {
+		return cert.PublicKeyAlgorithm.String(), 0, oid
+	}
+	return oid, 0, oid
+}
+
+// signatureAlgorithmID names the algorithm a certificate is signed with
+// ("SHA256-RSA", "ML-DSA-44") and returns the dotted OID of its outer
+// signatureAlgorithm. As with keys, post-quantum algorithms are named from
+// the OID, and an algorithm no name is known for is named by the OID.
+func signatureAlgorithmID(cert *x509.Certificate) (name, oid string) {
+	var c struct {
+		TBS       asn1.RawValue
+		Algorithm pkix.AlgorithmIdentifier
+		Signature asn1.BitString
+	}
+	if _, err := asn1.Unmarshal(cert.Raw, &c); err == nil {
+		oid = c.Algorithm.Algorithm.String()
+	}
+	if a, ok := pqAlgorithmByOID(oid); ok {
+		return a.Name, oid
+	}
+	if cert.SignatureAlgorithm != x509.UnknownSignatureAlgorithm || oid == "" {
+		return cert.SignatureAlgorithm.String(), oid
+	}
+	return oid, oid
 }
 
 func parseServerKeyExchange(body []byte, hs *Handshake) {
