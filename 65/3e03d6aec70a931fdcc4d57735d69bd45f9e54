@@ -1,0 +1,16 @@
+go/cmd/safer-exec/cbom.go
+  h_0926447d100ad2 42,46-53,63-84,253-322,425-438
+go/cmd/safer-exec/cbom_test.go
+  h_0926447d100ad2 4-12,16-17,24,26,37-42,60-61,63-64,82-176,192,203,315-410
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "653e03d6aec70a931fdcc4d57735d69bd45f9e54",
+  "prompts": {},
+  "humans": {
+    "h_0926447d100ad2": {
+      "author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
