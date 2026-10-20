@@ -1166,6 +1166,8 @@ Enable opt-in capture of TLS cipher suites and cryptographic library identities 
 
 With `.proxyEgress()`, the egress proxy reads the cleartext start of every CONNECT tunnel as it forwards it, without terminating or altering the connection. The hello messages are not encrypted, even in TLS 1.3, so each connection's protocol version, cipher suite and key-exchange group are recorded whatever TLS library the program uses (OpenSSL, Schannel, Go, Rust, Java, Node.js). The group shows post-quantum readiness: a hybrid such as `X25519MLKEM768` is reported with `postQuantum: true`. Up to TLS 1.2 the server's certificate key (`serverKey`, e.g. `RSA-2048`) and signature algorithm are cleartext too; TLS 1.3 encrypts them. These entries carry `source: "proxy"` and `host` (the proxy target) and feed `result.crypto`, the `crypto-cipher` audit entries, `allowCiphers` checks and the CBOM. This is the only cipher source on macOS and Windows, and works on Linux without eBPF.
 
+Up to TLS 1.2 the observer also records the full certificate chain the server presented (`chain`, leaf first): each entry carries the subject and issuer names, the whole-certificate and SPKI SHA-256 hashes (lowercase hex, plus the base64 `pin-sha256` form of the SPKI digest), the key algorithm and size, and the CA and self-signed flags. The SPKI hash is the value SPKI pins and distrust lists key on — Go's CVE-2026-111943 intermediate distrust among them — so the chain answers "does this server present a certificate whose key is on the list". The chain is what the server sent, unverified: no signature is checked. It is bounded to 10 certificates and 64 KiB of certificate bytes; a malformed entry ends the chain where it stands. TLS 1.3 encrypts its Certificate message, so those connections record no chain. In the CBOM, each chain certificate becomes a certificate component (`crypto/certificate/<name>@sha256:<hash>`) and each distinct SPKI a public-key component (`crypto/public-key/<name>@spki-sha256:<hash>`), so cross-signed twins share one key component; both are linked from the TLS protocol component.
+
 On Windows, `traceCrypto` also records crypto DLLs the workload loads (CNG, Schannel, CryptoAPI providers, and bundled OpenSSL, GnuTLS, wolfSSL, libsodium, NSS and others) with their file versions, from the same ETW session as `traceLibraries` (an elevated process is needed). Programs that build their TLS stack in (Node.js, Go, Rust, Java) load no crypto DLL; their connections still appear through the proxy.
 
 ### Unified Socket-Level Handshake & SNI Fallback Tracing
@@ -1404,7 +1406,23 @@ When `--cbom-output` / `.cbom(path)` is set, the engine writes a [CycloneDX](htt
 | `serverName`     | `string`  | SNI the client sent                                                 |
 | `serverKey`      | `string`  | Server certificate key (`"RSA-2048"`), TLS 1.2 and earlier          |
 | `certSignature`  | `string`  | Server certificate signature algorithm, TLS 1.2 and earlier         |
+| `chain`          | `CertChainEntry[]` | Certificates the server presented, leaf first, TLS 1.2 and earlier |
 | `source`         | `string`  | `"proxy"` for handshakes the egress proxy read                      |
+
+**`CertChainEntry` fields** (one certificate of a presented chain):
+
+| Field              | Type      | Description                                                              |
+| ------------------ | --------- | ------------------------------------------------------------------------ |
+| `name`             | `string`  | Subject CN, else the first subject RDN value, else the subject string    |
+| `subject`          | `string`  | Subject name (RFC 4514 string)                                           |
+| `issuer`           | `string`  | Issuer name (RFC 4514 string)                                            |
+| `certSha256`       | `string`  | SHA-256 over the whole DER certificate, lowercase hex                   |
+| `spkiSha256`       | `string`  | SHA-256 over the DER SubjectPublicKeyInfo, lowercase hex                 |
+| `spkiSha256Base64` | `string`  | The SPKI digest as standard base64 (the RFC 7469 `pin-sha256` form)     |
+| `keyName`          | `string`  | Public key algorithm and size (`"RSA-2048"`, `"ECDSA-P256"`, `"Ed25519"`) |
+| `keyBits`          | `number`  | Public key size in bits                                                  |
+| `isCA`             | `boolean` | basicConstraints CA flag                                                 |
+| `selfSigned`       | `boolean` | Subject equals issuer and the self-signature verifies                    |
 
 ## URL Access-Control Rules (`allowUrls` / `--allow-url`)
 
