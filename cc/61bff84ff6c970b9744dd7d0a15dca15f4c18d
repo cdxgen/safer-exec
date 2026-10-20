@@ -1,0 +1,18 @@
+go/cmd/safer-exec/proxy.go
+  h_0926447d100ad2 249-251,254-258,290-303
+go/cmd/safer-exec/proxy_test.go
+  h_0926447d100ad2 5-8,10-12,15,26,523-667
+go/internal/config/config.go
+  h_0926447d100ad2 637-640,645-670
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cc61bff84ff6c970b9744dd7d0a15dca15f4c18d",
+  "prompts": {},
+  "humans": {
+    "h_0926447d100ad2": {
+      "author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
