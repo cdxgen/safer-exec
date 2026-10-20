@@ -1,0 +1,45 @@
+go/internal/tlsobserve/tlsobserve.go
+  s_52f5c4eaf6e6b7::t_e56a6bb9de2217 26
+  s_52f5c4eaf6e6b7::t_ac68087f5b46ab 62-63,70-75
+  s_52f5c4eaf6e6b7::t_3b9d379ff25154 527-528,532-533,538-539,546,550-552,557-559,561,564-565,575-588
+go/internal/tlsobserve/tlsobserve_test.go
+  s_52f5c4eaf6e6b7::t_3e3baadbcccadb 293-296,347,349,365-414,464
+README.md
+  s_52f5c4eaf6e6b7::t_9ad3fd2f33a76d 1390-1412,1416-1431
+  s_52f5c4eaf6e6b7::t_22acdebbbf546c 1169,1316-1318
+go/cmd/safer-exec/pki_test.go
+  s_52f5c4eaf6e6b7::t_0e5b760c14d276 1-53
+go/cmd/safer-exec/proxy_test.go
+  s_52f5c4eaf6e6b7::t_9133fc94da3a1e 523-526
+go/cmd/safer-exec/cbom.go
+  s_52f5c4eaf6e6b7::t_85a12eb9b43991 470-473,478-481
+  s_52f5c4eaf6e6b7::t_0c96186e011d13 75-80
+  s_52f5c4eaf6e6b7::t_91c66af8477ec2 260-261,263-273,276,282-287,290,294-299,301-303,307,320,325-351
+  s_52f5c4eaf6e6b7::t_a19a994cd49abf 352
+AGENTS.md
+  s_52f5c4eaf6e6b7::t_22acdebbbf546c 64,408-411
+go/cmd/safer-exec/cbom_test.go
+  s_52f5c4eaf6e6b7::t_446e1b07dbf74f 129,281-283,285-288,293-307,309-313,316,318,327-336,339-345,351-353,355,360,363,376-378,383-385,395-399,401-415,424,427
+  s_52f5c4eaf6e6b7::t_78163587ad96bd 32-34,36,55,58,76-80,82-88,92,100-113,119-128
+  s_52f5c4eaf6e6b7::t_d963668b643229 130
+go/internal/config/config.go
+  s_52f5c4eaf6e6b7::t_baf9e36989f1f7 647-648,656-662
+go/cmd/safer-exec/proxy.go
+  s_52f5c4eaf6e6b7::t_6b18a286a09d7b 291
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9ccf077257aacf9b76933a7a77bef92f571b3a32",
+  "prompts": {},
+  "sessions": {
+    "s_52f5c4eaf6e6b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6df25678-2bd9-411d-a772-3a7751696245",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
