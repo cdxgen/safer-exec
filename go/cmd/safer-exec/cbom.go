@@ -39,7 +39,16 @@ type cbomComponent struct {
 	Name             string           `json:"name"`
 	Version          string           `json:"version,omitempty"`
 	CryptoProperties *cbomCryptoProps `json:"cryptoProperties,omitempty"`
+	Properties       []cbomProperty   `json:"properties,omitempty"`
 	Evidence         *cbomEvidence    `json:"evidence,omitempty"`
+}
+
+// cbomProperty is a CycloneDX name/value property. The certificate and
+// public-key components carry their hashes and role as cdx:crypto:
+// properties, the fields the 1.6 and 1.7 schemas share.
+type cbomProperty struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 type cbomEvidence struct {
@@ -51,10 +60,28 @@ type cbomOccurrence struct {
 }
 
 type cbomCryptoProps struct {
-	AssetType           string          `json:"assetType"`
-	AlgorithmProperties *cbomAlgoProps  `json:"algorithmProperties,omitempty"`
-	ProtocolProperties  *cbomProtoProps `json:"protocolProperties,omitempty"`
-	OID                 string          `json:"oid,omitempty"`
+	AssetType                  string                    `json:"assetType"`
+	AlgorithmProperties        *cbomAlgoProps            `json:"algorithmProperties,omitempty"`
+	ProtocolProperties         *cbomProtoProps           `json:"protocolProperties,omitempty"`
+	CertificateProperties      *cbomCertProps            `json:"certificateProperties,omitempty"`
+	RelatedCryptoMaterialProps *cbomRelatedMaterialProps `json:"relatedCryptoMaterialProperties,omitempty"`
+	OID                        string                    `json:"oid,omitempty"`
+}
+
+// cbomCertProps holds the certificate fields the 1.6 and 1.7 schemas share
+// (1.7 adds serialNumber, the fingerprint object and certificateExtensions,
+// which the hashes in version, the bom-ref and the properties stand in for).
+type cbomCertProps struct {
+	SubjectName       string `json:"subjectName,omitempty"`
+	IssuerName        string `json:"issuerName,omitempty"`
+	CertificateFormat string `json:"certificateFormat,omitempty"`
+}
+
+// cbomRelatedMaterialProps describes a public key by SPKI.
+type cbomRelatedMaterialProps struct {
+	Type   string `json:"type"`
+	Size   int    `json:"size,omitempty"`
+	Format string `json:"format,omitempty"`
 }
 
 type cbomAlgoProps struct {
@@ -223,6 +250,76 @@ func (b *cbomBuilder) library(name, version, path string) string {
 	return b.add(c)
 }
 
+// certificate adds a presented chain certificate as a certificate component
+// and returns its bom-ref, crypto/certificate/<name>@sha256:<certSha256>.
+// The whole-DER hash doubles as the version and the cdx:crypto:fingerprint
+// property; the SPKI hash is what distrust lists (Go's CVE-2026-111943 set)
+// and pins match on. Fields the observed chain cannot fill — occurrences,
+// validity, serial, extensions — are left out rather than invented.
+func (b *cbomBuilder) certificate(e config.CertChainEntry) string {
+	ref := "crypto/certificate/" + url.PathEscape(e.Name) + "@sha256:" + e.CertSha256
+	return b.add(cbomComponent{
+		Type:    "cryptographic-asset",
+		BomRef:  ref,
+		Name:    e.Name,
+		Version: e.CertSha256,
+		CryptoProperties: &cbomCryptoProps{
+			AssetType: "certificate",
+			CertificateProperties: &cbomCertProps{
+				SubjectName:       e.Subject,
+				IssuerName:        e.Issuer,
+				CertificateFormat: "X.509",
+			},
+		},
+		Properties: []cbomProperty{
+			{Name: "cdx:crypto:spkiSha256", Value: e.SpkiSha256},
+			{Name: "cdx:crypto:fingerprint", Value: e.CertSha256},
+			{Name: "cdx:crypto:certRole", Value: certRole(e)},
+			{Name: "cdx:crypto:selfSigned", Value: strconv.FormatBool(e.SelfSigned)},
+			{Name: "cdx:crypto:isCA", Value: strconv.FormatBool(e.IsCA)},
+		},
+	})
+}
+
+// publicKey adds the public-key component of a chain certificate's key and
+// returns its bom-ref, crypto/public-key/<name>@spki-sha256:<spkiSha256>.
+// Cross-signed or re-issued certificates share the key and therefore the
+// component. The 1.7 fingerprint object has no 1.6 counterpart, so the digest
+// travels as properties.
+func (b *cbomBuilder) publicKey(e config.CertChainEntry) string {
+	ref := "crypto/public-key/" + url.PathEscape(e.KeyName) + "@spki-sha256:" + e.SpkiSha256
+	return b.add(cbomComponent{
+		Type:   "cryptographic-asset",
+		BomRef: ref,
+		Name:   e.KeyName,
+		CryptoProperties: &cbomCryptoProps{
+			AssetType: "related-crypto-material",
+			RelatedCryptoMaterialProps: &cbomRelatedMaterialProps{
+				Type:   "public-key",
+				Size:   e.KeyBits,
+				Format: "SPKI",
+			},
+		},
+		Properties: []cbomProperty{
+			{Name: "cdx:crypto:spkiSha256", Value: e.SpkiSha256},
+			{Name: "cdx:crypto:spkiSha256Base64", Value: e.SpkiSha256Base64},
+		},
+	})
+}
+
+// certRole classifies a chain certificate: a self-signed CA is a root, any
+// other CA an intermediate, everything else a leaf.
+func certRole(e config.CertChainEntry) string {
+	switch {
+	case e.IsCA && e.SelfSigned:
+		return "root"
+	case e.IsCA:
+		return "intermediate"
+	default:
+		return "leaf"
+	}
+}
+
 func (b *cbomBuilder) provide(libRef string, refs ...string) {
 	for _, r := range refs {
 		if !slices.Contains(b.provides[libRef], r) {
@@ -324,6 +421,20 @@ func buildCBOM(r *config.CryptoResult) cbomDoc {
 				if !slices.Contains(props.CipherSuites[i].Algorithms, ref) {
 					props.CipherSuites[i].Algorithms = append(props.CipherSuites[i].Algorithms, ref)
 				}
+			}
+
+			// The chain the server presented (TLS ≤ 1.2) becomes certificate
+			// and public-key components linked from this protocol component;
+			// a key shared by cross-signed twins is one component.
+			var chainRefs []string
+			for _, e := range c.Chain {
+				certRef := b.certificate(e)
+				keyRef := b.publicKey(e)
+				b.provide(certRef, keyRef)
+				chainRefs = append(chainRefs, certRef, keyRef)
+			}
+			if len(chainRefs) > 0 {
+				b.provide(protoRef, chainRefs...)
 			}
 		}
 
