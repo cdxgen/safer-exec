@@ -1,0 +1,18 @@
+go/cmd/safer-exec/main.go
+  h_0926447d100ad2 45
+npm/package-lock.json
+  h_0926447d100ad2 3,9,18-23
+npm/package.json
+  h_0926447d100ad2 3,51-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4b7cea6efac4f928136c350ac5c6c27aa7422806",
+  "prompts": {},
+  "humans": {
+    "h_0926447d100ad2": {
+      "author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
