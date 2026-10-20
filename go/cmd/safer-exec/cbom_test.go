@@ -408,6 +408,25 @@ func TestCBOMCertificateAndPublicKeyComponents(t *testing.T) {
 	}
 }
 
+// Building the CBOM twice from the same observations yields identical bytes
+// once the metadata timestamp is set aside: no map-iteration order reaches
+// the output.
+func TestCBOMDeterministic(t *testing.T) {
+	docs := make([][]byte, 2)
+	for i := range docs {
+		doc := buildCBOM(cbomFixture(t))
+		doc.Metadata.Timestamp = ""
+		data, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		docs[i] = data
+	}
+	if !bytes.Equal(docs[0], docs[1]) {
+		t.Fatal("two builds of the same result differ")
+	}
+}
+
 // The validator must catch what the CBOM of safer-exec 1.1.1 got wrong, or a
 // pass above would mean nothing.
 func TestCycloneDXValidatorRejectsInvalidCBOM(t *testing.T) {
