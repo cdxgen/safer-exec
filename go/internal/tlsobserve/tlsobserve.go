@@ -6,7 +6,8 @@
 // can learn the negotiated protocol version, cipher suite and key-exchange
 // group (including post-quantum hybrids) of every connection the workload
 // makes, whatever TLS library it uses. Up to TLS 1.2 the server's certificate
-// and key exchange are cleartext too; TLS 1.3 encrypts them.
+// and key exchange are cleartext too, so the whole certificate chain the
+// server presented is recorded; TLS 1.3 encrypts them.
 package tlsobserve
 
 import (
@@ -14,8 +15,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"sync"
@@ -42,9 +46,39 @@ type Handshake struct {
 	// CertSignature is the server certificate's signature algorithm
 	// ("SHA256-RSA"); TLS 1.2 and earlier only.
 	CertSignature string
+	// Chain records every certificate of the server's TLS ≤ 1.2 certificate
+	// list, the leaf first. TLS 1.3 encrypts the Certificate message, so no
+	// chain is recorded there. It is what the server sent, unverified.
+	Chain []ChainCert
 	// Resumed is set when a TLS 1.2 session was resumed (no certificate or
 	// key exchange is sent).
 	Resumed bool
+}
+
+// ChainCert is one certificate of the chain a server presented. The hashes
+// identify the certificate for SPKI-based distrust lists: SpkiSha256 is the
+// same digest Go's crypto/x509 distrust list (CVE-2026-111943) and SPKI pins
+// are built from.
+type ChainCert struct {
+	// Name is the certificate's component name: the subject CN, else the
+	// first subject RDN value, else the subject string.
+	Name string
+	// Subject and Issuer are the RFC 4514 name strings.
+	Subject, Issuer string
+	// CertSha256 is SHA-256 over the whole DER certificate; SpkiSha256 over
+	// the DER SubjectPublicKeyInfo. Both lowercase hex.
+	CertSha256, SpkiSha256 string
+	// SpkiSha256Base64 is the SPKI digest in the RFC 7469 pin-sha256 form
+	// (standard base64 of the same digest bytes).
+	SpkiSha256Base64 string
+	// KeyName names the public key algorithm and size ("RSA-2048",
+	// "ECDSA-P256", "Ed25519"); KeyBits is its size in bits, 0 when the
+	// algorithm has no meaningful size.
+	KeyName string
+	KeyBits int
+	// IsCA is the basicConstraints CA flag. SelfSigned means the subject and
+	// issuer DER are equal and the self-signature verifies.
+	IsCA, SelfSigned bool
 }
 
 const (
@@ -69,6 +103,11 @@ const (
 	// cleartext messages by then is not followed further.
 	clientLimit = 64 << 10
 	serverLimit = 256 << 10
+
+	// Bounds on the server certificate chain: at most maxChainCerts entries
+	// and maxChainBytes of certificate bytes are turned into chain records.
+	maxChainCerts = 10
+	maxChainBytes = 64 << 10
 )
 
 // helloRetryRandom is the ServerHello random of a TLS 1.3 HelloRetryRequest.
@@ -472,27 +511,103 @@ func parseServerHello(body []byte, hs *Handshake) (retry, ok bool) {
 	return retry, true
 }
 
+// parseCertificate walks a TLS ≤ 1.2 Certificate message (RFC 5246 §7.4.2):
+// a 3-byte-length-prefixed certificate_list of 3-byte-length-prefixed DER
+// certificates, the server's own first. Every entry becomes a chain record
+// until a bound (maxChainCerts entries, maxChainBytes of certificate bytes)
+// or a malformed entry stops the walk, which keeps what already parsed. The
+// first certificate also fills ServerKey and CertSignature.
 func parseCertificate(body []byte, hs *Handshake) {
 	r := reader{b: body}
 	list := reader{b: r.n(r.u24())}
-	der := list.n(list.u24())
-	if list.bad || len(der) == 0 {
-		return
+	var total int
+	for !list.bad && len(list.b) > 0 {
+		if len(hs.Chain) >= maxChainCerts || total >= maxChainBytes {
+			return
+		}
+		der := list.n(list.u24())
+		if list.bad || len(der) == 0 {
+			return
+		}
+		total += len(der)
+		if total > maxChainBytes {
+			return
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			return
+		}
+		if len(hs.Chain) == 0 {
+			hs.CertSignature = cert.SignatureAlgorithm.String()
+			hs.ServerKey = serverKeyString(cert)
+		}
+		hs.Chain = append(hs.Chain, chainCert(cert))
 	}
-	cert, err := x509.ParseCertificate(der)
-	if err != nil {
-		return
-	}
-	hs.CertSignature = cert.SignatureAlgorithm.String()
+}
+
+// serverKeyString names a certificate's public key ("RSA-2048",
+// "ECDSA-P-256", "Ed25519").
+func serverKeyString(cert *x509.Certificate) string {
 	switch k := cert.PublicKey.(type) {
 	case *rsa.PublicKey:
-		hs.ServerKey = fmt.Sprintf("RSA-%d", k.N.BitLen())
+		return fmt.Sprintf("RSA-%d", k.N.BitLen())
 	case *ecdsa.PublicKey:
-		hs.ServerKey = "ECDSA-" + k.Curve.Params().Name
+		return "ECDSA-" + k.Curve.Params().Name
 	case ed25519.PublicKey:
-		hs.ServerKey = "Ed25519"
+		return "Ed25519"
 	default:
-		hs.ServerKey = cert.PublicKeyAlgorithm.String()
+		return cert.PublicKeyAlgorithm.String()
+	}
+}
+
+// chainCert records the identity fields and hashes of one presented
+// certificate.
+func chainCert(cert *x509.Certificate) ChainCert {
+	certSum := sha256.Sum256(cert.Raw)
+	spkiSum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+	name, bits := publicKeyID(cert)
+	return ChainCert{
+		Name:             certName(cert),
+		Subject:          cert.Subject.String(),
+		Issuer:           cert.Issuer.String(),
+		CertSha256:       hex.EncodeToString(certSum[:]),
+		SpkiSha256:       hex.EncodeToString(spkiSum[:]),
+		SpkiSha256Base64: base64.StdEncoding.EncodeToString(spkiSum[:]),
+		KeyName:          name,
+		KeyBits:          bits,
+		IsCA:             cert.IsCA,
+		SelfSigned:       bytes.Equal(cert.RawSubject, cert.RawIssuer) && cert.CheckSignatureFrom(cert) == nil,
+	}
+}
+
+// certName is the certificate's component name: the subject CN, else the
+// first subject RDN value, else the subject string.
+func certName(cert *x509.Certificate) string {
+	if cert.Subject.CommonName != "" {
+		return cert.Subject.CommonName
+	}
+	for _, atv := range cert.Subject.Names {
+		if s, ok := atv.Value.(string); ok && s != "" {
+			return s
+		}
+	}
+	return cert.Subject.String()
+}
+
+// publicKeyID names a certificate's public key the way a CBOM public-key
+// component does ("RSA-2048", "ECDSA-P256", "Ed25519"), with its size in
+// bits (0 when the algorithm has no meaningful size).
+func publicKeyID(cert *x509.Certificate) (string, int) {
+	switch k := cert.PublicKey.(type) {
+	case *rsa.PublicKey:
+		return fmt.Sprintf("RSA-%d", k.N.BitLen()), k.N.BitLen()
+	case *ecdsa.PublicKey:
+		bits := k.Curve.Params().BitSize
+		return fmt.Sprintf("ECDSA-P%d", bits), bits
+	case ed25519.PublicKey:
+		return "Ed25519", 256
+	default:
+		return cert.PublicKeyAlgorithm.String(), 0
 	}
 }
 
