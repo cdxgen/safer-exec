@@ -246,9 +246,16 @@ func (p *egressProxy) cipherSnapshot() []config.CipherInfo {
 }
 
 // recordTLS records one tunnel's handshake parameters once per distinct set.
+// The chain's certificate hashes are part of the key: two servers that agree
+// on every negotiated parameter but present different chains stay separate
+// entries.
 func (p *egressProxy) recordTLS(target string, h tlsobserve.Handshake) {
 	info := proxyCipherInfo(target, h)
-	key := strings.Join([]string{info.Host, info.ServerName, info.IANAName, info.Name, info.Protocol, info.Group, info.ServerKey}, "|")
+	keyParts := []string{info.Host, info.ServerName, info.IANAName, info.Name, info.Protocol, info.Group, info.ServerKey}
+	for _, cc := range info.Chain {
+		keyParts = append(keyParts, cc.CertSha256)
+	}
+	key := strings.Join(keyParts, "|")
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.cipherSeen[key] || len(p.ciphers) >= maxProxyCipherEntries {
@@ -279,6 +286,20 @@ func proxyCipherInfo(target string, h tlsobserve.Handshake) config.CipherInfo {
 		ServerKey:      h.ServerKey,
 		CertSignature:  h.CertSignature,
 		Source:         "proxy",
+	}
+	for _, cc := range h.Chain {
+		info.Chain = append(info.Chain, config.CertChainEntry{
+			Name:             cc.Name,
+			Subject:          cc.Subject,
+			Issuer:           cc.Issuer,
+			CertSha256:       cc.CertSha256,
+			SpkiSha256:       cc.SpkiSha256,
+			SpkiSha256Base64: cc.SpkiSha256Base64,
+			KeyName:          cc.KeyName,
+			KeyBits:          cc.KeyBits,
+			IsCA:             cc.IsCA,
+			SelfSigned:       cc.SelfSigned,
+		})
 	}
 	if s.Known {
 		info.IANAName = s.Name

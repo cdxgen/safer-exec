@@ -2,9 +2,17 @@ package main
 
 import (
 	"bufio"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +23,7 @@ import (
 	"time"
 
 	"github.com/cdxgen/safer-exec/go/internal/config"
+	"github.com/cdxgen/safer-exec/go/internal/tlsobserve"
 )
 
 // The matcher must be exact-or-dot-suffix: a bare suffix check would let
@@ -509,5 +518,150 @@ func TestEgressProxyRecordsTLSParameters(t *testing.T) {
 	if c12.Protocol != "TLSv1.2" || c12.KeyExchange != "ECDHE" || c12.Group == "" || c12.ServerKey == "" || c12.CertSignature == "" ||
 		c12.Encryption != "AES" || c12.Mode != "GCM" {
 		t.Errorf("TLS 1.2 tunnel = %+v", c12)
+	}
+}
+
+// proxyChainPKI builds a three-level PKI and returns the server certificate
+// (leaf first) plus the parsed leaf, intermediate and root.
+func proxyChainPKI(t *testing.T) (tls.Certificate, *x509.Certificate, *x509.Certificate, *x509.Certificate) {
+	t.Helper()
+	key := func() *ecdsa.PrivateKey {
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	issue := func(cn string, isCA bool, k *ecdsa.PrivateKey, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) *x509.Certificate {
+		tmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(time.Now().UnixNano()),
+			Subject:               pkix.Name{CommonName: cn},
+			DNSNames:              []string{"observe.test"},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(time.Hour),
+			KeyUsage:              x509.KeyUsageDigitalSignature,
+			BasicConstraintsValid: true,
+			IsCA:                  isCA,
+		}
+		if isCA {
+			tmpl.KeyUsage = x509.KeyUsageCertSign
+		}
+		if parent == nil {
+			parent, parentKey = tmpl, k
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &k.PublicKey, parentKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cert
+	}
+	rootKey, interKey, leafKey := key(), key(), key()
+	root := issue("proxy-test-root-ca", true, rootKey, nil, nil)
+	inter := issue("proxy-test-intermediate", true, interKey, root, rootKey)
+	leaf := issue("proxy-test-leaf", false, leafKey, inter, interKey)
+	server := tls.Certificate{
+		Certificate: [][]byte{leaf.Raw, inter.Raw, root.Raw},
+		PrivateKey:  leafKey,
+	}
+	return server, leaf, inter, root
+}
+
+// A TLS 1.2 tunnel through the proxy records the whole chain the server
+// presented, leaf first, with the SPKI hashes a distrust list keys on.
+func TestEgressProxyRecordsCertificateChain(t *testing.T) {
+	serverCert, leaf, inter, root := proxyChainPKI(t)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	srv.TLS = &tls.Config{
+		MaxVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{serverCert},
+		CipherSuites: []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+	}
+	srv.StartTLS()
+	defer srv.Close()
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+
+	p, err := startEgressProxy(config.ExecConfig{
+		AllowIPs:    []string{"127.0.0.1"},
+		AllowPorts:  []int{port},
+		TraceCrypto: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", p.port))
+	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
+		Proxy:           http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: "observe.test"},
+	}}
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var entry *config.CipherInfo
+	for _, c := range p.cipherSnapshot() {
+		if c.Host == fmt.Sprintf("127.0.0.1:%d", port) {
+			e := c
+			entry = &e
+		}
+	}
+	if entry == nil {
+		t.Fatal("no cipher entry for the tunnel")
+	}
+	if entry.ServerKey != "ECDSA-P-256" || entry.CertSignature != "ECDSA-SHA256" {
+		t.Errorf("leaf fields: %+v", entry)
+	}
+	want := []*x509.Certificate{leaf, inter, root}
+	if len(entry.Chain) != len(want) {
+		t.Fatalf("chain = %+v", entry.Chain)
+	}
+	for i, cert := range want {
+		got := entry.Chain[i]
+		certSum := sha256.Sum256(cert.Raw)
+		spkiSum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+		if got.CertSha256 != hex.EncodeToString(certSum[:]) || got.SpkiSha256 != hex.EncodeToString(spkiSum[:]) ||
+			got.Name != cert.Subject.CommonName || got.Subject != cert.Subject.String() || got.Issuer != cert.Issuer.String() {
+			t.Errorf("chain[%d] = %+v (cert %s)", i, got, cert.Subject.CommonName)
+		}
+		if got.IsCA != cert.IsCA || got.KeyName != "ECDSA-P256" || got.KeyBits != 256 {
+			t.Errorf("chain[%d] flags = %+v", i, got)
+		}
+	}
+	if !entry.Chain[2].SelfSigned || entry.Chain[1].SelfSigned || entry.Chain[0].SelfSigned {
+		t.Errorf("self-signed flags: %+v", entry.Chain)
+	}
+}
+
+// The recorded chain is part of the dedup key: the same target presenting a
+// different chain under otherwise equal parameters is a new entry, and the
+// same chain is recorded once.
+func TestEgressProxyChainDistinguishesEqualHandshakes(t *testing.T) {
+	p, err := startEgressProxy(config.ExecConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	base := tlsobserve.Handshake{Version: 0x0303, CipherSuite: 0xC02F, ServerKey: "ECDSA-P-256"}
+	withA, withB := base, base
+	withA.Chain = []tlsobserve.ChainCert{{Name: "leaf-a", CertSha256: "aa11", SpkiSha256: "0101"}}
+	withB.Chain = []tlsobserve.ChainCert{{Name: "leaf-b", CertSha256: "bb22", SpkiSha256: "0202"}}
+	p.recordTLS("same.host:443", withA)
+	p.recordTLS("same.host:443", withB)
+	p.recordTLS("same.host:443", withA)
+	got := p.cipherSnapshot()
+	if len(got) != 2 {
+		t.Fatalf("recorded %d entries, want 2 (equal parameters, different chains): %+v", len(got), got)
+	}
+	if got[0].Chain[0].Name == got[1].Chain[0].Name {
+		t.Fatalf("entries were not distinguished by chain: %+v", got)
 	}
 }

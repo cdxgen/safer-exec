@@ -634,8 +634,38 @@ type CipherInfo struct {
 	ServerKey string `json:"serverKey,omitempty"`
 	// CertSignature is the server certificate's signature algorithm.
 	CertSignature string `json:"certSignature,omitempty"`
+	// Chain is the certificate chain the server presented, leaf first,
+	// visible only up to TLS 1.2 (the observer cannot read the encrypted
+	// TLS 1.3 Certificate message).
+	Chain []CertChainEntry `json:"chain,omitempty"`
 	// Source is how the cipher was observed: "ebpf_uprobe" or "proxy".
 	Source string `json:"source,omitempty"`
+}
+
+// CertChainEntry is one certificate of the chain a server presented in a
+// TLS ≤ 1.2 handshake. The SPKI SHA-256 is the digest SPKI pins and distrust
+// lists (Go's CVE-2026-111943 set) key on.
+type CertChainEntry struct {
+	// Name is the certificate's component name: the subject CN, else the
+	// first subject RDN value, else the subject string.
+	Name string `json:"name,omitempty"`
+	// Subject and Issuer are the RFC 4514 name strings.
+	Subject string `json:"subject,omitempty"`
+	Issuer  string `json:"issuer,omitempty"`
+	// CertSha256 is SHA-256 over the whole DER certificate; SpkiSha256 over
+	// the DER SubjectPublicKeyInfo. Both lowercase hex.
+	CertSha256 string `json:"certSha256,omitempty"`
+	SpkiSha256 string `json:"spkiSha256,omitempty"`
+	// SpkiSha256Base64 is the SPKI digest in the RFC 7469 pin-sha256 form.
+	SpkiSha256Base64 string `json:"spkiSha256Base64,omitempty"`
+	// KeyName names the public key algorithm and size ("RSA-2048",
+	// "ECDSA-P256", "Ed25519"); KeyBits is its size in bits.
+	KeyName string `json:"keyName,omitempty"`
+	KeyBits int    `json:"keyBits,omitempty"`
+	// IsCA is the basicConstraints CA flag; SelfSigned means the subject and
+	// issuer DER are equal and the self-signature verifies.
+	IsCA       bool `json:"isCA,omitempty"`
+	SelfSigned bool `json:"selfSigned,omitempty"`
 }
 
 // CryptoOperation describes a single cryptographic operation observed via
