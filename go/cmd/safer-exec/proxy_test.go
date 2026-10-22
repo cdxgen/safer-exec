@@ -626,3 +626,133 @@ func TestEgressProxyChainDistinguishesEqualHandshakes(t *testing.T) {
 		t.Fatalf("entries were not distinguished by chain: %+v", got)
 	}
 }
+
+// IP-literal targets must match IP-literal allowlist entries however the
+// entry was written: in AllowIPs, in AllowHosts (Node's DNS step resolves
+// nothing for a literal, so the literal only ever reaches the engine as a
+// host entry), as a bracketed IPv6 literal, in an AllowURLRules host, or as a
+// CIDR. A literal that no entry covers stays denied.
+func TestEgressProxyIPLiteralAllowlist(t *testing.T) {
+	cases := []struct {
+		name   string
+		cfg    config.ExecConfig
+		target string
+		port   int
+		want   bool
+	}{
+		{"AllowIPs v4", config.ExecConfig{AllowIPs: []string{"127.0.0.1"}}, "127.0.0.1", 443, true},
+		{"AllowIPs v6", config.ExecConfig{AllowIPs: []string{"::1"}}, "::1", 443, true},
+		{"AllowIPs bracketed v6", config.ExecConfig{AllowIPs: []string{"[::1]"}}, "::1", 443, true},
+		{"AllowHosts v4", config.ExecConfig{AllowHosts: []string{"127.0.0.1"}}, "127.0.0.1", 443, true},
+		{"AllowHosts v6", config.ExecConfig{AllowHosts: []string{"::1"}}, "::1", 443, true},
+		{"AllowHosts bracketed v6", config.ExecConfig{AllowHosts: []string{"[::1]"}}, "::1", 443, true},
+		{"AllowHosts v6 spelled long", config.ExecConfig{AllowHosts: []string{"0:0:0:0:0:0:0:1"}}, "::1", 443, true},
+		{"target v6 spelled long", config.ExecConfig{AllowHosts: []string{"::1"}}, "0:0:0:0:0:0:0:1", 443, true},
+		{"AllowURLRules host", config.ExecConfig{AllowURLRules: []config.AllowURLRule{{Host: "127.0.0.1"}}}, "127.0.0.1", 443, true},
+		{"CIDR v4 in AllowIPs", config.ExecConfig{AllowIPs: []string{"127.0.0.0/8"}}, "127.0.0.5", 443, true},
+		{"CIDR v4 in AllowHosts", config.ExecConfig{AllowHosts: []string{"10.1.0.0/16"}}, "10.1.9.9", 443, true},
+		{"CIDR v6", config.ExecConfig{AllowIPs: []string{"fd00::/8"}}, "fd12::1", 443, true},
+		{"CIDR outside", config.ExecConfig{AllowIPs: []string{"10.1.0.0/16"}}, "10.2.0.1", 443, false},
+		{"other v4 literal", config.ExecConfig{AllowHosts: []string{"127.0.0.1"}}, "127.0.0.2", 443, false},
+		{"other v6 literal", config.ExecConfig{AllowHosts: []string{"::1"}}, "::2", 443, false},
+		{"v4-mapped v6 of allowed v4", config.ExecConfig{AllowIPs: []string{"127.0.0.1"}}, "::ffff:127.0.0.1", 443, true},
+		{"v4-mapped v6 of other v4", config.ExecConfig{AllowIPs: []string{"127.0.0.1"}}, "::ffff:127.0.0.2", 443, false},
+		{"port gate still applies", config.ExecConfig{AllowHosts: []string{"127.0.0.1"}}, "127.0.0.1", 22, false},
+		{"explicit port", config.ExecConfig{AllowHosts: []string{"127.0.0.1"}, AllowPorts: []int{9460}}, "127.0.0.1", 9460, true},
+		// Names that only resolve to an address must not match a literal
+		// entry, and numeric spellings the resolver would accept must not
+		// be treated as the allowed literal.
+		{"localhost is not 127.0.0.1", config.ExecConfig{AllowHosts: []string{"127.0.0.1"}}, "localhost", 443, false},
+		{"decimal spelling", config.ExecConfig{AllowHosts: []string{"127.0.0.1"}}, "2130706433", 443, false},
+		{"hex spelling", config.ExecConfig{AllowHosts: []string{"127.0.0.1"}}, "0x7f000001", 443, false},
+		{"octal spelling", config.ExecConfig{AllowHosts: []string{"127.0.0.1"}}, "0177.0.0.1", 443, false},
+		{"short spelling", config.ExecConfig{AllowHosts: []string{"127.0.0.1"}}, "127.1", 443, false},
+		{"literal does not allow its suffix names", config.ExecConfig{AllowHosts: []string{"127.0.0.1"}}, "x.127.0.0.1", 443, false},
+		{"metadata not allowed by loopback entry", config.ExecConfig{AllowHosts: []string{"127.0.0.1"}}, "169.254.169.254", 80, false},
+		{"metadata not allowed by wildcard host", config.ExecConfig{AllowHosts: []string{"*.example.com"}}, "169.254.169.254", 80, false},
+		{"bare star host does not allow literals", config.ExecConfig{AllowHosts: []string{"*"}}, "127.0.0.1", 443, false},
+		{"bare star host does not allow metadata", config.ExecConfig{AllowHosts: []string{"*"}}, "169.254.169.254", 80, false},
+		{"bare star still allows names", config.ExecConfig{AllowHosts: []string{"*"}}, "example.org", 443, true},
+		{"empty list denies", config.ExecConfig{}, "127.0.0.1", 443, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := startEgressProxy(tc.cfg)
+			if err != nil {
+				t.Fatalf("start proxy: %v", err)
+			}
+			defer p.Close()
+			if got := p.targetAllowed(tc.target, tc.port); got != tc.want {
+				t.Errorf("targetAllowed(%q, %d) = %v, want %v", tc.target, tc.port, got, tc.want)
+			}
+		})
+	}
+}
+
+// End to end through the proxy: a CONNECT to an allowed IP literal tunnels,
+// both for 127.0.0.1 and ::1, and a literal that is not allowed gets 403.
+func TestEgressProxyConnectsToAllowedIPLiterals(t *testing.T) {
+	for _, tc := range []struct {
+		name, listen, entry, other string
+	}{
+		{"v4", "127.0.0.1:0", "127.0.0.1", "127.0.0.2"},
+		{"v6", "[::1]:0", "::1", "::2"},
+		{"cidr v4", "127.0.0.1:0", "127.0.0.0/8", "10.0.0.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", tc.listen)
+			if err != nil {
+				t.Skipf("cannot listen on %s: %v", tc.listen, err)
+			}
+			defer ln.Close()
+			go func() {
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					c.Write([]byte("hello"))
+					c.Close()
+				}
+			}()
+			addr := ln.Addr().(*net.TCPAddr)
+			p, err := startEgressProxy(config.ExecConfig{AllowHosts: []string{tc.entry}, AllowPorts: []int{addr.Port}})
+			if err != nil {
+				t.Fatalf("start proxy: %v", err)
+			}
+			defer p.Close()
+			target := net.JoinHostPort(addr.IP.String(), strconv.Itoa(addr.Port))
+			status := proxyStatusLine(t, p.port, fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target))
+			if !strings.Contains(status, "200") {
+				t.Errorf("CONNECT %s = %q, want 200", target, status)
+			}
+			denied := net.JoinHostPort(tc.other, strconv.Itoa(addr.Port))
+			status = proxyStatusLine(t, p.port, fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", denied, denied))
+			if !strings.Contains(status, "403") {
+				t.Errorf("CONNECT %s = %q, want 403", denied, status)
+			}
+		})
+	}
+}
+
+// Every deny that exists today stays: a learning run refuses loopback,
+// link-local (cloud metadata) and unspecified literals however they are
+// spelled, and the allowlist change must not make them reachable.
+func TestLearningProxyStillRefusesHostLocalLiterals(t *testing.T) {
+	for _, ip := range []string{"127.0.0.1", "::1", "169.254.169.254", "fe80::1", "0.0.0.0", "::", "224.0.0.1", "::ffff:169.254.169.254"} {
+		if !hostLocalIP(net.ParseIP(ip)) {
+			t.Errorf("hostLocalIP(%s) = false, want true", ip)
+		}
+	}
+	p, err := startLearningEgressProxy(config.ExecConfig{AllowHosts: []string{"127.0.0.1", "169.254.169.254", "169.254.0.0/16"}})
+	if err != nil {
+		t.Fatalf("start proxy: %v", err)
+	}
+	defer p.Close()
+	for _, target := range []string{"127.0.0.1:80", "169.254.169.254:80", "[::1]:80"} {
+		status := proxyStatusLine(t, p.port, fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target))
+		if !strings.Contains(status, "403") {
+			t.Errorf("learning CONNECT %s = %q, want 403", target, status)
+		}
+	}
+}

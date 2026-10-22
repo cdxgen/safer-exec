@@ -46,6 +46,7 @@ type egressProxy struct {
 	exact    map[string]bool // lowercase exact hostnames
 	suffixes []string        // ".example.com" suffixes from "*.example.com" patterns
 	ips      map[string]bool // allowed IP literals (normalized)
+	nets     []*net.IPNet    // allowed CIDR ranges
 	anyHost  bool            // an empty-host URL rule or bare "*" allows any host
 	ports    map[int]bool    // explicit port allowlist; nil/empty means 80/443 only
 	hasHosts bool            // whether any host/ip target is allowed at all
@@ -91,6 +92,25 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 		observeTLS: cfg.TraceCrypto || cfg.CBOMOutputPath != "",
 	}
 
+	// addIP records an IP literal or CIDR entry. It reports whether the entry
+	// was one, so the same spelling is not also kept as a hostname: an IP
+	// literal target is matched against these entries only, never against
+	// names.
+	addIP := func(entry string) bool {
+		entry = strings.TrimSpace(entry)
+		if bare := strings.TrimSuffix(strings.TrimPrefix(entry, "["), "]"); bare != entry {
+			entry = bare
+		}
+		if ip := net.ParseIP(entry); ip != nil {
+			p.ips[ip.String()] = true
+			return true
+		}
+		if _, n, err := net.ParseCIDR(entry); err == nil {
+			p.nets = append(p.nets, n)
+			return true
+		}
+		return false
+	}
 	addHost := func(h string) {
 		h = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(h), "."))
 		if h == "" || strings.HasPrefix(h, "~") {
@@ -106,6 +126,11 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 			p.suffixes = append(p.suffixes, strings.ToLower(h[1:])) // ".example.com"
 			return
 		}
+		// Node's DNS step resolves nothing for an IP literal, so a literal
+		// written as an allowed host only ever reaches the engine here.
+		if addIP(h) {
+			return
+		}
 		p.exact[h] = true
 	}
 	for _, h := range cfg.AllowHosts {
@@ -115,9 +140,7 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 		addHost(r.Host)
 	}
 	for _, ip := range cfg.AllowIPs {
-		if parsed := net.ParseIP(strings.TrimSpace(ip)); parsed != nil {
-			p.ips[parsed.String()] = true
-		}
+		addIP(ip)
 	}
 	if len(cfg.AllowPorts) > 0 {
 		p.ports = make(map[int]bool, len(cfg.AllowPorts))
@@ -342,10 +365,10 @@ func (p *egressProxy) targetAllowed(host string, port int) bool {
 		return host != "" && port > 0 && port <= 65535
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if !p.hasHosts && len(p.ips) == 0 {
-			return false
-		}
-		if p.ips[ip.String()] {
+		// An IP literal matches IP and CIDR entries only; a bare "*" host or
+		// a wildcard suffix never allows one (cloud metadata endpoints are
+		// literals).
+		if p.ips[ip.String()] || p.inAllowedNet(ip) {
 			return portAllowed(p.ports, port)
 		}
 		return false
@@ -362,6 +385,15 @@ func (p *egressProxy) targetAllowed(host string, port int) bool {
 	for _, suffix := range p.suffixes {
 		if strings.HasSuffix(host, suffix) {
 			return portAllowed(p.ports, port)
+		}
+	}
+	return false
+}
+
+func (p *egressProxy) inAllowedNet(ip net.IP) bool {
+	for _, n := range p.nets {
+		if n.Contains(ip) {
+			return true
 		}
 	}
 	return false
