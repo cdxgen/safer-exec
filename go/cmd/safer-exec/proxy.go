@@ -46,6 +46,7 @@ type egressProxy struct {
 	exact    map[string]bool // lowercase exact hostnames
 	suffixes []string        // ".example.com" suffixes from "*.example.com" patterns
 	ips      map[string]bool // allowed IP literals (normalized)
+	nets     []*net.IPNet    // allowed CIDR ranges
 	anyHost  bool            // an empty-host URL rule or bare "*" allows any host
 	ports    map[int]bool    // explicit port allowlist; nil/empty means 80/443 only
 	hasHosts bool            // whether any host/ip target is allowed at all
@@ -91,6 +92,25 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 		observeTLS: cfg.TraceCrypto || cfg.CBOMOutputPath != "",
 	}
 
+	// addIP records an IP literal or CIDR entry. It reports whether the entry
+	// was one, so the same spelling is not also kept as a hostname: an IP
+	// literal target is matched against these entries only, never against
+	// names.
+	addIP := func(entry string) bool {
+		entry = strings.TrimSpace(entry)
+		if strings.HasPrefix(entry, "[") && strings.HasSuffix(entry, "]") {
+			entry = entry[1 : len(entry)-1]
+		}
+		if ip := net.ParseIP(entry); ip != nil {
+			p.ips[ip.String()] = true
+			return true
+		}
+		if _, n, err := net.ParseCIDR(entry); err == nil {
+			p.nets = append(p.nets, n)
+			return true
+		}
+		return false
+	}
 	addHost := func(h string) {
 		h = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(h), "."))
 		if h == "" || strings.HasPrefix(h, "~") {
@@ -106,6 +126,11 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 			p.suffixes = append(p.suffixes, strings.ToLower(h[1:])) // ".example.com"
 			return
 		}
+		// Node's DNS step resolves nothing for an IP literal, so a literal
+		// written as an allowed host only ever reaches the engine here.
+		if addIP(h) {
+			return
+		}
 		p.exact[h] = true
 	}
 	for _, h := range cfg.AllowHosts {
@@ -115,9 +140,7 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 		addHost(r.Host)
 	}
 	for _, ip := range cfg.AllowIPs {
-		if parsed := net.ParseIP(strings.TrimSpace(ip)); parsed != nil {
-			p.ips[parsed.String()] = true
-		}
+		addIP(ip)
 	}
 	if len(cfg.AllowPorts) > 0 {
 		p.ports = make(map[int]bool, len(cfg.AllowPorts))
@@ -342,10 +365,10 @@ func (p *egressProxy) targetAllowed(host string, port int) bool {
 		return host != "" && port > 0 && port <= 65535
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if !p.hasHosts && len(p.ips) == 0 {
-			return false
-		}
-		if p.ips[ip.String()] {
+		// An IP literal matches IP and CIDR entries only; a bare "*" host or
+		// a wildcard suffix never allows one (cloud metadata endpoints are
+		// literals).
+		if p.ips[ip.String()] || p.inAllowedNet(ip) {
 			return portAllowed(p.ports, port)
 		}
 		return false
@@ -367,6 +390,83 @@ func (p *egressProxy) targetAllowed(host string, port int) bool {
 	return false
 }
 
+// inAllowedNet reports whether a CIDR entry covers ip. Link-local (cloud
+// metadata at 169.254.169.254), other cloud metadata addresses, multicast and
+// unspecified addresses, and IPv6 forms embedding any of them, are never
+// covered by a range, so "0.0.0.0/0" or "::/0" cannot open them; they are
+// reachable only through an exact IP-literal entry.
+func (p *egressProxy) inAllowedNet(ip net.IP) bool {
+	if rangeExcluded(ip) {
+		return false
+	}
+	for _, n := range p.nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// metadataIPs are cloud metadata endpoints outside link-local space: Alibaba
+// Cloud (100.100.100.200) and AWS IMDS over IPv6 (fd00:ec2::254).
+var metadataIPs = map[string]bool{
+	"100.100.100.200": true,
+	"fd00:ec2::254":   true,
+}
+
+var nat64Prefix = net.ParseIP("64:ff9b::")
+
+// embeddedIPv4 returns the IPv4 address an IPv6 address carries in its low 32
+// bits as an IPv4-compatible (::a.b.c.d) or NAT64 (64:ff9b::a.b.c.d) form,
+// which reach that IPv4 host on networks that route them; nil otherwise.
+func embeddedIPv4(ip net.IP) net.IP {
+	ip16 := ip.To16()
+	if ip16 == nil || ip.To4() != nil {
+		return nil
+	}
+	compatible := true
+	for _, b := range ip16[:12] {
+		if b != 0 {
+			compatible = false
+			break
+		}
+	}
+	if compatible || net.IP(ip16[:12]).Equal(net.IP(nat64Prefix[:12])) {
+		return net.IPv4(ip16[12], ip16[13], ip16[14], ip16[15])
+	}
+	return nil
+}
+
+// rangeExcluded reports addresses no CIDR or wildcard entry may open.
+func rangeExcluded(ip net.IP) bool {
+	excluded := func(ip net.IP) bool {
+		return ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() ||
+			ip.IsUnspecified() || metadataIPs[ip.String()]
+	}
+	if excluded(ip) {
+		return true
+	}
+	if v4 := embeddedIPv4(ip); v4 != nil {
+		return excluded(v4) || v4.IsLoopback()
+	}
+	return false
+}
+
+// wildcardOnly reports whether host is allowed only by a bare "*" entry, not
+// by an exact or suffix entry naming it.
+func (p *egressProxy) wildcardOnly(host string) bool {
+	host = normalizeProxyHost(host)
+	if !p.anyHost || net.ParseIP(host) != nil || p.exact[host] {
+		return false
+	}
+	for _, suffix := range p.suffixes {
+		if strings.HasSuffix(host, suffix) {
+			return false
+		}
+	}
+	return true
+}
+
 // portAllowed checks the port gate. An empty explicit list means "standard
 // web ports only" — a conservative default that also matches the engine's
 // Seatbelt behavior when host pinning is requested without ports.
@@ -384,6 +484,30 @@ func portAllowed(ports map[int]bool, port int) bool {
 // was working around was in fact the dropped-buffer bug fixed in handleConn.)
 func (p *egressProxy) dialTarget(host, portStr string) (net.Conn, error) {
 	d := net.Dialer{Timeout: 15 * time.Second}
+	if !p.learning() && p.wildcardOnly(host) {
+		// A bare "*" never allows an IP literal, so it must not reach one
+		// through a name either: numeric spellings (2130706433, 0x7f000001),
+		// rebinding names (127.0.0.1.nip.io) and localhost resolve to
+		// host-local or metadata addresses. Checked per resolved address;
+		// an exact IP entry still allows its address.
+		d.Control = func(_, address string, _ syscall.RawConn) error {
+			h, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip := net.ParseIP(h)
+			if ip == nil {
+				return errWildcardLocalTarget
+			}
+			if p.ips[ip.String()] {
+				return nil
+			}
+			if hostLocalIP(ip) || rangeExcluded(ip) {
+				return errWildcardLocalTarget
+			}
+			return nil
+		}
+	}
 	if p.learning() {
 		// Checked per attempted address, after resolution, so a public name
 		// that resolves to a host-local address is refused too.
@@ -400,6 +524,10 @@ func (p *egressProxy) dialTarget(host, portStr string) (net.Conn, error) {
 	}
 	return d.Dial("tcp", net.JoinHostPort(host, portStr))
 }
+
+// errWildcardLocalTarget marks an enforce-mode dial refused because a name
+// allowed only by a bare "*" resolved to a host-local or metadata address.
+var errWildcardLocalTarget = errors.New("wildcard host resolved to a host-local or metadata address")
 
 // errHostLocalTarget marks a learning-mode dial refused because the target
 // address belongs to the engine's host rather than the network.
@@ -435,6 +563,11 @@ func normalizeProxyHost(host string) string {
 // refusal of a host-local address is a policy denial (403 plus a
 // proxy-violation entry), anything else a 502.
 func (p *egressProxy) dialFailed(conn net.Conn, subject string, err error) {
+	if errors.Is(err, errWildcardLocalTarget) {
+		p.recordViolationDetail(subject, errWildcardLocalTarget.Error())
+		fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\nX-Safer-Exec: egress-denied\r\n\r\n")
+		return
+	}
 	if errors.Is(err, errHostLocalTarget) {
 		p.recordViolationDetail(subject, "host-local address refused while learning")
 		fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\nX-Safer-Exec: egress-denied\r\n\r\n")
