@@ -1,0 +1,21 @@
+go/cmd/safer-exec/proxy.go
+  s_797ad76f967931::t_13b9afa2d3e68f 101-102,393-396,398-400
+go/cmd/safer-exec/proxy_test.go
+  s_797ad76f967931::t_2b69464d56f412 673-680
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "313dc8a5ac01bfe831cb464021ca2621291c818a",
+  "prompts": {},
+  "sessions": {
+    "s_797ad76f967931": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "12ea2e25-5d96-4da2-a7fb-223a0762383c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
