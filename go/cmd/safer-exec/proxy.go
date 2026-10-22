@@ -98,8 +98,8 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 	// names.
 	addIP := func(entry string) bool {
 		entry = strings.TrimSpace(entry)
-		if bare := strings.TrimSuffix(strings.TrimPrefix(entry, "["), "]"); bare != entry {
-			entry = bare
+		if strings.HasPrefix(entry, "[") && strings.HasSuffix(entry, "]") {
+			entry = entry[1 : len(entry)-1]
 		}
 		if ip := net.ParseIP(entry); ip != nil {
 			p.ips[ip.String()] = true
@@ -390,7 +390,14 @@ func (p *egressProxy) targetAllowed(host string, port int) bool {
 	return false
 }
 
+// inAllowedNet reports whether a CIDR entry covers ip. Link-local (cloud
+// metadata at 169.254.169.254), multicast and unspecified addresses are never
+// covered by a range, so "0.0.0.0/0" or "::/0" cannot open them; they are
+// reachable only through an exact IP-literal entry.
 func (p *egressProxy) inAllowedNet(ip net.IP) bool {
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
 	for _, n := range p.nets {
 		if n.Contains(ip) {
 			return true
