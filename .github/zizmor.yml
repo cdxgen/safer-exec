@@ -1,0 +1,7 @@
+rules:
+  # The only cache is the MXC executor restore in build-mxc. It runs on pull
+  # requests only, so the executor that the publish job ships on push and
+  # manual runs is always built from source.
+  cache-poisoning:
+    ignore:
+      - ci.yml

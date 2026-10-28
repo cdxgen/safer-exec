@@ -77,7 +77,9 @@ jobs:
   # The Windows engine drives the Microsoft eXecution Container executor,
   # built here from the commit pinned in .github/scripts/build-mxc.ps1. The
   # build output is cached under a key derived from that script, so it is
-  # rebuilt only when the pin or the build steps change.
+  # rebuilt only when the pin or the build steps change. The cache is used on
+  # pull requests only: the publish job ships this executor, so every push and
+  # manual run builds it from source.
   build-mxc:
     if: github.event_name != 'merge_group'
     timeout-minutes: 60
@@ -99,6 +101,7 @@ jobs:
 
       - name: Restore MXC build
         id: mxc-cache
+        if: github.event_name == 'pull_request'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: mxc-bin
