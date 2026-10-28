@@ -1,0 +1,21 @@
+.github/workflows/ci.yml
+  s_9ef41a999f4dfc::t_b61ceeedfbf815 80-82,104
+.github/zizmor.yml
+  s_9ef41a999f4dfc::t_56d5fc701a96b1 1-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2bb74148d6c85e45192b7662d055b3b5d9ab184d",
+  "prompts": {},
+  "sessions": {
+    "s_9ef41a999f4dfc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "664079b5-fb65-49df-a81f-2b91f06cbafa",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
