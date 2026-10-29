@@ -36,6 +36,11 @@ func TestMain(m *testing.M) {
 		s, _ := strconv.Atoi(os.Getenv("WINJOB_TEST_ARG"))
 		time.Sleep(time.Duration(s) * time.Second)
 		os.Exit(0)
+	case "spin":
+		ms, _ := strconv.Atoi(os.Getenv("WINJOB_TEST_ARG"))
+		for end := time.Now().Add(time.Duration(ms) * time.Millisecond); time.Now().Before(end); {
+		}
+		os.Exit(0)
 	case "alloc":
 		// Commit memory with VirtualAlloc until the job refuses, then wait to
 		// be killed. (A Go heap allocation failure aborts the process, which
@@ -279,5 +284,29 @@ func TestCPURateLimitIsAccepted(t *testing.T) {
 	}
 	if _, total, err := j.Accounting(); err != nil || total < 1 {
 		t.Errorf("accounting total=%d err=%v", total, err)
+	}
+}
+
+// Usage counts the CPU time of processes that have already exited.
+func TestUsageCountsExitedProcesses(t *testing.T) {
+	j, err := New(Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	c := helper("spin", "300")
+	if err := j.Start(c); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	cpu, _, err := j.Usage()
+	if err != nil || cpu < 150_000 {
+		t.Fatalf("usage cpu=%dµs err=%v, want at least 150ms", cpu, err)
+	}
+	j.Close()
+	if _, _, err := j.Usage(); err == nil {
+		t.Fatal("Usage on a closed job succeeded")
 	}
 }

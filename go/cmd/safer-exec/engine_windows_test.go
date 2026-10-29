@@ -108,6 +108,17 @@ func workload(role string, args []string) int {
 		s, _ := strconv.Atoi(args[0])
 		time.Sleep(time.Duration(s) * time.Second)
 		return 0
+	case "keyed":
+		// Alternate 100 ms of CPU with 100 ms of sleep, like a sender
+		// signalling through CPU contention.
+		cycles, _ := strconv.Atoi(args[0])
+		for range cycles {
+			for end := time.Now().Add(100 * time.Millisecond); time.Now().Before(end); {
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		fmt.Println("keyed-done")
+		return 0
 	case "alloc":
 		mb, _ := strconv.Atoi(args[0])
 		var keep [][]byte
@@ -1069,4 +1080,26 @@ func TestWindowsDiagnostics(t *testing.T) {
 	if !ok || lib.Available != d.Features["trace_libraries"] || lib.Available != (dlltrace.Probe() == nil) {
 		t.Errorf("library_tracing = %+v, trace_libraries = %v", lib, d.Features["trace_libraries"])
 	}
+}
+
+// An audited run that alternates CPU bursts with sleep is reported as a
+// timing-channel suspect from the job object's counters.
+func TestWindowsEngineReportsTimingChannel(t *testing.T) {
+	requireMXC(t)
+	if testing.Short() {
+		t.Skip("takes about 15 s")
+	}
+	dir := testDir(t)
+	cfg := workloadConfig(t, dir, "keyed", "70")
+	cfg.EnableAudit = true
+	res := runEngine(t, cfg)
+	if !strings.Contains(res.stdout, "keyed-done") {
+		t.Fatalf("workload did not finish: %q", res.stdout)
+	}
+	for _, e := range auditEntries(res.stderr) {
+		if e.Type == "timing-channel-suspect" && e.Target == "cpu" {
+			return
+		}
+	}
+	t.Fatal("no cpu timing-channel-suspect entry")
 }
