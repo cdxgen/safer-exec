@@ -1022,12 +1022,14 @@ func TestEgressProxyFlushCountsOpenTunnels(t *testing.T) {
 		}
 		defer c.Close()
 		buf := make([]byte, 32<<10)
-		for { // read, ignore EOF, never close: a server holding the tunnel open
-			if _, err := c.Read(buf); err != nil && err != io.EOF {
-				return
-			}
-			if hold.Load() {
+		for { // read at full speed, ignore EOF, never close: a server holding the tunnel open
+			_, err := c.Read(buf)
+			if err == io.EOF && hold.Load() {
 				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			if err != nil {
+				return
 			}
 		}
 	}()
@@ -1047,8 +1049,11 @@ func TestEgressProxyFlushCountsOpenTunnels(t *testing.T) {
 		t.Fatalf("CONNECT: %q", line)
 	}
 	br.ReadString('\n')
-	conn.Write(make([]byte, 2<<20))
-	time.Sleep(200 * time.Millisecond)
+	if _, err := conn.Write(make([]byte, 2<<20)); err != nil {
+		t.Fatal(err)
+	}
+	// Wait until the proxy has forwarded the upload; the server only reads.
+	time.Sleep(500 * time.Millisecond)
 
 	old := os.Stderr
 	r, w, _ := os.Pipe()
