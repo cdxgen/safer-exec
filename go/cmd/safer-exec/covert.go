@@ -22,8 +22,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -229,20 +231,59 @@ type runRecord struct {
 // directory, so concurrent runs can find out what they share. Every run
 // registers; only audited runs report.
 type runRegistry struct {
-	dir  string
-	file string
-	self runRecord
-	mu   sync.Mutex
-	seen map[string]bool
+	dir    string
+	file   string
+	self   runRecord
+	mu     sync.Mutex
+	seen   map[string]bool
+	capped bool
 }
 
-// registryDir is the per-user directory of live run records.
+// registryDir is the per-user directory of live run records. It lives in
+// the user's cache directory rather than the temp directory, because sandbox
+// profiles grant the temp directory to every workload; the macOS profile also
+// denies this directory explicitly (registryDenyRule). A policy that grants
+// the cache directory to a Linux or Windows workload lets it plant or delete
+// records; check() treats every record as untrusted input for that reason.
 func registryDir() string {
+	if base, err := os.UserCacheDir(); err == nil && base != "" {
+		return filepath.Join(base, "safer-exec-runs")
+	}
 	name := "safer-exec-runs"
 	if uid := os.Getuid(); uid >= 0 {
 		name += "-" + strconv.Itoa(uid)
 	}
 	return filepath.Join(os.TempDir(), name)
+}
+
+// Bounds on what check() reads: records are written by safer-exec, but a
+// workload with access to the directory could plant anything.
+const (
+	maxRegistryRecords  = 512
+	maxRegistryFindings = 64
+	maxRecordBytes      = 64 << 10
+)
+
+// recordName matches the names registerRun writes: <pid>-<started>.json.
+var recordName = regexp.MustCompile(`^([0-9]{1,10})-([0-9]{1,20})\.json$`)
+
+// readRecord reads one record without following links, without blocking on
+// a FIFO or device, and only from a regular file of bounded size.
+func readRecord(path string) ([]byte, bool) {
+	f, err := openRecord(path)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() > maxRecordBytes {
+		return nil, false
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxRecordBytes+1))
+	if err != nil || len(data) > maxRecordBytes {
+		return nil, false
+	}
+	return data, true
 }
 
 // registerRun writes this run's record. It returns nil (and the run goes
@@ -322,20 +363,25 @@ func (r *runRegistry) check() []config.AuditEntry {
 	if err != nil {
 		return nil
 	}
+	if len(entries) > maxRegistryRecords {
+		entries = entries[:maxRegistryRecords]
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var out []config.AuditEntry
 	for _, e := range entries {
 		path := filepath.Join(r.dir, e.Name())
-		if path == r.file || !strings.HasSuffix(e.Name(), ".json") {
+		m := recordName.FindStringSubmatch(e.Name())
+		if path == r.file || m == nil || !e.Type().IsRegular() {
 			continue
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
+		data, ok := readRecord(path)
+		if !ok {
 			continue
 		}
 		var other runRecord
-		if json.Unmarshal(data, &other) != nil || other.PID <= 0 {
+		if json.Unmarshal(data, &other) != nil || other.PID <= 0 ||
+			strconv.Itoa(other.PID) != m[1] || strconv.FormatInt(other.Started, 10) != m[2] {
 			continue
 		}
 		if !pidAlive(other.PID) {
@@ -344,10 +390,19 @@ func (r *runRegistry) check() []config.AuditEntry {
 		}
 		report := func(typ, mine, theirs, what string) {
 			key := typ + "\x00" + mine + "\x00" + e.Name()
-			if r.seen[key] {
+			if r.seen[key] || r.capped {
 				return
 			}
 			r.seen[key] = true
+			if len(r.seen) > maxRegistryFindings {
+				r.capped = true
+				out = append(out, config.AuditEntry{
+					Type:   "shared-write-path",
+					Target: r.dir,
+					Detail: fmt.Sprintf("more than %d shared paths found; further overlaps are not reported", maxRegistryFindings),
+				})
+				return
+			}
 			out = append(out, config.AuditEntry{
 				Type:   typ,
 				Target: mine,

@@ -64,31 +64,49 @@ func bashPath(t *testing.T) string {
 }
 
 // An audited proxy-egress run records UDP and direct TCP that leave outside
-// the proxy, and the command still runs to completion.
+// the proxy, while the workload keeps working: its connection to the proxy
+// and the command itself must succeed whatever the watch could observe.
 func TestEgressWatchRecordsBypassAttempts(t *testing.T) {
 	if !egressNotifySupported() {
 		t.Skip("kernel lacks SECCOMP_USER_NOTIF_FLAG_CONTINUE")
 	}
 	bash := bashPath(t)
+	script := `p=${HTTPS_PROXY##*:}; p=${p%/}; (exec 3<>/dev/tcp/127.0.0.1/$p && echo proxy-ok); ` +
+		`echo x > /dev/udp/192.0.2.1/53; (echo > /dev/tcp/192.0.2.1/443) 2>/dev/null; echo done`
 	cfg := config.ExecConfig{
 		Cmd:         bash,
-		Args:        []string{"-c", "echo x > /dev/udp/192.0.2.1/53; (echo > /dev/tcp/192.0.2.1/443) 2>/dev/null; echo done"},
+		Args:        []string{"-c", script},
 		ReadPaths:   baseReadPaths(),
 		ProxyEgress: true,
 		AllowHosts:  []string{"example.com"},
 		EnableAudit: true,
 	}
 	stdout, stderr, _ := runSandbox(t, cfg)
-	if !strings.Contains(stdout, "done") {
-		t.Fatalf("command did not finish: stdout=%q", stdout)
+	if !strings.Contains(stdout, "proxy-ok") || !strings.Contains(stdout, "done") {
+		t.Fatalf("the watch broke the workload: stdout=%q", stdout)
 	}
 	if strings.Contains(stderr, "egress watch:") {
 		t.Skipf("egress watch unavailable here: %s", stderr)
 	}
-	for _, want := range []string{`"type":"proxy-bypass-attempt"`, `"target":"udp 192.0.2.1:53"`, `192.0.2.1:443"`} {
-		if !strings.Contains(stderr, want) {
-			t.Errorf("missing %s in audit output", want)
+	if !strings.Contains(stderr, `"target":"udp socket"`) {
+		t.Errorf("UDP socket creation not recorded")
+	}
+	// Destinations need process_vm_readv on the workload, which a container
+	// profile can deny; the socket entry above does not.
+	switch {
+	case strings.Contains(stderr, `"target":"udp 192.0.2.1:53"`):
+		if !strings.Contains(stderr, `"target":"tcp 192.0.2.1:443"`) {
+			t.Errorf("UDP destination recorded but not the direct TCP one")
 		}
+	case strings.Contains(stderr, `"target":"tcp 192.0.2.1:53"`):
+		t.Errorf("a UDP destination was labelled TCP")
+	case strings.Contains(stderr, `192.0.2.1:53"`):
+		t.Logf("socket types not readable here")
+	default:
+		t.Logf("destinations not readable here; only socket creation was recorded")
+	}
+	if strings.Contains(stderr, `"target":"tcp 127.0.0.1:`) {
+		t.Errorf("the connection to the proxy itself was reported")
 	}
 }
 

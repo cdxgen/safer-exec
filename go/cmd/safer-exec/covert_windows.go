@@ -24,9 +24,22 @@ func pidAlive(pid int) bool {
 }
 
 // privateDir reports whether dir is a real directory, not a reparse point.
-// The registry lives under the per-user %TEMP%, which other users cannot
-// write.
+// The registry lives under the per-user %LocalAppData%, which other users
+// cannot write.
 func privateDir(dir string) bool {
 	fi, err := os.Lstat(dir)
 	return err == nil && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 && fi.Mode()&os.ModeIrregular == 0
+}
+
+// openRecord opens a registry record that is a plain file, not a reparse
+// point.
+func openRecord(path string) (*os.File, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, os.ErrInvalid
+	}
+	return os.Open(path)
 }

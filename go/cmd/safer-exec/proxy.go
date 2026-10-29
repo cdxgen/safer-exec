@@ -67,8 +67,16 @@ type egressProxy struct {
 	// traffic tallies the bytes each allowed target sent and received across
 	// all of its tunnels, for the upload-heavy finding at flush time.
 	traffic map[string]*proxyTraffic
-	// findings deduplicates proxy-sni-mismatch and proxy-embedded-url entries.
-	findings map[string]bool
+	// findings deduplicates proxy-sni-mismatch and proxy-embedded-url
+	// entries; findingCount counts them per type against maxProxyFindings.
+	findings     map[string]bool
+	findingCount map[string]int
+	// detect enables the audit-only detections (sni mismatch, embedded URL,
+	// upload heavy); they run only for audited runs.
+	detect bool
+	// handlers tracks the connection goroutines, so a flush can wait for
+	// the tunnels it closed to record their traffic.
+	handlers sync.WaitGroup
 }
 
 // proxyTraffic is the byte count of one target's tunnels. up is what the
@@ -87,7 +95,9 @@ const (
 	uploadHeavyRatio    = 4
 )
 
-// maxProxyFindings caps the sni-mismatch and embedded-url entries recorded.
+// maxProxyFindings caps the entries recorded per detection type. A workload
+// can produce endless distinct SNIs or URLs, so the cap is per type and its
+// first overflow is itself reported.
 const maxProxyFindings = 256
 
 // maxProxyConnectEntries caps distinct proxy-connect audit entries so a
@@ -112,11 +122,13 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 		ips:   make(map[string]bool),
 		conns: make(map[net.Conn]struct{}),
 
-		connected:  make(map[string]bool),
-		cipherSeen: make(map[string]bool),
-		traffic:    make(map[string]*proxyTraffic),
-		findings:   make(map[string]bool),
-		observeTLS: cfg.TraceCrypto || cfg.CBOMOutputPath != "",
+		connected:    make(map[string]bool),
+		cipherSeen:   make(map[string]bool),
+		traffic:      make(map[string]*proxyTraffic),
+		findings:     make(map[string]bool),
+		findingCount: make(map[string]int),
+		detect:       cfg.EnableAudit,
+		observeTLS:   cfg.TraceCrypto || cfg.CBOMOutputPath != "",
 	}
 
 	// addIP records an IP literal or CIDR entry. It reports whether the entry
@@ -255,8 +267,10 @@ func (p *egressProxy) acceptLoop() {
 			return
 		}
 		p.conns[conn] = struct{}{}
+		p.handlers.Add(1)
 		p.mu.Unlock()
 		go func() {
+			defer p.handlers.Done()
 			defer func() {
 				p.mu.Lock()
 				delete(p.conns, conn)
@@ -270,6 +284,26 @@ func (p *egressProxy) acceptLoop() {
 
 // Close stops the listener and tears down live tunnels so the engine can
 // exit promptly after the sandboxed command finishes.
+// track registers an upstream connection so Close also closes it: a server
+// that never closes its side must not keep a tunnel, and its handler, alive
+// past the run. It returns the function that closes and forgets it.
+func (p *egressProxy) track(c net.Conn) func() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		c.Close()
+		return func() {}
+	}
+	p.conns[c] = struct{}{}
+	p.mu.Unlock()
+	return func() {
+		p.mu.Lock()
+		delete(p.conns, c)
+		p.mu.Unlock()
+		c.Close()
+	}
+}
+
 func (p *egressProxy) Close() {
 	p.mu.Lock()
 	if p.closed {
@@ -371,15 +405,33 @@ func (p *egressProxy) violationsSnapshot() []config.AuditEntry {
 		targets = append(targets, target)
 	}
 	sort.Strings(targets)
+	heavy := false
+	var total proxyTraffic
+	lopsided := func(t *proxyTraffic) bool {
+		return t.up >= uploadHeavyMinBytes && t.up >= uploadHeavyRatio*t.down
+	}
 	for _, target := range targets {
 		t := p.traffic[target]
-		if t.up < uploadHeavyMinBytes || t.up < uploadHeavyRatio*t.down {
+		total.up += t.up
+		total.down += t.down
+		total.conns += t.conns
+		if !lopsided(t) {
 			continue
 		}
+		heavy = true
 		v = append(v, config.AuditEntry{
 			Type:   "proxy-upload-heavy",
 			Target: target,
 			Detail: fmt.Sprintf("sent %d bytes and received %d over %d connection(s); an upload this lopsided to an allowed host can be data leaving through it", t.up, t.down, t.conns),
+		})
+	}
+	// Spreading an upload over many targets keeps each under the threshold;
+	// the run as a whole still shows it.
+	if !heavy && len(targets) > 1 && lopsided(&total) {
+		v = append(v, config.AuditEntry{
+			Type:   "proxy-upload-heavy",
+			Target: fmt.Sprintf("%d targets", len(targets)),
+			Detail: fmt.Sprintf("sent %d bytes and received %d over %d connection(s) to %d allowed targets, none lopsided on its own; an upload spread like this can be data leaving through them", total.up, total.down, total.conns, len(targets)),
 		})
 	}
 	p.traffic = make(map[string]*proxyTraffic)
@@ -388,6 +440,9 @@ func (p *egressProxy) violationsSnapshot() []config.AuditEntry {
 
 // recordTraffic adds one finished tunnel's byte counts to its target.
 func (p *egressProxy) recordTraffic(target string, up, down int64) {
+	if !p.detect {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	t := p.traffic[target]
@@ -404,14 +459,20 @@ func (p *egressProxy) recordTraffic(target string, up, down int64) {
 }
 
 // recordFinding records a detection entry once per key, within
-// maxProxyFindings. Unlike proxy-violation, nothing was denied.
+// maxProxyFindings per type. Unlike proxy-violation, nothing was denied.
 func (p *egressProxy) recordFinding(key, typ, target, detail string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.findings[key] || len(p.findings) >= maxProxyFindings {
+	if p.findings[key] || p.findingCount[typ] > maxProxyFindings {
 		return
 	}
 	p.findings[key] = true
+	p.findingCount[typ]++
+	if p.findingCount[typ] > maxProxyFindings {
+		p.violations = append(p.violations, config.AuditEntry{Type: typ, Target: "proxy",
+			Detail: fmt.Sprintf("more than %d distinct findings of this type; further ones are not reported", maxProxyFindings)})
+		return
+	}
 	p.violations = append(p.violations, config.AuditEntry{Type: typ, Target: target, Detail: detail})
 }
 
@@ -422,6 +483,9 @@ func (p *egressProxy) recordFinding(key, typ, target, detail string) {
 // hostname allowlist. A tunnel without SNI (IP literal targets, non-TLS
 // protocols) is not reported.
 func (p *egressProxy) checkSNI(connectHost string, port int, target, serverName string, ech bool) {
+	if !p.detect {
+		return
+	}
 	sni := normalizeProxyHost(serverName)
 	if sni == "" || sni == normalizeProxyHost(connectHost) {
 		return
@@ -436,50 +500,56 @@ func (p *egressProxy) checkSNI(connectHost string, port int, target, serverName 
 	p.recordFinding("sni\x00"+target+"\x00"+sni, "proxy-sni-mismatch", "CONNECT "+target, detail)
 }
 
-// embeddedURLHosts returns, for each query parameter and path segment of a
-// plain-HTTP request target that carries an absolute or scheme-relative URL,
-// the parameter name (or "path") and the host that URL names. The values
-// themselves are never returned: they can carry credentials.
-func embeddedURLHosts(target string) [][2]string {
+// embeddedURL is one URL found inside a request target: where it was (a
+// query parameter name, or "path") and the host and port it names.
+type embeddedURL struct {
+	where, host string
+	port        int
+}
+
+// embeddedURLHosts returns each absolute or scheme-relative URL a plain-HTTP
+// request target carries in a query parameter or its path. Only the host and
+// port are returned, never the value: it can carry credentials. Parameters
+// are split on both "&" and ";", so a ";" cannot hide one.
+func embeddedURLHosts(target string) []embeddedURL {
 	u, err := url.Parse(target)
 	if err != nil {
 		return nil
 	}
-	var out [][2]string
-	hostOf := func(v string) string {
+	var out []embeddedURL
+	add := func(where, v string) {
 		v = strings.TrimSpace(v)
-		i := strings.Index(v, "://")
-		switch {
-		case i > 0:
-			v = v[i+1:]
-		case strings.HasPrefix(v, "//"):
-		default:
-			return ""
+		scheme := ""
+		if i := strings.Index(v, "://"); i > 0 {
+			scheme, v = strings.ToLower(v[:i]), v[i+1:]
+		} else if !strings.HasPrefix(v, "//") {
+			return
 		}
 		ref, err := url.Parse(v)
-		if err != nil {
-			return ""
+		if err != nil || ref.Hostname() == "" {
+			return
 		}
-		return normalizeProxyHost(ref.Hostname())
-	}
-	keys := make([]string, 0)
-	q := u.Query()
-	for k := range q {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		for _, v := range q[k] {
-			if h := hostOf(v); h != "" {
-				out = append(out, [2]string{k, h})
+		port, _ := strconv.Atoi(ref.Port())
+		if port == 0 {
+			port = 80
+			if scheme == "https" || scheme == "wss" {
+				port = 443
 			}
 		}
+		out = append(out, embeddedURL{where: where, host: normalizeProxyHost(ref.Hostname()), port: port})
+	}
+	for _, pair := range strings.FieldsFunc(u.RawQuery, func(r rune) bool { return r == '&' || r == ';' }) {
+		k, v, _ := strings.Cut(pair, "=")
+		if dk, err := url.QueryUnescape(k); err == nil {
+			k = dk
+		}
+		if dv, err := url.QueryUnescape(v); err == nil {
+			v = dv
+		}
+		add(k, v)
 	}
 	if i := strings.Index(u.Path, "://"); i > 0 {
-		start := strings.LastIndex(u.Path[:i], "/") + 1
-		if h := hostOf(u.Path[start:]); h != "" {
-			out = append(out, [2]string{"path", h})
-		}
+		add("path", u.Path[strings.LastIndex(u.Path[:i], "/")+1:])
 	}
 	return out
 }
@@ -487,31 +557,51 @@ func embeddedURLHosts(target string) [][2]string {
 // checkEmbeddedURLs records a proxy-embedded-url entry for each URL a
 // plain-HTTP request carries for a host other than its own. An allowed
 // service that fetches a URL it is handed (webhooks, link previews, image
-// proxies, metrics endpoints) turns into a route to any host. HTTPS requests
-// are encrypted inside their tunnel and cannot be checked.
+// proxies, metrics endpoints) turns into a route to any host. Only the first
+// request of a connection is parsed (later keep-alive requests are tunneled
+// as they are), and HTTPS requests are encrypted inside their tunnel, so
+// neither can be checked.
 func (p *egressProxy) checkEmbeddedURLs(method, target, requestHost string, port int) {
+	if !p.detect {
+		return
+	}
 	self := normalizeProxyHost(requestHost)
-	subject := method + " " + redactRequestTarget(target)
-	for _, kv := range embeddedURLHosts(target) {
-		name, host := kv[0], kv[1]
-		if host == self {
+	// The subject names only the request's authority: the path can carry
+	// secrets as well as the query.
+	subject := method + " " + net.JoinHostPort(self, strconv.Itoa(port))
+	for _, e := range embeddedURLHosts(target) {
+		if e.host == self {
 			continue
 		}
-		where := fmt.Sprintf("query parameter %q", name)
-		if name == "path" {
+		where := fmt.Sprintf("query parameter %q", e.where)
+		if e.where == "path" {
 			where = "the request path"
 		}
-		detail := fmt.Sprintf("%s carries a URL for %s; a service that fetches it would carry the request past the allowlist", where, host)
-		if !p.learning() && !p.targetAllowed(host, port) {
+		detail := fmt.Sprintf("%s carries a URL for %s; a service that fetches it would carry the request past the allowlist", where, net.JoinHostPort(e.host, strconv.Itoa(e.port)))
+		if !p.learning() && !p.targetAllowed(e.host, e.port) {
 			detail += " (that host is not on the allowlist)"
 		}
-		p.recordFinding("url\x00"+subject+"\x00"+name+"\x00"+host, "proxy-embedded-url", subject, detail)
+		p.recordFinding("url\x00"+subject+"\x00"+e.host, "proxy-embedded-url", subject, detail)
 	}
 }
 
 // flushViolations emits the collected proxy-violation and proxy-connect
 // audit entries, one JSON object each, over the report channel (or stderr).
+//
+// It runs once the workload has exited. It first closes the proxy and waits
+// briefly for the connection handlers, so tunnels a server kept open are
+// counted for proxy-upload-heavy instead of being missed.
 func (p *egressProxy) flushViolations() {
+	p.Close()
+	drained := make(chan struct{})
+	go func() {
+		p.handlers.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(2 * time.Second):
+	}
 	for _, v := range p.violationsSnapshot() {
 		entry := map[string]string{
 			"type":    v.Type,
@@ -841,8 +931,8 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 			p.dialFailed(conn, "CONNECT "+parts[1], err)
 			return
 		}
-		defer upstream.Close()
-		target := net.JoinHostPort(normalizeProxyHost(host), portStr)
+		defer p.track(upstream)()
+		target := net.JoinHostPort(normalizeProxyHost(host), strconv.Itoa(port))
 		p.recordConnect(target, "connect")
 		_ = conn.SetDeadline(time.Time{})
 		fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -899,8 +989,8 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 			p.dialFailed(conn, parts[0]+" "+redactRequestTarget(parts[1]), dialErr)
 			return
 		}
-		defer upstream.Close()
-		target := net.JoinHostPort(normalizeProxyHost(host), portStr)
+		defer p.track(upstream)()
+		target := net.JoinHostPort(normalizeProxyHost(host), strconv.Itoa(port))
 		p.recordConnect(target, "http")
 		p.checkEmbeddedURLs(parts[0], parts[1], host, port)
 		_ = conn.SetDeadline(time.Time{})

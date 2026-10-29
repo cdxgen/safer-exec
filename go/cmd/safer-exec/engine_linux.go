@@ -1206,6 +1206,8 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, proxy *e
 // runInitReduced is the inner init for reduced isolation mode. It skips namespace
 // and filesystem setup, applying only seccomp-bpf and Landlock network confinement.
 func runInitReduced(cfg config.ExecConfig) error {
+	// See runInit: the restrictions must land on the thread that execs.
+	runtime.LockOSThread()
 	adoptAuditFd()
 	adoptLibPipeFd()
 	adoptDetectionEnv()
@@ -1370,6 +1372,9 @@ func collectAuditLog(r *os.File) {
 }
 
 func runInit(cfg config.ExecConfig) error {
+	// Landlock restrict_self and seccomp without TSYNC apply to the calling
+	// thread only, so everything up to the exec must stay on one thread.
+	runtime.LockOSThread()
 	adoptAuditFd()
 	adoptLibPipeFd()
 	adoptDetectionEnv()
@@ -1979,7 +1984,11 @@ func setupCgroupV1(cfg config.ExecConfig) ([]string, error) {
 
 	pid := os.Getpid()
 	pidStr := strconv.Itoa(pid)
-	name := fmt.Sprintf("safer-exec-%d", pid)
+	// The engine's unique name: under the PID namespace every pid is 1.
+	name := cgroupName
+	if name == "" {
+		name = fmt.Sprintf("safer-exec-%d", pid)
+	}
 	var cleanupPaths []string
 
 	if cfg.MaxMemoryMB > 0 {

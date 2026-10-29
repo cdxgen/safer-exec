@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -174,9 +176,7 @@ func TestPathsOverlap(t *testing.T) {
 // record of a run that has exited is removed instead of reported.
 func TestRunRegistryReportsSharedPaths(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("TMPDIR", tmp)
-	t.Setenv("TMP", tmp)
-	t.Setenv("TEMP", tmp)
+	isolateRegistry(t, tmp)
 	shared := filepath.Join(tmp, "shared")
 	if err := os.MkdirAll(filepath.Join(shared, "sub"), 0o755); err != nil {
 		t.Fatal(err)
@@ -198,8 +198,9 @@ func TestRunRegistryReportsSharedPaths(t *testing.T) {
 	}
 	resolvedShared := cleanPaths([]string{filepath.Join(shared, "sub")})[0]
 	resolvedLock := cleanPaths([]string{lock})[0]
-	writeRecord("peer.json", runRecord{PID: os.Getpid(), Command: "pip", WritePaths: []string{resolvedShared}, LockFiles: []string{resolvedLock}})
-	writeRecord("dead.json", runRecord{PID: deadPID(t), Command: "gone", WritePaths: []string{resolvedShared}, LockFiles: []string{resolvedLock}})
+	dead := deadPID(t)
+	writeRecord(fmt.Sprintf("%d-1.json", os.Getpid()), runRecord{PID: os.Getpid(), Started: 1, Command: "pip", WritePaths: []string{resolvedShared}, LockFiles: []string{resolvedLock}})
+	writeRecord(fmt.Sprintf("%d-2.json", dead), runRecord{PID: dead, Started: 2, Command: "gone", WritePaths: []string{resolvedShared}, LockFiles: []string{resolvedLock}})
 
 	entries := reg.check()
 	types := map[string]int{}
@@ -212,7 +213,7 @@ func TestRunRegistryReportsSharedPaths(t *testing.T) {
 	if types["shared-write-path"] != 1 || types["shared-lock-file"] != 1 || len(entries) != 2 {
 		t.Fatalf("entries = %+v", entries)
 	}
-	if _, err := os.Stat(filepath.Join(reg.dir, "dead.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(reg.dir, fmt.Sprintf("%d-2.json", dead))); !os.IsNotExist(err) {
 		t.Fatal("the dead run's record was not removed")
 	}
 	if again := reg.check(); len(again) != 0 {
@@ -228,4 +229,54 @@ func deadPID(t *testing.T) int {
 		t.Fatal(err)
 	}
 	return cmd.Process.Pid
+}
+
+// isolateRegistry points the user cache and temp directories at dir.
+func isolateRegistry(t *testing.T, dir string) {
+	t.Helper()
+	for _, k := range []string{"TMPDIR", "TMP", "TEMP", "HOME", "XDG_CACHE_HOME", "LocalAppData", "USERPROFILE"} {
+		t.Setenv(k, dir)
+	}
+}
+
+// Records a workload could plant are skipped without blocking or following
+// links: a FIFO, a symlink, an oversized file, and a record whose name does
+// not match its content.
+func TestRunRegistryIgnoresPlantedRecords(t *testing.T) {
+	tmp := t.TempDir()
+	isolateRegistry(t, tmp)
+	shared := filepath.Join(tmp, "shared")
+	os.MkdirAll(shared, 0o755)
+	reg := registerRun(config.ExecConfig{Cmd: "npm", WritePaths: []string{shared}})
+	if reg == nil {
+		t.Fatal("registration failed")
+	}
+	defer reg.close()
+	if !strings.HasPrefix(reg.dir, tmp) {
+		t.Fatalf("registry %s is outside the isolated cache %s", reg.dir, tmp)
+	}
+	resolved := cleanPaths([]string{shared})
+	good, _ := json.Marshal(runRecord{PID: os.Getpid(), Started: 7, Command: "forged", WritePaths: resolved})
+	// Name and content disagree.
+	os.WriteFile(filepath.Join(reg.dir, "1-7.json"), good, 0o600)
+	// Oversized.
+	os.WriteFile(filepath.Join(reg.dir, fmt.Sprintf("%d-8.json", os.Getpid())), append(good, make([]byte, maxRecordBytes)...), 0o600)
+	if runtime.GOOS != "windows" {
+		target := filepath.Join(tmp, "target.json")
+		os.WriteFile(target, good, 0o600)
+		os.Symlink(target, filepath.Join(reg.dir, fmt.Sprintf("%d-7.json", os.Getpid())))
+		if err := mkfifo(filepath.Join(reg.dir, fmt.Sprintf("%d-9.json", os.Getpid()))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan []config.AuditEntry, 1)
+	go func() { done <- reg.check() }()
+	select {
+	case entries := <-done:
+		if len(entries) != 0 {
+			t.Fatalf("planted records were reported: %+v", entries)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("check blocked on a planted record")
+	}
 }

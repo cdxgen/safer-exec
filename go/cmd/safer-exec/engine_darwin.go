@@ -1282,6 +1282,12 @@ func buildSeatbeltProfile(cfg config.ExecConfig, proxyPort int) string {
 		}
 	}
 
+	// The run registry (covert.go) must not be readable or writable by the
+	// workload, even when a policy grants the cache directory around it:
+	// planted records would make the engine report false overlaps, and a
+	// deleted record hides this run from concurrent ones.
+	sb.WriteString(registryDenyRule())
+
 	// Network rules
 	resolvedIPs := cfg.AllowIPs
 	if len(cfg.AllowHosts) > 0 {
@@ -1566,3 +1572,13 @@ func runDiagnostics() config.DiagnosticsResult {
 // Ensure imports are used
 var _ = json.Marshal
 var _ = bufio.Scanner{}
+
+// registryDenyRule denies the workload every access to the run registry.
+// Later rules win in a Seatbelt profile, so it follows the path grants.
+func registryDenyRule() string {
+	dir := registryDir()
+	if resolved, err := filepath.EvalSymlinks(filepath.Dir(dir)); err == nil {
+		dir = filepath.Join(resolved, filepath.Base(dir))
+	}
+	return fmt.Sprintf("(deny file-read* file-write* (subpath %q))\n", dir)
+}

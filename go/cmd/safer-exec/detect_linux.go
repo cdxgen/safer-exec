@@ -110,6 +110,7 @@ func readCgroupUsage(dir string) (cpuUsec, ioBytes uint64, ok bool) {
 // samples that cgroup from the outer engine once the inner process has
 // created it.
 type cgroupWatch struct {
+	name    string
 	dir     string
 	sampler *contentionSampler
 }
@@ -120,7 +121,7 @@ type cgroupWatch struct {
 func prepareCgroupWatch(cfg config.ExecConfig, env []string) (*cgroupWatch, []string) {
 	name := newCgroupName()
 	env = append(env, envCgroupName+"="+name)
-	w := &cgroupWatch{}
+	w := &cgroupWatch{name: name}
 	if parent := ownCgroupDir(); parent != "" {
 		w.dir = filepath.Join(parent, name)
 	}
@@ -147,8 +148,22 @@ func (w *cgroupWatch) finish() []config.AuditEntry {
 		return nil
 	}
 	entries := w.sampler.finish()
+	dirs := []string{}
 	if w.dir != "" {
-		os.Remove(w.dir)
+		dirs = append(dirs, w.dir)
+	}
+	for _, ctrl := range []string{"memory", "cpu", "pids", "blkio"} {
+		dirs = append(dirs, filepath.Join("/sys/fs/cgroup", ctrl, w.name))
+	}
+	for _, d := range dirs {
+		// A process that outlived the run (reduced isolation has no PID
+		// namespace) keeps the cgroup busy; give it a moment, then leave it.
+		for i := 0; i < 5; i++ {
+			if err := os.Remove(d); err == nil || os.IsNotExist(err) {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 	}
 	return entries
 }
@@ -160,27 +175,34 @@ const (
 	seccompUserNotifFlagContinue = 1
 	seccompIoctlNotifRecv        = 0xc0502100 // _IOWR('!', 0, struct seccomp_notif)
 	seccompIoctlNotifSend        = 0xc0182101 // _IOWR('!', 1, struct seccomp_notif_resp)
-	seccompIoctlNotifIDValid     = 0x40082102 // _IOW('!', 2, __u64)
-	seccompNotifSize             = 80
-	seccompNotifRespSize         = 24
+	// _IOR('!', 2, __u64): the original encoding, which every kernel with
+	// user notification accepts; 5.9 added the corrected _IOW alias.
+	seccompIoctlNotifIDValid = 0x80082102
+	seccompNotifSize         = 80
+	seccompNotifRespSize     = 24
 )
 
 // egressNotifySupported reports whether the kernel can let a notified
-// syscall continue (SECCOMP_USER_NOTIF_FLAG_CONTINUE, Linux 5.5) and lets the
-// engine copy the listener out of the inner process (pidfd_getfd, 5.6).
-// Without the first a supervisor could only fail or emulate the call, which
-// would break it.
+// syscall continue (SECCOMP_USER_NOTIF_FLAG_CONTINUE, Linux 5.5). Without it a
+// supervisor could only fail or emulate the call, which would break it.
 func egressNotifySupported() bool {
 	var u unix.Utsname
 	if unix.Uname(&u) != nil {
 		return false
 	}
-	return parseKernelVersion(unix.ByteSliceToString(u.Release[:])) >= 5.06
+	return parseKernelVersion(unix.ByteSliceToString(u.Release[:])) >= 5.05
 }
 
 // egressNotifyProgram returns the filter that notifies the supervisor of
-// socket(AF_INET/AF_INET6, SOCK_DGRAM), connect, sendto with a destination
-// address, and sendmsg. Everything else is allowed without a notification.
+// socket(AF_INET/AF_INET6, SOCK_DGRAM), connect, and sendto with a
+// destination address. Everything else is allowed without a notification.
+//
+// sendmsg is deliberately not watched. The inner process hands the listener
+// to the engine with sendmsg (SCM_RIGHTS) after the filter is in place, so a
+// watched sendmsg would wait for a supervisor that does not have the listener
+// yet. It is also the hot path of connected UDP and of IPC, where a round trip
+// per call would slow workloads down. A UDP socket is still reported when it
+// is created; only the destinations of unconnected sendmsg/sendmmsg go unseen.
 func egressNotifyProgram() []unix.SockFilter {
 	const (
 		ld   = bpfLoadWordAbsolute
@@ -204,10 +226,9 @@ func egressNotifyProgram() []unix.SockFilter {
 		{Code: jeq, Jf: 3, K: unix.AF_INET6},
 		{Code: ld, K: arg1},
 		{Code: and, K: 0xf},
-		{Code: jeq, Jt: 9, K: unix.SOCK_DGRAM},
+		{Code: jeq, Jt: 8, K: unix.SOCK_DGRAM},
 		allow,
-		{Code: jeq, Jt: 7, K: unix.SYS_CONNECT},
-		{Code: jeq, Jt: 6, K: unix.SYS_SENDMSG},
+		{Code: jeq, Jt: 6, K: unix.SYS_CONNECT},
 		{Code: jeq, Jf: 4, K: unix.SYS_SENDTO},
 		{Code: ld, K: arg4},
 		{Code: jeq, Jf: 3, K: 0},
@@ -219,13 +240,13 @@ func egressNotifyProgram() []unix.SockFilter {
 }
 
 // installEgressNotify runs in the inner process before the sandbox's own
-// seccomp filter. It installs egressNotifyProgram with a listener and tells
-// the outer engine the listener's descriptor number over the socket in
-// SAFER_EXEC_NOTIFY_FD; the engine copies the descriptor out with
-// pidfd_getfd. Passing it with SCM_RIGHTS would deadlock: the filter already
-// applies to this process, so its own sendmsg would wait for a supervisor
-// that has no listener yet. write and read are not watched. Any failure
-// leaves the run unwatched, never blocked.
+// seccomp filter. It installs egressNotifyProgram with a listener and passes
+// the listener to the outer engine over the socket in SAFER_EXEC_NOTIFY_FD
+// with SCM_RIGHTS, which needs no permission the engine could be denied (as
+// pidfd_getfd does under Docker's default profile). Once the engine holds the
+// listener, this process closes its own copy. If the handoff fails the
+// watched calls would fail with ENOSYS for lack of a supervisor, so that is
+// reported loudly; it only happens when the engine is already gone.
 func installEgressNotify() {
 	sock := notifyFd
 	if sock < 0 {
@@ -241,12 +262,9 @@ func installEgressNotify() {
 		return
 	}
 	defer unix.Close(int(listener))
-	if _, err := unix.Write(sock, []byte(strconv.Itoa(int(listener)))); err != nil {
-		return
+	if err := unix.Sendmsg(sock, []byte{1}, unix.UnixRights(int(listener)), nil, 0); err != nil {
+		fmt.Fprintf(os.Stderr, "safer-exec: warning: egress watch: passing the listener failed (%v); watched network calls will fail\n", err)
 	}
-	// Keep the listener open until the engine has its copy (or gave up).
-	ack := make([]byte, 1)
-	_, _ = unix.Read(sock, ack)
 }
 
 // egressWatch is the outer engine's side: it receives the listener, records
@@ -260,6 +278,7 @@ type egressWatch struct {
 
 	mu    sync.Mutex
 	notes map[string]*egressNote
+	exes  map[int]string // executable per pid, read once
 }
 
 type egressNote struct {
@@ -268,8 +287,12 @@ type egressNote struct {
 	count            int
 }
 
-// maxEgressNotes caps the distinct destinations recorded.
-const maxEgressNotes = 256
+// maxEgressNotes caps the distinct destinations recorded, and maxExeCache
+// the executables remembered per pid.
+const (
+	maxEgressNotes = 256
+	maxExeCache    = 1024
+)
 
 // prepareEgressWatch returns a watch for proxy-egress runs on kernels that
 // support it, with the socket end to pass to the inner process as fd 5.
@@ -288,6 +311,7 @@ func prepareEgressWatch(cfg config.ExecConfig, proxyPort int) *egressWatch {
 		done:      make(chan struct{}),
 		stop:      make(chan struct{}),
 		notes:     make(map[string]*egressNote),
+		exes:      make(map[int]string),
 	}
 }
 
@@ -308,50 +332,61 @@ func (w *egressWatch) attach(extra []*os.File, env []string) ([]*os.File, []stri
 }
 
 // started closes the child end in the engine and starts serving.
-func (w *egressWatch) started(rootPID int) {
+func (w *egressWatch) started() {
 	if w == nil {
 		return
 	}
 	w.child.Close()
-	go w.serve(rootPID)
+	go w.serve()
 }
 
-func (w *egressWatch) serve(rootPID int) {
-	defer close(w.done)
-	defer w.parent.Close()
-	listener := -1
-	// Wait for the listener's descriptor number, giving up when the run ends
-	// without one.
-	for listener < 0 {
+// receiveListener waits for the listener from the inner process. It returns
+// -1 when the run ends first or the inner process never sends one.
+func (w *egressWatch) receiveListener() int {
+	oob := make([]byte, unix.CmsgSpace(4))
+	buf := make([]byte, 1)
+	for {
 		select {
 		case <-w.stop:
-			return
+			return -1
 		default:
 		}
 		fds := []unix.PollFd{{Fd: int32(w.parent.Fd()), Events: unix.POLLIN}}
-		if n, err := unix.Poll(fds, 100); err != nil && err != unix.EINTR {
-			return
-		} else if n == 0 {
+		n, err := unix.Poll(fds, 100)
+		if err != nil && err != unix.EINTR {
+			return -1
+		}
+		if n <= 0 {
 			continue
 		}
-		buf := make([]byte, 16)
-		n, err := unix.Read(int(w.parent.Fd()), buf)
-		if err != nil || n == 0 {
-			return
+		_, oobn, _, _, err := unix.Recvmsg(int(w.parent.Fd()), buf, oob, unix.MSG_CMSG_CLOEXEC)
+		if err != nil {
+			return -1
 		}
-		remote, err := strconv.Atoi(string(buf[:n]))
-		if err == nil {
-			listener = copyListener(rootPID, remote)
+		msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+		if err != nil || len(msgs) == 0 {
+			return -1
 		}
-		_, _ = unix.Write(int(w.parent.Fd()), []byte{1})
-		if listener < 0 {
-			fmt.Fprintf(os.Stderr, "safer-exec: warning: egress watch: could not take over the seccomp listener; UDP and direct egress are not recorded\n")
-			return
+		fds2, err := unix.ParseUnixRights(&msgs[0])
+		if err != nil || len(fds2) == 0 {
+			return -1
 		}
+		return fds2[0]
 	}
-	// Closing the listener makes the notified syscalls of a process that
-	// outlives the run (possible in reduced isolation, which has no PID
-	// namespace) fail with ENOSYS instead of waiting for an answer forever.
+}
+
+func (w *egressWatch) serve() {
+	defer close(w.done)
+	defer w.parent.Close()
+	listener := w.receiveListener()
+	if listener < 0 {
+		return
+	}
+	// The listener is closed only when the run is over. Closing it earlier
+	// would make every watched call of the workload fail with ENOSYS, so
+	// unexpected errors are retried instead. A process that outlives the run
+	// (reduced isolation has no PID namespace) gets ENOSYS afterwards rather
+	// than waiting forever for an answer.
 	defer unix.Close(listener)
 	notif := make([]byte, seccompNotifSize)
 	resp := make([]byte, seccompNotifRespSize)
@@ -363,21 +398,28 @@ func (w *egressWatch) serve(rootPID int) {
 		}
 		fds := []unix.PollFd{{Fd: int32(listener), Events: unix.POLLIN}}
 		n, err := unix.Poll(fds, 100)
-		if err != nil && err != unix.EINTR {
-			return
+		if err != nil {
+			if err != unix.EINTR {
+				time.Sleep(10 * time.Millisecond)
+			}
+			continue
 		}
 		if n == 0 {
 			continue
 		}
-		if fds[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0 && fds[0].Revents&unix.POLLIN == 0 {
-			return // every watched process has exited
+		if fds[0].Revents&unix.POLLIN == 0 {
+			if fds[0].Revents&unix.POLLHUP != 0 {
+				return // every watched process has exited
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 		clear(notif)
 		if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(listener), seccompIoctlNotifRecv, uintptr(unsafe.Pointer(&notif[0]))); errno != 0 {
-			if errno == unix.EINTR || errno == unix.ENOENT {
-				continue
+			if errno != unix.EINTR && errno != unix.ENOENT {
+				time.Sleep(10 * time.Millisecond)
 			}
-			return
+			continue
 		}
 		id := binary.LittleEndian.Uint64(notif[0:])
 		w.inspect(listener, id, notif)
@@ -400,20 +442,12 @@ func (w *egressWatch) inspect(listener int, id uint64, notif []byte) {
 	var addr, addrLen uint64
 	switch nr {
 	case unix.SYS_SOCKET:
-		w.record(pid, "udp", "", 1)
+		w.record(pid, "udp", "")
 		return
 	case unix.SYS_CONNECT:
 		fd, addr, addrLen = int(arg(0)), arg(1), arg(2)
 	case unix.SYS_SENDTO:
 		fd, addr, addrLen = int(arg(0)), arg(4), arg(5)
-	case unix.SYS_SENDMSG:
-		fd = int(arg(0))
-		hdr := readRemote(pid, arg(1), 12)
-		if len(hdr) < 12 {
-			return
-		}
-		addr = binary.LittleEndian.Uint64(hdr[0:])
-		addrLen = uint64(binary.LittleEndian.Uint32(hdr[8:]))
 	default:
 		return
 	}
@@ -433,37 +467,7 @@ func (w *egressWatch) inspect(listener int, id uint64, notif []byte) {
 	if proto != "udp" && loopback && port == w.proxyPort {
 		return // the egress proxy itself
 	}
-	w.record(pid, proto, dest, 0)
-}
-
-// copyListener finds the inner process — rootPID itself (reduced isolation)
-// or a child of it (unshare --fork) — whose descriptor fd is the seccomp
-// listener, and duplicates it into this process.
-func copyListener(rootPID, fd int) int {
-	candidates := []int{rootPID}
-	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", rootPID, rootPID)); err == nil {
-		for _, f := range strings.Fields(string(data)) {
-			if pid, err := strconv.Atoi(f); err == nil {
-				candidates = append(candidates, pid)
-			}
-		}
-	}
-	for _, pid := range candidates {
-		if link, _ := os.Readlink(fmt.Sprintf("/proc/%d/fd/%d", pid, fd)); !strings.Contains(link, "seccomp notify") {
-			continue
-		}
-		pidfd, err := unix.PidfdOpen(pid, 0)
-		if err != nil {
-			return -1
-		}
-		dup, err := unix.PidfdGetfd(pidfd, fd, 0)
-		unix.Close(pidfd)
-		if err != nil {
-			return -1
-		}
-		return dup
-	}
-	return -1
+	w.record(pid, proto, dest)
 }
 
 // readRemote reads n bytes at addr in pid's memory.
@@ -507,39 +511,134 @@ func parseSockaddr(sa []byte) (dest string, loopback bool, port int, ok bool) {
 	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), ip.IsLoopback(), port, true
 }
 
-// socketProto names the type of socket fd in pid ("udp", "tcp" or "ip"
-// when it cannot be read).
-func socketProto(pid, fd int) string {
-	pidfd, err := unix.PidfdOpen(pid, 0)
+// socketProto names the type of socket fd in thread tid: "udp", "tcp", or
+// "ip" when it cannot be told.
+//
+// It first duplicates the descriptor (pidfd_getfd on the thread group, so
+// calls from any thread work before Linux 6.9's PIDFD_THREAD) and asks the
+// socket. The duplicate is closed on a separate goroutine: if the workload
+// closes its own copy meanwhile, ours is the last reference, and a socket
+// with SO_LINGER set makes that close wait. At most maxDupClosers such closes
+// run at once; beyond that, and where pidfd_getfd is denied (Docker's
+// default profile without CAP_SYS_PTRACE), the type comes from the socket
+// tables in /proc, which list a UDP socket only once it is bound.
+func socketProto(tid, fd int) string {
+	if typ, ok := socketTypeByDup(tid, fd); ok {
+		return typ
+	}
+	link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%d", tid, fd))
 	if err != nil {
 		return "ip"
 	}
-	defer unix.Close(pidfd)
-	dup, err := unix.PidfdGetfd(pidfd, fd, 0)
-	if err != nil {
+	inode, ok := strings.CutPrefix(link, "socket:[")
+	if !ok {
 		return "ip"
 	}
-	defer unix.Close(dup)
-	typ, err := unix.GetsockoptInt(dup, unix.SOL_SOCKET, unix.SO_TYPE)
-	switch {
-	case err != nil:
-		return "ip"
-	case typ == unix.SOCK_DGRAM:
-		return "udp"
-	case typ == unix.SOCK_STREAM:
-		return "tcp"
+	inode = strings.TrimSuffix(inode, "]")
+	for _, t := range []struct{ table, proto string }{{"udp", "udp"}, {"udp6", "udp"}, {"tcp", "tcp"}, {"tcp6", "tcp"}} {
+		if socketTableHas(fmt.Sprintf("/proc/%d/net/%s", tid, t.table), inode) {
+			return t.proto
+		}
 	}
 	return "ip"
 }
 
-// record counts one observation. A UDP socket's creation is kept only when
-// no destination of that process is seen, so sockets used through sendmmsg
-// or other unwatched calls are still reported.
-func (w *egressWatch) record(pid int, proto, dest string, sockets int) {
-	exe, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+// maxDupClosers bounds the goroutines closing duplicated sockets.
+const maxDupClosers = 64
+
+var dupClosers = make(chan struct{}, maxDupClosers)
+
+func socketTypeByDup(tid, fd int) (string, bool) {
+	select {
+	case dupClosers <- struct{}{}:
+	default:
+		return "", false
+	}
+	release := func() { <-dupClosers }
+	pidfd, err := unix.PidfdOpen(threadGroup(tid), 0)
+	if err != nil {
+		release()
+		return "", false
+	}
+	dup, err := unix.PidfdGetfd(pidfd, fd, 0)
+	unix.Close(pidfd)
+	if err != nil {
+		release()
+		return "", false
+	}
+	typ, err := unix.GetsockoptInt(dup, unix.SOL_SOCKET, unix.SO_TYPE)
+	go func() {
+		unix.Close(dup)
+		release()
+	}()
+	switch {
+	case err != nil:
+		return "", false
+	case typ == unix.SOCK_DGRAM:
+		return "udp", true
+	case typ == unix.SOCK_STREAM:
+		return "tcp", true
+	}
+	return "ip", true
+}
+
+// threadGroup returns the thread-group id of tid, or tid itself.
+func threadGroup(tid int) int {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", tid))
+	if err != nil {
+		return tid
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "Tgid:"); ok {
+			if pid, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+				return pid
+			}
+		}
+	}
+	return tid
+}
+
+// socketTableHas reports whether a /proc/net socket table lists inode.
+func socketTableHas(path, inode string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) > 9 && fields[9] == inode {
+			return true
+		}
+	}
+	return false
+}
+
+// exeOf returns pid's executable, read once per pid.
+func (w *egressWatch) exeOf(pid int) string {
+	w.mu.Lock()
+	exe, ok := w.exes[pid]
+	w.mu.Unlock()
+	if ok {
+		return exe
+	}
+	exe, _ = os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 	if exe == "" {
 		exe = "pid " + strconv.Itoa(pid)
 	}
+	w.mu.Lock()
+	if len(w.exes) < maxExeCache {
+		w.exes[pid] = exe
+	}
+	w.mu.Unlock()
+	return exe
+}
+
+// record counts one observation: a UDP socket's creation (dest "") or a
+// destination.
+func (w *egressWatch) record(pid int, proto, dest string) {
+	exe := w.exeOf(pid)
 	key := proto + "\x00" + dest + "\x00" + exe
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -555,21 +654,19 @@ func (w *egressWatch) record(pid int, proto, dest string, sockets int) {
 }
 
 // finish stops the watch and returns one proxy-bypass-attempt entry per
-// destination.
+// destination, and one per executable that opened UDP sockets. It waits for
+// the serve loop at most a couple of seconds.
 func (w *egressWatch) finish() []config.AuditEntry {
 	if w == nil {
 		return nil
 	}
 	close(w.stop)
-	<-w.done
+	select {
+	case <-w.done:
+	case <-time.After(2 * time.Second):
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	withDest := map[string]bool{}
-	for _, n := range w.notes {
-		if n.dest != "" {
-			withDest[n.exe] = true
-		}
-	}
 	keys := make([]string, 0, len(w.notes))
 	for k := range w.notes {
 		keys = append(keys, k)
@@ -581,17 +678,17 @@ func (w *egressWatch) finish() []config.AuditEntry {
 		var target, detail string
 		switch {
 		case n.dest == "":
-			if withDest[n.exe] {
-				continue
-			}
 			target = "udp socket"
 			detail = fmt.Sprintf("%s (pid %d) opened %d UDP socket(s) while egress is pinned to the proxy; Landlock does not confine UDP, so DNS lookups or QUIC can carry data past the hostname allowlist", n.exe, n.pid, n.count)
 		case n.proto == "udp":
 			target = "udp " + n.dest
 			detail = fmt.Sprintf("%s (pid %d) sent UDP to %s %d time(s), outside the egress proxy; Landlock does not confine UDP, so DNS lookups or QUIC can carry data past the hostname allowlist", n.exe, n.pid, n.dest, n.count)
-		default:
-			target = n.proto + " " + n.dest
+		case n.proto == "tcp":
+			target = "tcp " + n.dest
 			detail = fmt.Sprintf("%s (pid %d) connected to %s %d time(s) without going through the egress proxy; Landlock confines TCP by port only, so a connection on an allowed port reaches any host", n.exe, n.pid, n.dest, n.count)
+		default:
+			target = "ip " + n.dest
+			detail = fmt.Sprintf("%s (pid %d) addressed %s %d time(s) without going through the egress proxy (socket type unknown); Landlock does not confine UDP and confines TCP by port only", n.exe, n.pid, n.dest, n.count)
 		}
 		out = append(out, config.AuditEntry{Type: "proxy-bypass-attempt", Target: target, Detail: detail})
 	}
@@ -615,7 +712,7 @@ func attachDetections(cfg config.ExecConfig, cmd *exec.Cmd, proxy *egressProxy) 
 // startDetections starts both watches once the inner process runs and
 // returns the function that stops them and reports their findings.
 func startDetections(cfg config.ExecConfig, cmd *exec.Cmd, cg *cgroupWatch, egress *egressWatch) func() {
-	egress.started(cmd.Process.Pid)
+	egress.started()
 	cg.start(cfg)
 	return func() {
 		emitDetections(egress.finish())

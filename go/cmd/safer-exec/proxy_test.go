@@ -12,8 +12,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -846,7 +848,7 @@ func TestEgressProxyRecordsSNIMismatch(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }))
 	defer srv.Close()
 	port := srv.Listener.Addr().(*net.TCPAddr).Port
-	p, err := startEgressProxy(config.ExecConfig{AllowHosts: []string{"localhost"}, AllowIPs: []string{"127.0.0.1"}, AllowPorts: []int{port}})
+	p, err := startEgressProxy(config.ExecConfig{AllowHosts: []string{"localhost"}, AllowIPs: []string{"127.0.0.1"}, AllowPorts: []int{port}, EnableAudit: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -888,14 +890,14 @@ func TestEgressProxyRecordsEmbeddedURL(t *testing.T) {
 	defer srv.Close()
 	hostPort := strings.TrimPrefix(srv.URL, "http://")
 	port := srv.Listener.Addr().(*net.TCPAddr).Port
-	p, err := startEgressProxy(config.ExecConfig{AllowIPs: []string{"127.0.0.1"}, AllowPorts: []int{port}})
+	p, err := startEgressProxy(config.ExecConfig{AllowIPs: []string{"127.0.0.1"}, AllowPorts: []int{port}, EnableAudit: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer p.Close()
 	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", p.port))
 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
-	target := "http://" + hostPort + "/fetch?callback=https%3A%2F%2Fexfil.example%2Fx%3Ftoken%3Dsecret&self=http://" + hostPort + "/y"
+	target := "http://" + hostPort + "/api/secretpath/fetch?callback=https%3A%2F%2Fexfil.example%2Fx%3Ftoken%3Dsecret&self=http://" + hostPort + "/y"
 	resp, err := client.Get(target)
 	if err != nil {
 		t.Fatal(err)
@@ -908,32 +910,183 @@ func TestEgressProxyRecordsEmbeddedURL(t *testing.T) {
 		if e.Type == "proxy-embedded-url" {
 			found = append(found, e)
 		}
-		if strings.Contains(e.Target+e.Detail, "secret") {
+		if strings.Contains(e.Target+e.Detail, "secret") || strings.Contains(e.Target+e.Detail, "token") {
 			t.Fatalf("entry leaked the query value: %+v", e)
 		}
 	}
-	if len(found) != 1 || !strings.Contains(found[0].Detail, `"callback"`) || !strings.Contains(found[0].Detail, "exfil.example") ||
-		found[0].Target != "GET http://"+hostPort+"/fetch" {
+	if len(found) != 1 || !strings.Contains(found[0].Detail, `"callback"`) || !strings.Contains(found[0].Detail, "exfil.example:443") ||
+		found[0].Target != "GET "+hostPort {
 		t.Fatalf("embedded url entries = %+v", found)
 	}
 }
 
 func TestEmbeddedURLHosts(t *testing.T) {
 	cases := map[string][]string{
-		"http://a.example/x?u=https://b.example/p":          {"u=b.example"},
-		"http://a.example/x?u=%2F%2Fc.example%2Fp":          {"u=c.example"},
-		"http://a.example/proxy/https://d.example/img.png":  {"path=d.example"},
-		"http://a.example/x?q=plain+text&n=1":               nil,
-		"http://a.example/x?u=mailto:someone@e.example":     nil,
-		"http://a.example/x?u=HTTPS://F.Example.:8443/path": {"u=f.example"},
+		"http://a.example/x?u=https://b.example/p":            {"u=b.example:443"},
+		"http://a.example/x?u=%2F%2Fc.example%2Fp":            {"u=c.example:80"},
+		"http://a.example/proxy/https://d.example/img.png":    {"path=d.example:443"},
+		"http://a.example/x?q=plain+text&n=1":                 nil,
+		"http://a.example/x?u=mailto:someone@e.example":       nil,
+		"http://a.example/x?u=HTTPS://F.Example.:8443/path":   {"u=f.example:8443"},
+		"http://a.example/x?a=1;u=http://g.example/":          {"u=g.example:80"},
+		"http://a.example/p/https://user:pw@h.example:9000/x": {"path=h.example:9000"},
 	}
 	for target, want := range cases {
 		var got []string
-		for _, kv := range embeddedURLHosts(target) {
-			got = append(got, kv[0]+"="+kv[1])
+		for _, e := range embeddedURLHosts(target) {
+			got = append(got, fmt.Sprintf("%s=%s:%d", e.where, e.host, e.port))
 		}
 		if strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Errorf("embeddedURLHosts(%q) = %v, want %v", target, got, want)
+		}
+	}
+}
+
+// Detections are audit-only: without audit the proxy records none of them.
+func TestEgressProxyDetectionsNeedAudit(t *testing.T) {
+	p, err := startEgressProxy(config.ExecConfig{AllowHosts: []string{"a.example"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	p.checkSNI("a.example", 443, "a.example:443", "b.example", false)
+	p.checkEmbeddedURLs("GET", "http://a.example/?u=http://c.example/", "a.example", 80)
+	p.recordTraffic("a.example:443", 10<<20, 0)
+	if v := p.violationsSnapshot(); len(v) != 0 {
+		t.Fatalf("entries without audit: %+v", v)
+	}
+}
+
+// A flood of distinct findings is capped per type with one overflow entry,
+// so it cannot crowd out the other type.
+func TestEgressProxyFindingCapsArePerType(t *testing.T) {
+	p, err := startEgressProxy(config.ExecConfig{AllowHosts: []string{"a.example"}, EnableAudit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	for i := 0; i < maxProxyFindings+50; i++ {
+		p.checkSNI("a.example", 443, "a.example:443", fmt.Sprintf("junk%d.example", i), false)
+	}
+	p.checkEmbeddedURLs("GET", "http://a.example/?u=http://real.example/", "a.example", 80)
+	counts := map[string]int{}
+	overflow := false
+	for _, e := range p.violationsSnapshot() {
+		counts[e.Type]++
+		if e.Target == "proxy" {
+			overflow = true
+		}
+	}
+	if counts["proxy-sni-mismatch"] != maxProxyFindings+1 || !overflow || counts["proxy-embedded-url"] != 1 {
+		t.Fatalf("counts = %v overflow=%v", counts, overflow)
+	}
+}
+
+// Splitting an upload across targets that each stay under the threshold is
+// still reported for the run as a whole.
+func TestEgressProxyRecordsSpreadUploads(t *testing.T) {
+	p, err := startEgressProxy(config.ExecConfig{AllowHosts: []string{"*.example"}, EnableAudit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	for i := 0; i < 8; i++ {
+		p.recordTraffic(fmt.Sprintf("h%d.example:443", i), uploadHeavyMinBytes/2, 100)
+	}
+	var found []config.AuditEntry
+	for _, e := range p.violationsSnapshot() {
+		if e.Type == "proxy-upload-heavy" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 || found[0].Target != "8 targets" {
+		t.Fatalf("spread upload entries = %+v", found)
+	}
+}
+
+// A tunnel the server keeps open is counted when the run's entries are
+// flushed: the flush closes the proxy and waits for its handlers.
+func TestEgressProxyFlushCountsOpenTunnels(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var hold atomic.Bool
+	hold.Store(true)
+	defer hold.Store(false)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 32<<10)
+		for { // read, ignore EOF, never close: a server holding the tunnel open
+			if _, err := c.Read(buf); err != nil && err != io.EOF {
+				return
+			}
+			if hold.Load() {
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+	p, err := startEgressProxy(config.ExecConfig{AllowIPs: []string{"127.0.0.1"}, AllowPorts: []int{port}, EnableAudit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", p.port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n", port)
+	br := bufio.NewReader(conn)
+	if line, _ := br.ReadString('\n'); !strings.Contains(line, "200") {
+		t.Fatalf("CONNECT: %q", line)
+	}
+	br.ReadString('\n')
+	conn.Write(make([]byte, 2<<20))
+	time.Sleep(200 * time.Millisecond)
+
+	old := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+	start := time.Now()
+	p.flushViolations()
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("flush waited %s for a tunnel the server held open", d)
+	}
+	w.Close()
+	os.Stderr = old
+	out, _ := io.ReadAll(r)
+	if !strings.Contains(string(out), "proxy-upload-heavy") {
+		t.Fatalf("open tunnel not counted: %s", out)
+	}
+}
+
+// A port spelled with leading zeros is the same target.
+func TestEgressProxyNormalizesTargetPort(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+	p, err := startEgressProxy(config.ExecConfig{AllowIPs: []string{"127.0.0.1"}, AllowPorts: []int{port}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", p.port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(conn, "CONNECT 127.0.0.1:000%d HTTP/1.1\r\n\r\n", port)
+	bufio.NewReader(conn).ReadString('\n')
+	conn.Close()
+	entries := waitForEntry(t, p, "proxy-connect")
+	for _, e := range entries {
+		if e.Type == "proxy-connect" && e.Target != fmt.Sprintf("127.0.0.1:%d", port) {
+			t.Fatalf("target = %q", e.Target)
 		}
 	}
 }
@@ -948,7 +1101,7 @@ func TestEgressProxyRecordsUploadHeavyTargets(t *testing.T) {
 	defer srv.Close()
 	hostPort := strings.TrimPrefix(srv.URL, "http://")
 	port := srv.Listener.Addr().(*net.TCPAddr).Port
-	p, err := startEgressProxy(config.ExecConfig{AllowIPs: []string{"127.0.0.1"}, AllowPorts: []int{port}})
+	p, err := startEgressProxy(config.ExecConfig{AllowIPs: []string{"127.0.0.1"}, AllowPorts: []int{port}, EnableAudit: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -598,11 +598,11 @@ With `traceCrypto`, the egress proxy reads the cleartext start of each CONNECT t
 
 **Residual risk:**
 
-- Detection is not prevention. Each check observes, and a careful sender stays under its thresholds: it can upload slowly, use symbols longer than the 10-second window, or use a resource that is not sampled.
-- Cache-timing channels (the Spectre-style channel in the report) leave no trace in CPU-time or IO counters and are not detected. Reliable detection needs hardware performance counters; seccomp already denies `perf_event_open` inside the sandbox.
-- HTTPS hides request paths and bodies from the proxy, so a URL handed to an allowed service over HTTPS is invisible.
-- The Linux egress watch reads destinations from the target's memory after the call is made. A multithreaded workload can change the buffer between the check and the kernel's use of it. The notification id is re-checked, so a reused pid is never attributed, but the address itself is best-effort.
-- The registry only sees runs of the same user that registered. A workload in another sandbox technology, or under another user, is not compared.
+- Detection is not prevention. Each check observes, and a careful sender stays under its thresholds. It can keep each upload under 1 MiB per target while also keeping the run total balanced by downloading padding, use symbols longer than the 10-second window, or use a resource that is not sampled.
+- Cache-timing channels (the Spectre-style channel in the report) leave no trace in CPU-time or IO counters and are not detected. Reliable detection needs hardware performance counters; seccomp already denies `perf_event_open` inside the sandbox. On most Linux hosts the sandbox cgroup has no io controller, so storage channels are not sampled either.
+- HTTPS hides request paths and bodies from the proxy, so a URL handed to an allowed service over HTTPS is invisible. On plain HTTP only the first request of a connection is parsed.
+- The Linux egress watch does not see `sendmsg`/`sendmmsg` destinations, only the UDP socket's creation. It reads destinations from the target's memory after the call is made; a multithreaded workload can change the buffer before the kernel uses it. The notification id is re-checked, so a reused pid is never attributed, but the address itself is best-effort. Container profiles that deny `process_vm_readv` or `pidfd_getfd` leave destinations or socket types out.
+- The run registry only sees runs of the same user that registered. A workload in another sandbox technology, or under another user, is not compared. On Linux and Windows, a policy that grants the user's cache directory lets the workload forge or delete records; the engine bounds and validates what it reads, so this skews findings but cannot hang or crash the engine.
 - In reduced isolation there is no PID namespace, so a process can outlive the run. Once the engine stops serving the watch, that process gets `ENOSYS` from the watched network calls.
 - Linux sandboxes share the host kernel. Kernel and VM escapes like those in the report are outside what a process sandbox can contain; run adversarial agents inside a microVM, with safer-exec as the inner layer.
 
