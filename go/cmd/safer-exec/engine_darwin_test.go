@@ -714,3 +714,21 @@ func TestCheckSensitiveEnv(t *testing.T) {
 		})
 	}
 }
+
+// The workload must not reach the run registry, even through a granted
+// parent directory.
+func TestSeatbeltProfileDeniesRunRegistry(t *testing.T) {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		t.Skip("no user cache dir")
+	}
+	profile := buildSeatbeltProfile(config.ExecConfig{Cmd: "/bin/echo", WritePaths: []string{cache}}, 0)
+	rule := registryDenyRule()
+	if !strings.Contains(profile, rule) {
+		t.Fatalf("profile lacks %q", rule)
+	}
+	grant := fmt.Sprintf("(allow file-write* (subpath %q))", cache)
+	if !strings.Contains(profile, grant) || strings.LastIndex(profile, rule) < strings.LastIndex(profile, grant) {
+		t.Fatal("the registry deny comes before a later grant of its parent")
+	}
+}

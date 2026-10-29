@@ -450,6 +450,32 @@ func (j *Job) Accounting() (peakJobMemory uint64, totalProcesses uint32, err err
 	return uint64(info.PeakJobMemoryUsed), basic.TotalProcesses, nil
 }
 
+// basicAndIoAccountingInformation is
+// JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION.
+type basicAndIoAccountingInformation struct {
+	Basic basicAccountingInformation
+	IO    windows.IO_COUNTERS
+}
+
+// Usage returns the CPU time (user plus kernel, in microseconds) and the IO
+// bytes (read, write and other transfers) that every process of the job has
+// used so far, including processes that have already exited.
+func (j *Job) Usage() (cpuUsec, ioBytes uint64, err error) {
+	j.hmu.RLock()
+	defer j.hmu.RUnlock()
+	if j.closed {
+		return 0, 0, errClosed
+	}
+	var info basicAndIoAccountingInformation
+	if err = queryJobInformation(j.handle, windows.JobObjectBasicAndIoAccountingInformation,
+		unsafe.Pointer(&info), unsafe.Sizeof(info)); err != nil {
+		return 0, 0, err
+	}
+	cpu := uint64(info.Basic.TotalUserTime+info.Basic.TotalKernelTime) / 10
+	io := info.IO.ReadTransferCount + info.IO.WriteTransferCount + info.IO.OtherTransferCount
+	return cpu, io, nil
+}
+
 // isConsoleHostOf reports whether pid is the console host (conhost.exe) the
 // OS created for parent; killing it would take the parent down with it.
 func isConsoleHostOf(pid, parent uint32) bool {

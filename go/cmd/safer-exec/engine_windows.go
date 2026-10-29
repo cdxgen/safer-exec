@@ -267,6 +267,12 @@ func requiresHostLoopback(cfg config.ExecConfig) bool {
 
 // run executes cfg.Cmd in an MXC ProcessContainer.
 func run(cfg config.ExecConfig) error {
+	reg := registerRun(cfg)
+	defer reg.close()
+	if cfg.EnableAudit {
+		emitDetections(reg.check())
+		defer func() { emitDetections(reg.check()) }()
+	}
 	mode := mxc.ModeEnforce
 	switch {
 	case cfg.EnableLearn:
@@ -493,6 +499,14 @@ func run(cfg config.ExecConfig) error {
 		return fmt.Errorf("start %s: %w", launcher, err)
 	}
 	launcherPID := uint32(cmd.Process.Pid)
+	// The job's aggregate CPU and IO counters, sampled for timing channels.
+	var contention *contentionSampler
+	if job != nil && cfg.EnableAudit {
+		contention = startContentionSampler(func() (uint64, uint64, bool) {
+			cpu, io, err := job.Usage()
+			return cpu, io, err == nil
+		})
+	}
 
 	started := time.Now()
 	var events sync.WaitGroup
@@ -543,6 +557,7 @@ func run(cfg config.ExecConfig) error {
 	}
 	exitCode := int(uint32(cmd.ProcessState.ExitCode()))
 
+	detections := contention.finish()
 	if job != nil {
 		// Closing the job kills anything the workload left running, which
 		// also ends the event stream.
@@ -562,6 +577,7 @@ func run(cfg config.ExecConfig) error {
 		stderr.EnsureNewline()
 		proxy.flushViolations()
 	}
+	emitDetections(detections)
 	var cryptoLibs []config.CryptoLibrary
 	if libTrace != nil {
 		cryptoLibs = reportImageLoads(cfg, libTrace, launcherPID, stderr)

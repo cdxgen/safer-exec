@@ -55,6 +55,12 @@ func run(cfg config.ExecConfig) error {
 		return nil
 	}
 
+	reg := registerRun(cfg)
+	defer reg.close()
+	if cfg.EnableAudit {
+		emitDetections(reg.check())
+	}
+
 	// Handle validate profile mode: syntax-check the Seatbelt profile
 	if cfg.ValidateProfile {
 		return runValidateProfile(cfg)
@@ -223,6 +229,11 @@ func run(cfg config.ExecConfig) error {
 			proxy = nil
 		}
 		reportDarwinAudit(cfg, auditStartedAt, rootPID)
+		if cfg.EnableAudit {
+			emitDetections(reg.check())
+		}
+		// Deferred calls do not run on the os.Exit paths.
+		reg.close()
 	}
 
 	// Set a hard timeout using a goroutine if timeoutMs is set
@@ -1271,6 +1282,12 @@ func buildSeatbeltProfile(cfg config.ExecConfig, proxyPort int) string {
 		}
 	}
 
+	// The run registry (covert.go) must not be readable or writable by the
+	// workload, even when a policy grants the cache directory around it:
+	// planted records would make the engine report false overlaps, and a
+	// deleted record hides this run from concurrent ones.
+	sb.WriteString(registryDenyRule())
+
 	// Network rules
 	resolvedIPs := cfg.AllowIPs
 	if len(cfg.AllowHosts) > 0 {
@@ -1555,3 +1572,13 @@ func runDiagnostics() config.DiagnosticsResult {
 // Ensure imports are used
 var _ = json.Marshal
 var _ = bufio.Scanner{}
+
+// registryDenyRule denies the workload every access to the run registry.
+// Later rules win in a Seatbelt profile, so it follows the path grants.
+func registryDenyRule() string {
+	dir := registryDir()
+	if resolved, err := filepath.EvalSymlinks(filepath.Dir(dir)); err == nil {
+		dir = filepath.Join(resolved, filepath.Base(dir))
+	}
+	return fmt.Sprintf("(deny file-read* file-write* (subpath %q))\n", dir)
+}
