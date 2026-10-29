@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -683,4 +684,53 @@ func TestSuiteDecomposition(t *testing.T) {
 	if VersionName(0x0304) != "TLSv1.3" || VersionName(0x0303) != "TLSv1.2" || GroupName(0x0017) != "secp256r1" || GroupKeyExchange(0x0100) != "DHE" {
 		t.Error("version or group naming")
 	}
+}
+
+// HelloReader reports the ClientHello's SNI once, even when the record
+// arrives split across reads, and forwards every byte unchanged.
+func TestHelloReaderReportsSNI(t *testing.T) {
+	name := []byte("front.example")
+	sni := binary.BigEndian.AppendUint16(nil, uint16(len(name)+3))
+	sni = append(sni, 0)
+	sni = binary.BigEndian.AppendUint16(sni, uint16(len(name)))
+	sni = append(sni, name...)
+	record := clientHello(extension(extServerName, sni))
+	payload := append(append([]byte{}, record...), []byte{23, 3, 3, 0, 2, 0xaa, 0xbb}...)
+
+	var calls int
+	var got string
+	r := HelloReader(iotestOneByte(bytes.NewReader(payload)), func(name string, ech bool) {
+		calls++
+		got = name
+	})
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out, payload) {
+		t.Fatal("HelloReader altered the stream")
+	}
+	if calls != 1 || got != "front.example" {
+		t.Fatalf("onHello calls=%d name=%q", calls, got)
+	}
+}
+
+func TestHelloReaderIgnoresNonTLS(t *testing.T) {
+	called := false
+	r := HelloReader(strings.NewReader("GET / HTTP/1.1\r\n\r\n"), func(string, bool) { called = true })
+	if _, err := io.ReadAll(r); err != nil || called {
+		t.Fatalf("non-TLS stream reported (err=%v)", err)
+	}
+}
+
+// iotestOneByte returns a reader that yields one byte per Read call.
+func iotestOneByte(r io.Reader) io.Reader { return oneByte{r} }
+
+type oneByte struct{ r io.Reader }
+
+func (o oneByte) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return o.r.Read(p[:1])
 }

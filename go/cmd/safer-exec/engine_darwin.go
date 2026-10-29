@@ -55,6 +55,12 @@ func run(cfg config.ExecConfig) error {
 		return nil
 	}
 
+	reg := registerRun(cfg)
+	defer reg.close()
+	if cfg.EnableAudit {
+		emitDetections(reg.check())
+	}
+
 	// Handle validate profile mode: syntax-check the Seatbelt profile
 	if cfg.ValidateProfile {
 		return runValidateProfile(cfg)
@@ -223,6 +229,11 @@ func run(cfg config.ExecConfig) error {
 			proxy = nil
 		}
 		reportDarwinAudit(cfg, auditStartedAt, rootPID)
+		if cfg.EnableAudit {
+			emitDetections(reg.check())
+		}
+		// Deferred calls do not run on the os.Exit paths.
+		reg.close()
 	}
 
 	// Set a hard timeout using a goroutine if timeoutMs is set

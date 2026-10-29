@@ -818,3 +818,172 @@ func TestEgressProxyWildcardRefusesHostLocalResolution(t *testing.T) {
 		t.Errorf("exact localhost entry: CONNECT %s = %q, want 200", target, status)
 	}
 }
+
+// waitForEntry collects proxy audit entries until one of type typ arrives or
+// the deadline passes. Tunnels record their findings when they close, which
+// can trail the client's last read.
+func waitForEntry(t *testing.T, p *egressProxy, typ string) []config.AuditEntry {
+	t.Helper()
+	var all []config.AuditEntry
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		all = append(all, p.violationsSnapshot()...)
+		for _, e := range all {
+			if e.Type == typ {
+				return all
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no %s entry; got %+v", typ, all)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A tunnel whose TLS server name differs from its CONNECT host is recorded
+// as proxy-sni-mismatch (domain fronting); one whose names agree is not.
+func TestEgressProxyRecordsSNIMismatch(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }))
+	defer srv.Close()
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+	p, err := startEgressProxy(config.ExecConfig{AllowHosts: []string{"localhost"}, AllowIPs: []string{"127.0.0.1"}, AllowPorts: []int{port}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", p.port))
+	get := func(serverName string) {
+		client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: serverName},
+		}}
+		resp, err := client.Get(fmt.Sprintf("https://localhost:%d/", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		client.CloseIdleConnections()
+	}
+	get("localhost")
+	get("fronted.example")
+	entries := waitForEntry(t, p, "proxy-sni-mismatch")
+	var mismatches []config.AuditEntry
+	for _, e := range entries {
+		if e.Type == "proxy-sni-mismatch" {
+			mismatches = append(mismatches, e)
+		}
+	}
+	want := fmt.Sprintf("CONNECT localhost:%d", port)
+	if len(mismatches) != 1 || mismatches[0].Target != want ||
+		!strings.Contains(mismatches[0].Detail, `"fronted.example"`) || !strings.Contains(mismatches[0].Detail, "not on the allowlist") {
+		t.Fatalf("sni mismatch entries = %+v", mismatches)
+	}
+}
+
+// A plain-HTTP request carrying a URL for another host in its query or path
+// is recorded as proxy-embedded-url, without the URL itself.
+func TestEgressProxyRecordsEmbeddedURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }))
+	defer srv.Close()
+	hostPort := strings.TrimPrefix(srv.URL, "http://")
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+	p, err := startEgressProxy(config.ExecConfig{AllowIPs: []string{"127.0.0.1"}, AllowPorts: []int{port}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", p.port))
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	target := "http://" + hostPort + "/fetch?callback=https%3A%2F%2Fexfil.example%2Fx%3Ftoken%3Dsecret&self=http://" + hostPort + "/y"
+	resp, err := client.Get(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	entries := waitForEntry(t, p, "proxy-embedded-url")
+	var found []config.AuditEntry
+	for _, e := range entries {
+		if e.Type == "proxy-embedded-url" {
+			found = append(found, e)
+		}
+		if strings.Contains(e.Target+e.Detail, "secret") {
+			t.Fatalf("entry leaked the query value: %+v", e)
+		}
+	}
+	if len(found) != 1 || !strings.Contains(found[0].Detail, `"callback"`) || !strings.Contains(found[0].Detail, "exfil.example") ||
+		found[0].Target != "GET http://"+hostPort+"/fetch" {
+		t.Fatalf("embedded url entries = %+v", found)
+	}
+}
+
+func TestEmbeddedURLHosts(t *testing.T) {
+	cases := map[string][]string{
+		"http://a.example/x?u=https://b.example/p":          {"u=b.example"},
+		"http://a.example/x?u=%2F%2Fc.example%2Fp":          {"u=c.example"},
+		"http://a.example/proxy/https://d.example/img.png":  {"path=d.example"},
+		"http://a.example/x?q=plain+text&n=1":               nil,
+		"http://a.example/x?u=mailto:someone@e.example":     nil,
+		"http://a.example/x?u=HTTPS://F.Example.:8443/path": {"u=f.example"},
+	}
+	for target, want := range cases {
+		var got []string
+		for _, kv := range embeddedURLHosts(target) {
+			got = append(got, kv[0]+"="+kv[1])
+		}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("embeddedURLHosts(%q) = %v, want %v", target, got, want)
+		}
+	}
+}
+
+// A client that uploads far more than it downloads through an allowed target
+// is recorded as proxy-upload-heavy; ordinary downloads are not.
+func TestEgressProxyRecordsUploadHeavyTargets(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+	hostPort := strings.TrimPrefix(srv.URL, "http://")
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+	p, err := startEgressProxy(config.ExecConfig{AllowIPs: []string{"127.0.0.1"}, AllowPorts: []int{port}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", p.port), 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", hostPort, hostPort)
+	br := bufio.NewReader(conn)
+	if line, _ := br.ReadString('\n'); !strings.Contains(line, "200") {
+		t.Fatalf("CONNECT: %q", line)
+	}
+	for {
+		if line, err := br.ReadString('\n'); err != nil || line == "\r\n" {
+			break
+		}
+	}
+	body := strings.Repeat("x", 2<<20)
+	fmt.Fprintf(conn, "POST /upload HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", hostPort, len(body), body)
+	io.Copy(io.Discard, br)
+	conn.Close()
+	entries := waitForEntry(t, p, "proxy-upload-heavy")
+	for _, e := range entries {
+		if e.Type == "proxy-upload-heavy" && e.Target != hostPort {
+			t.Fatalf("upload-heavy target = %q, want %q", e.Target, hostPort)
+		}
+	}
+
+	p.recordTraffic("cdn.example:443", 4<<10, 50<<20)
+	for _, e := range p.violationsSnapshot() {
+		if e.Type == "proxy-upload-heavy" {
+			t.Fatalf("a download was reported as upload-heavy: %+v", e)
+		}
+	}
+}

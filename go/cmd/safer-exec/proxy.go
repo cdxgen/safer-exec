@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -63,7 +64,31 @@ type egressProxy struct {
 	ciphers    []config.CipherInfo
 	cipherSeen map[string]bool
 	closed     bool
+	// traffic tallies the bytes each allowed target sent and received across
+	// all of its tunnels, for the upload-heavy finding at flush time.
+	traffic map[string]*proxyTraffic
+	// findings deduplicates proxy-sni-mismatch and proxy-embedded-url entries.
+	findings map[string]bool
 }
+
+// proxyTraffic is the byte count of one target's tunnels. up is what the
+// sandboxed client sent, down what the target returned.
+type proxyTraffic struct {
+	up, down int64
+	conns    int
+}
+
+// An allowed target counts as upload-heavy when the client sent at least
+// uploadHeavyMinBytes and at least uploadHeavyRatio times what it received.
+// Package and API downloads are the other way round; a lopsided upload to a
+// host the policy allows for downloads is how data leaves through it.
+const (
+	uploadHeavyMinBytes = 1 << 20
+	uploadHeavyRatio    = 4
+)
+
+// maxProxyFindings caps the sni-mismatch and embedded-url entries recorded.
+const maxProxyFindings = 256
 
 // maxProxyConnectEntries caps distinct proxy-connect audit entries so a
 // command that fans out to many hosts cannot grow the audit log unbounded.
@@ -89,6 +114,8 @@ func startEgressProxy(cfg config.ExecConfig) (*egressProxy, error) {
 
 		connected:  make(map[string]bool),
 		cipherSeen: make(map[string]bool),
+		traffic:    make(map[string]*proxyTraffic),
+		findings:   make(map[string]bool),
 		observeTLS: cfg.TraceCrypto || cfg.CBOMOutputPath != "",
 	}
 
@@ -332,13 +359,154 @@ func proxyCipherInfo(target string, h tlsobserve.Handshake) config.CipherInfo {
 	return info
 }
 
-// violationsSnapshot returns and clears recorded audit entries.
+// violationsSnapshot returns and clears recorded audit entries, followed by
+// a proxy-upload-heavy entry for each target whose traffic so far qualifies.
 func (p *egressProxy) violationsSnapshot() []config.AuditEntry {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	v := p.violations
 	p.violations = nil
+	targets := make([]string, 0, len(p.traffic))
+	for target := range p.traffic {
+		targets = append(targets, target)
+	}
+	sort.Strings(targets)
+	for _, target := range targets {
+		t := p.traffic[target]
+		if t.up < uploadHeavyMinBytes || t.up < uploadHeavyRatio*t.down {
+			continue
+		}
+		v = append(v, config.AuditEntry{
+			Type:   "proxy-upload-heavy",
+			Target: target,
+			Detail: fmt.Sprintf("sent %d bytes and received %d over %d connection(s); an upload this lopsided to an allowed host can be data leaving through it", t.up, t.down, t.conns),
+		})
+	}
+	p.traffic = make(map[string]*proxyTraffic)
 	return v
+}
+
+// recordTraffic adds one finished tunnel's byte counts to its target.
+func (p *egressProxy) recordTraffic(target string, up, down int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t := p.traffic[target]
+	if t == nil {
+		if len(p.traffic) >= maxProxyConnectEntries {
+			return
+		}
+		t = &proxyTraffic{}
+		p.traffic[target] = t
+	}
+	t.up += up
+	t.down += down
+	t.conns++
+}
+
+// recordFinding records a detection entry once per key, within
+// maxProxyFindings. Unlike proxy-violation, nothing was denied.
+func (p *egressProxy) recordFinding(key, typ, target, detail string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.findings[key] || len(p.findings) >= maxProxyFindings {
+		return
+	}
+	p.findings[key] = true
+	p.violations = append(p.violations, config.AuditEntry{Type: typ, Target: target, Detail: detail})
+}
+
+// checkSNI records a proxy-sni-mismatch entry when a tunnel's TLS server
+// name differs from the host its CONNECT request named. The proxy dials the
+// CONNECT host, so a different SNI asks whatever serves that address (a CDN
+// or a shared cloud front end) for another site: domain fronting past the
+// hostname allowlist. A tunnel without SNI (IP literal targets, non-TLS
+// protocols) is not reported.
+func (p *egressProxy) checkSNI(connectHost string, port int, target, serverName string, ech bool) {
+	sni := normalizeProxyHost(serverName)
+	if sni == "" || sni == normalizeProxyHost(connectHost) {
+		return
+	}
+	detail := fmt.Sprintf("TLS server name %q differs from the CONNECT host; the tunnel can reach a different site behind the same address (domain fronting)", sni)
+	if !p.learning() && !p.targetAllowed(sni, port) {
+		detail += "; that name is not on the allowlist"
+	}
+	if ech {
+		detail += "; Encrypted Client Hello is on, so this is the outer name and the real server name is hidden"
+	}
+	p.recordFinding("sni\x00"+target+"\x00"+sni, "proxy-sni-mismatch", "CONNECT "+target, detail)
+}
+
+// embeddedURLHosts returns, for each query parameter and path segment of a
+// plain-HTTP request target that carries an absolute or scheme-relative URL,
+// the parameter name (or "path") and the host that URL names. The values
+// themselves are never returned: they can carry credentials.
+func embeddedURLHosts(target string) [][2]string {
+	u, err := url.Parse(target)
+	if err != nil {
+		return nil
+	}
+	var out [][2]string
+	hostOf := func(v string) string {
+		v = strings.TrimSpace(v)
+		i := strings.Index(v, "://")
+		switch {
+		case i > 0:
+			v = v[i+1:]
+		case strings.HasPrefix(v, "//"):
+		default:
+			return ""
+		}
+		ref, err := url.Parse(v)
+		if err != nil {
+			return ""
+		}
+		return normalizeProxyHost(ref.Hostname())
+	}
+	keys := make([]string, 0)
+	q := u.Query()
+	for k := range q {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		for _, v := range q[k] {
+			if h := hostOf(v); h != "" {
+				out = append(out, [2]string{k, h})
+			}
+		}
+	}
+	if i := strings.Index(u.Path, "://"); i > 0 {
+		start := strings.LastIndex(u.Path[:i], "/") + 1
+		if h := hostOf(u.Path[start:]); h != "" {
+			out = append(out, [2]string{"path", h})
+		}
+	}
+	return out
+}
+
+// checkEmbeddedURLs records a proxy-embedded-url entry for each URL a
+// plain-HTTP request carries for a host other than its own. An allowed
+// service that fetches a URL it is handed (webhooks, link previews, image
+// proxies, metrics endpoints) turns into a route to any host. HTTPS requests
+// are encrypted inside their tunnel and cannot be checked.
+func (p *egressProxy) checkEmbeddedURLs(method, target, requestHost string, port int) {
+	self := normalizeProxyHost(requestHost)
+	subject := method + " " + redactRequestTarget(target)
+	for _, kv := range embeddedURLHosts(target) {
+		name, host := kv[0], kv[1]
+		if host == self {
+			continue
+		}
+		where := fmt.Sprintf("query parameter %q", name)
+		if name == "path" {
+			where = "the request path"
+		}
+		detail := fmt.Sprintf("%s carries a URL for %s; a service that fetches it would carry the request past the allowlist", where, host)
+		if !p.learning() && !p.targetAllowed(host, port) {
+			detail += " (that host is not on the allowlist)"
+		}
+		p.recordFinding("url\x00"+subject+"\x00"+name+"\x00"+host, "proxy-embedded-url", subject, detail)
+	}
 }
 
 // flushViolations emits the collected proxy-violation and proxy-connect
@@ -689,7 +857,11 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 			clientSrc = obs.ClientReader(reader)
 			serverSrc = obs.ServerReader(upstream)
 		}
-		p.tunnel(conn, clientSrc, upstream, serverSrc)
+		clientSrc = tlsobserve.HelloReader(clientSrc, func(serverName string, ech bool) {
+			p.checkSNI(host, port, target, serverName, ech)
+		})
+		up, down := p.tunnel(conn, clientSrc, upstream, serverSrc)
+		p.recordTraffic(target, up, down)
 		return
 	}
 
@@ -728,7 +900,9 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 			return
 		}
 		defer upstream.Close()
-		p.recordConnect(net.JoinHostPort(normalizeProxyHost(host), portStr), "http")
+		target := net.JoinHostPort(normalizeProxyHost(host), portStr)
+		p.recordConnect(target, "http")
+		p.checkEmbeddedURLs(parts[0], parts[1], host, port)
 		_ = conn.SetDeadline(time.Time{})
 		// Rewrite the request line to origin-form; the headers and body follow
 		// untouched (the Host header the client sent is preserved) — they are
@@ -737,7 +911,8 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 		// coalesced into the same segment as its request line, leaving the
 		// origin waiting forever for a request it can never complete.
 		fmt.Fprintf(upstream, "%s %s %s\r\n", parts[0], path, parts[2])
-		p.tunnel(conn, reader, upstream, upstream)
+		up, down := p.tunnel(conn, reader, upstream, upstream)
+		p.recordTraffic(target, up, down)
 		return
 	}
 }
@@ -747,15 +922,16 @@ func (p *egressProxy) handleConn(conn net.Conn) {
 // parsed through, so that any bytes already drawn into its buffer are
 // forwarded rather than lost. a is the same client connection, used only for
 // writes and for the half-close. serverSrc reads from b, possibly through the
-// TLS observer.
-func (p *egressProxy) tunnel(a net.Conn, clientSrc io.Reader, b net.Conn, serverSrc io.Reader) {
+// TLS observer. It returns the bytes copied client to server (up) and server
+// to client (down).
+func (p *egressProxy) tunnel(a net.Conn, clientSrc io.Reader, b net.Conn, serverSrc io.Reader) (up, down int64) {
 	done := make(chan struct{}, 2)
-	cp := func(dst io.Writer, src io.Reader) {
-		_, _ = io.Copy(dst, src)
+	cp := func(dst io.Writer, src io.Reader, n *int64) {
+		*n, _ = io.Copy(dst, src)
 		done <- struct{}{}
 	}
-	go cp(a, serverSrc)
-	go cp(b, clientSrc)
+	go cp(a, serverSrc, &down)
+	go cp(b, clientSrc, &up)
 	<-done
 	// Closing the second direction unblocks the other copy.
 	if tc, ok := a.(*net.TCPConn); ok {
@@ -765,4 +941,5 @@ func (p *egressProxy) tunnel(a net.Conn, clientSrc io.Reader, b net.Conn, server
 		tc.CloseWrite()
 	}
 	<-done
+	return up, down
 }

@@ -176,6 +176,12 @@ func isUnshareFlagSupported(flag string) bool {
 // run forks the Go binary using the system 'unshare' to bypass Go's multi-threading EINVAL issues.
 // If user namespaces are unavailable it falls back to reduced isolation (seccomp + landlock only).
 func run(cfg config.ExecConfig) error {
+	reg := registerRun(cfg)
+	defer reg.close()
+	if cfg.EnableAudit {
+		emitDetections(reg.check())
+		defer func() { emitDetections(reg.check()) }()
+	}
 	if cfg.EnableLearn {
 		return runLearn(cfg)
 	}
@@ -280,7 +286,7 @@ func run(cfg config.ExecConfig) error {
 	}
 	// reduced runs the command in reduced isolation and reports its results.
 	reduced := func() error {
-		err := runReduced(cfg, cfgJSON, selfPath, httpTracer, &httpEvents, &stopPIDRefresh)
+		err := runReduced(cfg, cfgJSON, selfPath, proxy, httpTracer, &httpEvents, &stopPIDRefresh)
 		if err == nil {
 			emitDiff()
 		}
@@ -427,6 +433,7 @@ func run(cfg config.ExecConfig) error {
 	libPipe := newLibLoadPipe(cfg)
 	libPipe.attach(cmd)
 	defer libPipe.finish()
+	cgWatch, egress := attachDetections(cfg, cmd, proxy)
 
 	if cfg.WorkingDir != "" {
 		cmd.Dir = cfg.WorkingDir
@@ -439,9 +446,11 @@ func run(cfg config.ExecConfig) error {
 		if httpTracer != nil {
 			httpTracer.Close()
 		}
+		egress.abandon()
 		return fmt.Errorf("starting sandboxed process: %w", err)
 	}
 	libPipe.started()
+	defer startDetections(cfg, cmd, cgWatch, egress)()
 
 	if cfg.EnableAudit && auditW != nil {
 		auditW.Close()
@@ -1030,7 +1039,7 @@ func deduplicateHTTPAccess(entries []config.HTTPAccessEntry) []config.HTTPAccess
 // runReduced executes the target command with reduced isolation when user namespaces
 // are unavailable. It spawns self with --init-reduced, which applies seccomp-bpf and
 // Landlock network confinement without any namespace or filesystem isolation.
-func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTracer httptrace.Tracer, httpEvents *[]config.HTTPAccessEntry, stopPIDRefresh *chan struct{}) error {
+func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, proxy *egressProxy, httpTracer httptrace.Tracer, httpEvents *[]config.HTTPAccessEntry, stopPIDRefresh *chan struct{}) error {
 	// Filesystem diffing requires OverlayFS (mount namespace). Skip and warn.
 	if cfg.EnableDiff {
 		fmt.Fprintf(os.Stderr, "safer-exec: warning: --diff requires mount namespace isolation; skipped in reduced isolation mode\n")
@@ -1079,6 +1088,7 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 	libPipe := newLibLoadPipe(cfg)
 	libPipe.attach(cmd)
 	defer libPipe.finish()
+	cgWatch, egress := attachDetections(cfg, cmd, proxy)
 
 	if cfg.WorkingDir != "" {
 		cmd.Dir = cfg.WorkingDir
@@ -1091,9 +1101,11 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 		if httpTracer != nil {
 			httpTracer.Close()
 		}
+		egress.abandon()
 		return fmt.Errorf("starting reduced sandbox: %w", err)
 	}
 	libPipe.started()
+	defer startDetections(cfg, cmd, cgWatch, egress)()
 
 	if auditW != nil {
 		auditW.Close()
@@ -1196,6 +1208,7 @@ func runReduced(cfg config.ExecConfig, cfgJSON []byte, selfPath string, httpTrac
 func runInitReduced(cfg config.ExecConfig) error {
 	adoptAuditFd()
 	adoptLibPipeFd()
+	adoptDetectionEnv()
 	cgroupPath, v1Paths, err := setupCgroup(cfg)
 	if err != nil {
 		return fmt.Errorf("setting up cgroup: %w", err)
@@ -1359,6 +1372,7 @@ func collectAuditLog(r *os.File) {
 func runInit(cfg config.ExecConfig) error {
 	adoptAuditFd()
 	adoptLibPipeFd()
+	adoptDetectionEnv()
 
 	// Bring up loopback interface if network is disabled but loopback is allowed.
 	// Resolve `ip` from trusted system directories rather than $PATH so a hijacked
@@ -1805,8 +1819,11 @@ func rawExecve(path string, argv, envp []string) error {
 }
 
 func setupCgroupV2Internal(cfg config.ExecConfig) (string, error) {
-	if cfg.MaxCPUCores == 0 && cfg.MaxMemoryMB == 0 && cfg.MaxProcesses == 0 &&
-		cfg.MaxReadIOPS == 0 && cfg.MaxWriteIOPS == 0 && cfg.MaxReadBps == 0 && cfg.MaxWriteBps == 0 {
+	noLimits := cfg.MaxCPUCores == 0 && cfg.MaxMemoryMB == 0 && cfg.MaxProcesses == 0 &&
+		cfg.MaxReadIOPS == 0 && cfg.MaxWriteIOPS == 0 && cfg.MaxReadBps == 0 && cfg.MaxWriteBps == 0
+	// An audited run gets a cgroup without limits too, so the engine can
+	// sample its aggregate CPU and IO for timing channels (cgroupWatch).
+	if noLimits && !cgroupMonitor {
 		return "", nil
 	}
 	if _, err := os.Stat(cgroupV2Root); err != nil {
@@ -1831,10 +1848,17 @@ func setupCgroupV2Internal(cfg config.ExecConfig) (string, error) {
 		baseDir = filepath.Join(cgroupV2Root, currentCgroup)
 	}
 
-	cgroupName := fmt.Sprintf("safer-exec-%d", os.Getpid())
-	cgroupPath := filepath.Join(baseDir, cgroupName)
+	name := cgroupName
+	if name == "" {
+		name = fmt.Sprintf("safer-exec-%d", os.Getpid())
+	}
+	cgroupPath := filepath.Join(baseDir, name)
 
 	if err := os.Mkdir(cgroupPath, 0o755); err != nil {
+		if noLimits {
+			// Monitoring only: nothing to warn about, nothing enforced.
+			return "", nil
+		}
 		// If we still don't have permission (e.g. systemd delegation is disabled),
 		// gracefully skip cgroup limits instead of failing the sandbox.
 		if cfg.Strict {
@@ -3244,6 +3268,11 @@ func applySeccomp(cfg config.ExecConfig) error {
 
 	// Ensure no_new_privs is set (idempotent; also set earlier before Landlock).
 	setNoNewPrivs()
+
+	// The egress watch's notify filter goes first: its listener must be the
+	// only one in the chain, and the sandbox's filter, installed next, still
+	// wins wherever it denies (ERRNO and KILL outrank USER_NOTIF).
+	installEgressNotify()
 
 	insts := buildSeccompProgram(cfg)
 

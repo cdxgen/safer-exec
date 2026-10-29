@@ -719,3 +719,43 @@ func parseServerKeyExchange(body []byte, hs *Handshake) {
 		}
 	}
 }
+
+// HelloReader wraps the reader of client-to-server bytes and calls onHello
+// once with the ClientHello's server name and ECH flag, as soon as the first
+// ClientHello is complete. It follows only the client direction, so the egress
+// proxy can compare every tunnel's SNI with its CONNECT target without the
+// cost of the full Observer. Bytes pass through unchanged; a stream that is
+// not TLS, or whose ClientHello exceeds the client byte budget, never calls
+// onHello.
+func HelloReader(r io.Reader, onHello func(serverName string, ech bool)) io.Reader {
+	h := &helloWatch{onHello: onHello}
+	h.s.limit = clientLimit
+	return &tee{r: r, feed: h.feed, done: h.finished}
+}
+
+type helloWatch struct {
+	mu      sync.Mutex
+	s       stream
+	onHello func(string, bool)
+}
+
+func (h *helloWatch) feed(p []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.s.feed(p, func(typ byte, body []byte) bool {
+		if typ == msgClientHello {
+			var hs Handshake
+			parseClientHello(body, &hs)
+			if h.onHello != nil {
+				h.onHello(hs.ServerName, hs.ECH)
+			}
+		}
+		return false
+	})
+}
+
+func (h *helloWatch) finished() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.s.done
+}
