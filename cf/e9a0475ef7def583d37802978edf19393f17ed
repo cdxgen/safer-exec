@@ -1,0 +1,57 @@
+go/cmd/safer-exec/detect_linux_test.go
+  s_e379ad7b69967a::t_9fa3be69113216 6,88,148,151-152
+  s_e379ad7b69967a::t_df4c9ff96699d7 1-5,7-87,89-147,149-150,153-155
+go/internal/tlsobserve/tlsobserve.go
+  s_e379ad7b69967a::t_97b39d0c9fc308 722-761
+go/cmd/safer-exec/covert_test.go
+  s_e379ad7b69967a::t_36cd7113cd6683 46-75
+  s_e379ad7b69967a::t_f435f7bcfa37ac 4,7,141,194,223-231
+  s_e379ad7b69967a::t_bf0d02b9a176fc 1-3,5-6,8-45,76-140,142-193,195-222
+go/internal/tlsobserve/tlsobserve_test.go
+  s_e379ad7b69967a::t_e298a99eb7132b 24
+  s_e379ad7b69967a::t_8baf6ee19618b1 688-736
+go/cmd/safer-exec/engine_darwin.go
+  s_e379ad7b69967a::t_1904678a8cd323 58-63,232-236
+go/cmd/safer-exec/covert_windows.go
+  s_e379ad7b69967a::t_a658fef65a5a28 1-32
+go/cmd/safer-exec/engine_windows.go
+  s_e379ad7b69967a::t_1904678a8cd323 270-275,502-509,560,580
+go/cmd/safer-exec/covert_unix.go
+  s_e379ad7b69967a::t_f313392ac703a4 1-26
+go/cmd/safer-exec/engine_linux.go
+  s_e379ad7b69967a::t_52ecf782b83c83 3276
+  s_e379ad7b69967a::t_44a7f38eef8216 453,1108
+  s_e379ad7b69967a::t_acb4ba32347250 179-184,289,1042,1211,1375,1822-1826,1851-1855,1858-1861,3272-3275
+  s_e379ad7b69967a::t_ba11226993c5d7 436,449,1091,1104
+go/cmd/safer-exec/proxy_test.go
+  s_e379ad7b69967a::t_d0ed7d1643088b 821-989
+go/cmd/safer-exec/covert.go
+  s_e379ad7b69967a::t_36cd7113cd6683 49-51
+  s_e379ad7b69967a::t_f435f7bcfa37ac 125,130-136,162,167
+  s_e379ad7b69967a::t_4af00bd3322c92 1-48,52-124,126-129,137-161,163-166,168-390
+go/internal/winjob/job_windows.go
+  s_e379ad7b69967a::t_1904678a8cd323 453-478
+go/cmd/safer-exec/proxy.go
+  s_e379ad7b69967a::t_0554039e9d227f 26,67-91,117-118,362-363,369-385,389-511,860-864,903-905,914-915,925-927,929-930,933-934,944
+go/cmd/safer-exec/detect_linux.go
+  s_e379ad7b69967a::t_acb4ba32347250 13,599-616,619-631
+  s_e379ad7b69967a::t_4538312b657097 41-43,53-57,230-231,234,352-355
+  s_e379ad7b69967a::t_368b850613a26a 1-12,14-40,44-52,58-168,173-177,179-221,229,232-233,235-243,246,250-310,312-315,317-318,320-322,325-336,340-341,345,349-351,356-436,467-598,632
+  s_e379ad7b69967a::t_44a7f38eef8216 169-172,178,222-228,244-245,247-249,311,316,319,323-324,337-339,342-344,346-348,437-466,617-618
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cfe9a0475ef7def583d37802978edf19393f17ed",
+  "prompts": {},
+  "sessions": {
+    "s_e379ad7b69967a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "631b203a-d3fa-435c-91d3-e1e45bc47f58",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
