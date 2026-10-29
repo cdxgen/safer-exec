@@ -189,7 +189,7 @@ func TestRunRegistryReportsSharedPaths(t *testing.T) {
 	}
 	defer reg.close()
 
-	// A live peer (this test process's parent) and a dead one.
+	// A live peer (this process, under another record) and a dead one.
 	writeRecord := func(name string, rec runRecord) {
 		data, _ := json.Marshal(rec)
 		if err := os.WriteFile(filepath.Join(reg.dir, name), data, 0o600); err != nil {
@@ -198,7 +198,7 @@ func TestRunRegistryReportsSharedPaths(t *testing.T) {
 	}
 	resolvedShared := cleanPaths([]string{filepath.Join(shared, "sub")})[0]
 	resolvedLock := cleanPaths([]string{lock})[0]
-	writeRecord("peer.json", runRecord{PID: os.Getppid(), Command: "pip", WritePaths: []string{resolvedShared}, LockFiles: []string{resolvedLock}})
+	writeRecord("peer.json", runRecord{PID: os.Getpid(), Command: "pip", WritePaths: []string{resolvedShared}, LockFiles: []string{resolvedLock}})
 	writeRecord("dead.json", runRecord{PID: deadPID(t), Command: "gone", WritePaths: []string{resolvedShared}, LockFiles: []string{resolvedLock}})
 
 	entries := reg.check()
