@@ -1,0 +1,24 @@
+README.md
+  s_e379ad7b69967a::t_279d844b933f73 904-923
+THREAT-MODEL.md
+  s_e379ad7b69967a::t_279d844b933f73 586-605,607-608,640
+  s_e379ad7b69967a::t_92d3b2e7aeded9 606
+AGENTS.md
+  s_e379ad7b69967a::t_4432c3c431b8e5 37-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8b3afdee068156003a300eb974dd496fd47485b2",
+  "prompts": {},
+  "sessions": {
+    "s_e379ad7b69967a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "631b203a-d3fa-435c-91d3-e1e45bc47f58",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
