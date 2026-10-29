@@ -1,0 +1,19 @@
+go/cmd/safer-exec/covert_test.go
+  s_e379ad7b69967a::t_e4d6d580356514 261
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "146119d1ae0590e43037a7c05b14c7b2c2991120",
+  "prompts": {},
+  "sessions": {
+    "s_e379ad7b69967a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "631b203a-d3fa-435c-91d3-e1e45bc47f58",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
