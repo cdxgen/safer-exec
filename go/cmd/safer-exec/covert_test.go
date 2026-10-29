@@ -258,7 +258,7 @@ func TestRunRegistryIgnoresPlantedRecords(t *testing.T) {
 	resolved := cleanPaths([]string{shared})
 	good, _ := json.Marshal(runRecord{PID: os.Getpid(), Started: 7, Command: "forged", WritePaths: resolved})
 	// Name and content disagree.
-	os.WriteFile(filepath.Join(reg.dir, "1-7.json"), good, 0o600)
+	os.WriteFile(filepath.Join(reg.dir, fmt.Sprintf("%d-7.json", os.Getpid()+1)), good, 0o600)
 	// Oversized.
 	os.WriteFile(filepath.Join(reg.dir, fmt.Sprintf("%d-8.json", os.Getpid())), append(good, make([]byte, maxRecordBytes)...), 0o600)
 	if runtime.GOOS != "windows" {
