@@ -34,7 +34,13 @@ go/                           — Go engine (platform-specific sandboxing)
   cmd/safer-exec/             — Entry point + platform engines
     main.go                   — Reads JSON config from stdin, dispatches
     report.go                 — Report channel to the Node runner (audit entries, structured results)
-    proxy.go                  — Egress proxy (hostname allowlist; TLS handshake observation for traceCrypto)
+    proxy.go                  — Egress proxy (hostname allowlist; TLS handshake observation for traceCrypto;
+                                SNI-mismatch, embedded-URL and upload-heavy detections)
+    covert.go                 — Audit-only covert-channel detections shared by all platforms: on/off keying
+                                in sampled CPU/IO counters, and the per-user registry of concurrent runs
+                                (covert_unix.go / covert_windows.go: pid liveness, registry dir checks)
+    detect_linux.go           — Linux detection wiring: cgroup CPU/IO sampler and the seccomp user-notification
+                                egress watch (UDP / direct TCP outside the proxy; always continues the call)
     crypto_report.go, cbom.go — Crypto results, crypto audit entries and the CycloneDX CBOM (all platforms)
     engine_darwin.go          — macOS: Seatbelt + RLIMIT engine
     engine_linux.go           — Linux: namespaces + seccomp + Landlock (net + fs) + cgroup
