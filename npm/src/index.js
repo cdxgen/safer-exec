@@ -59,6 +59,7 @@ import { EventEmitter } from 'node:events';
 import { resolveHosts } from './net.js';
 import { stripDangerousEnv } from './env.js';
 import { run as runBinary, runPipe as runBinaryPipe } from './runner.js';
+import { buildFilesystemView, resolveVisiblePathInView } from './visibility.js';
 import { npmPolicy } from './policies/npm.js';
 import { pnpmPolicy } from './policies/pnpm.js';
 import { yarnPolicy } from './policies/yarn.js';
@@ -2044,55 +2045,116 @@ export class SaferExec extends EventEmitter {
   }
 
   /**
-   * Execute the sandboxed command.
+   * Collect the settings the filesystem view is built from.
    *
-   * Before spawning the Go binary, this method:
-   * 1. Resolves all allowed hostnames to IP addresses
-   * 2. Builds the JSON config
-   * 3. Spawns the Go binary and pipes the config via stdin
+   * @param {string[]} readPaths - Effective read paths
+   * @param {string[]} writePaths - Effective write paths
+   * @param {string} cmd - The command as sent to the engine
+   * @returns {Object}
+   */
+  _filesystemViewInput(readPaths, writePaths, cmd) {
+    return {
+      platform: process.platform,
+      readPaths,
+      writePaths,
+      cmd: cmd || '',
+      workingDir: this._workingDir,
+      cwd: process.cwd(),
+      home: process.env.HOME || '',
+      tmpDir: process.env.TMPDIR || '/tmp',
+      uid: typeof process.getuid === 'function' ? process.getuid() : -1,
+      systemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || '',
+      allowHidden: this._allowHidden,
+      protectSystem: this._protectSystem,
+      protectHome: this._protectHome,
+      privateTmp: this._privateTmp,
+      enableLearn: this._enableLearn,
+      enableDryRun: this._enableDryRun,
+      blockCrypto: this._blockCrypto,
+      blockCryptoEntropy: this._blockCryptoEntropy,
+      blockTPM: this._blockTPM,
+      allowGPU: this._allowGPU,
+      blockInterpreters: this._blockInterpreters,
+      allowWritableDylibLoad: this._allowWritableDylibLoad,
+    };
+  }
+
+  /**
+   * Describe which host paths the workload can read inside the sandbox.
    *
-   * @param {string} cmd - The command to execute
-   * @param {string[]} [args=[]] - Command arguments
-   * @returns {Promise<ExecResult>} The execution result
-   * @returns {string} returns.stdout - Captured stdout
-   * @returns {string} returns.stderr - Captured stderr
-   * @returns {number} returns.exitCode - Process exit code
-   * @returns {Array<Object>} [returns.auditLog] - Audit log entries (when enableAudit is true)
-   * @returns {Object} [returns.fsDiff] - Filesystem mutation report (when enableDiff is true)
-   * @returns {Object} [returns.learnedPolicy] - Auto-generated policy (when enableLearn is true)
+   * Once `run()` or `runPipe()` has started, this returns the view of the
+   * most recent run, recorded before the engine started. Before any run it
+   * describes the current settings. The view is read-only and computing it
+   * changes nothing on disk or in this instance.
+   *
+   * The view mirrors the rules each engine applies. On Linux a path counts
+   * as readable only when both the bind mounts of full isolation and the
+   * Landlock rules of reduced isolation allow it, so the answer holds in
+   * either mode. On macOS it follows the Seatbelt profile, including its
+   * hidden-file, credential-store and device denies. On Windows it covers
+   * `%SystemRoot%`, the working directory and the read and write grants. On
+   * other platforms `modeled` is false and no path is reported readable.
+   *
+   * @returns {import('./visibility.js').FilesystemView}
    *
    * @example
-   * const result = await new SaferExec()
-   *   .applyPolicy('npm')
-   *   .run('npm', ['install']);
+   * const exec = new SaferExec().traceLibraries();
+   * const result = await exec.run('python3', ['app.py']);
+   * const view = exec.filesystemView();
+   * console.log(view.readRoots);
+   */
+  filesystemView() {
+    if (this._lastFilesystemView) {
+      return this._lastFilesystemView;
+    }
+    const { readPaths, writePaths } = this._effectivePaths();
+    return buildFilesystemView(this._filesystemViewInput(readPaths, writePaths, ''));
+  }
+
+  /**
+   * Resolve a host path and return the resolved path when the workload of
+   * the most recent run could read it, or null when it could not.
    *
-   * if (result.exitCode === 0) {
-   *   console.log('Install succeeded');
+   * The path must be absolute. Symbolic links are resolved on the host first,
+   * so a link the workload left in a writable directory that points at a
+   * file the sandbox hid is reported as not readable. Open the returned path
+   * rather than the original one. Paths that do not exist return null.
+   *
+   * @param {string} path - Absolute host path, such as a `lib-load` audit target
+   * @returns {string|null} The resolved path, or null
+   *
+   * @example
+   * for (const entry of result.auditLog.filter((e) => e.type === 'lib-load')) {
+   *   const file = exec.resolveVisiblePath(entry.target);
+   *   if (file) {
+   *     // safe to hash `file`
+   *   }
    * }
    */
-  /**
-   * Build the ExecConfig object and resolve all hostnames to IPs.
-   *
-   * This is the shared preparation step used by both `run()` and `runPipe()`.
-   * It resolves symlinks, filters non-existent paths, and resolves hostnames.
-   *
-   * @param {string} cmd - The command to execute
-   * @param {string[]} args - Command arguments
-   * @returns {Promise<{ config: object, binaryPath: string, effectiveTimeout: number }>}
-   */
-  async _buildConfig(cmd, args) {
-    // Resolve hostnames to IPs
-    if (this._allowHosts.length > 0) {
-      const { ips, failures } = await resolveHosts(this._allowHosts);
-      this._allowIPs = ips;
+  resolveVisiblePath(path) {
+    return resolveVisiblePathInView(this.filesystemView(), path);
+  }
 
-      if (failures.length > 0) {
-        const hostList = failures.map((f) => f.host).join(', ');
-        console.warn(
-          `safer-exec: could not resolve hosts: ${hostList}`
-        );
-      }
-    }
+  /**
+   * Report whether the workload of the most recent run could read a host
+   * path. Same rules as {@link resolveVisiblePath}.
+   *
+   * @param {string} path - Absolute host path
+   * @returns {boolean}
+   */
+  isPathVisible(path) {
+    return this.resolveVisiblePath(path) !== null;
+  }
+
+  /**
+   * Compute the read and write paths sent to the engine: the configured paths
+   * plus the working directory, the Linux system directories and the Node.js
+   * runtime directories, without paths that do not exist and, unless hidden
+   * paths are allowed, without hidden ones.
+   *
+   * @returns {{ readPaths: string[], writePaths: string[] }}
+   */
+  _effectivePaths() {
     let effectiveReadPaths = [...this._readPaths];
     if (this._workingDir && this._workingDir !== '/' && !effectiveReadPaths.includes(this._workingDir)) {
       effectiveReadPaths.push(this._workingDir);
@@ -2202,6 +2264,61 @@ export class SaferExec extends EventEmitter {
     // Deduplicate
     effectiveReadPaths = Array.from(new Set(effectiveReadPaths));
     effectiveWritePaths = Array.from(new Set(effectiveWritePaths));
+
+    return { readPaths: effectiveReadPaths, writePaths: effectiveWritePaths };
+  }
+
+  /**
+   * Execute the sandboxed command.
+   *
+   * Before spawning the Go binary, this method:
+   * 1. Resolves all allowed hostnames to IP addresses
+   * 2. Builds the JSON config
+   * 3. Spawns the Go binary and pipes the config via stdin
+   *
+   * @param {string} cmd - The command to execute
+   * @param {string[]} [args=[]] - Command arguments
+   * @returns {Promise<ExecResult>} The execution result
+   * @returns {string} returns.stdout - Captured stdout
+   * @returns {string} returns.stderr - Captured stderr
+   * @returns {number} returns.exitCode - Process exit code
+   * @returns {Array<Object>} [returns.auditLog] - Audit log entries (when enableAudit is true)
+   * @returns {Object} [returns.fsDiff] - Filesystem mutation report (when enableDiff is true)
+   * @returns {Object} [returns.learnedPolicy] - Auto-generated policy (when enableLearn is true)
+   *
+   * @example
+   * const result = await new SaferExec()
+   *   .applyPolicy('npm')
+   *   .run('npm', ['install']);
+   *
+   * if (result.exitCode === 0) {
+   *   console.log('Install succeeded');
+   * }
+   */
+  /**
+   * Build the ExecConfig object and resolve all hostnames to IPs.
+   *
+   * This is the shared preparation step used by both `run()` and `runPipe()`.
+   * It resolves symlinks, filters non-existent paths, and resolves hostnames.
+   *
+   * @param {string} cmd - The command to execute
+   * @param {string[]} args - Command arguments
+   * @returns {Promise<{ config: object, binaryPath: string, effectiveTimeout: number }>}
+   */
+  async _buildConfig(cmd, args) {
+    // Resolve hostnames to IPs
+    if (this._allowHosts.length > 0) {
+      const { ips, failures } = await resolveHosts(this._allowHosts);
+      this._allowIPs = ips;
+
+      if (failures.length > 0) {
+        const hostList = failures.map((f) => f.host).join(', ');
+        console.warn(
+          `safer-exec: could not resolve hosts: ${hostList}`
+        );
+      }
+    }
+    const { readPaths: effectiveReadPaths, writePaths: effectiveWritePaths } = this._effectivePaths();
 
     const effectiveBlockExec = [...this._blockExec];
     // Forbid the sandboxed command from re-running safer-exec itself. Not on
@@ -2343,6 +2460,12 @@ export class SaferExec extends EventEmitter {
       windowsAllowDaclMutation: this._windowsAllowDaclMutation,
       windowsBlockWin32k: this._windowsBlockWin32k,
     };
+
+    // Recorded before the engine starts, so the workload cannot influence how
+    // the roots resolve.
+    this._lastFilesystemView = buildFilesystemView(
+      this._filesystemViewInput(config.readPaths, config.writePaths, config.cmd)
+    );
 
     const effectiveTimeout = this._timeoutMs;
 
