@@ -425,7 +425,7 @@ Every configuration method returns `this` for chaining. The `.run()` method retu
 
 ### Instance Methods
 
-All methods return `this` for chaining except `.run()`.
+All methods return `this` for chaining except `.run()`, `.runPipe()` and the read-only queries `.filesystemView()`, `.resolveVisiblePath()` and `.isPathVisible()` described under [Filesystem visibility](#filesystem-visibility).
 
 | Method                              | Description                                                                                                                                                                                                               |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -584,6 +584,54 @@ interface PipeOptions {
 ```
 
 Returns `Promise<Omit<ExecResult, 'stdout' | 'stderr'>>`. stdout and stderr are forwarded raw; audit entries and structured results (filesystem diffs, learned policies, profiles) arrive over the report channel described below.
+
+### Filesystem visibility
+
+A workload can report host paths back to its caller: `lib-load` audit entries, file names in its output, or a symbolic link it leaves in a writable directory. A caller that then reads those paths on the host, for example to hash the libraries a traced program loaded, must not read a file the sandbox hid from the workload. Three read-only methods answer whether the workload could read a host path.
+
+| Method                      | Returns                                                                                          |
+| --------------------------- | ------------------------------------------------------------------------------------------------ |
+| `.filesystemView()`         | A frozen `FilesystemView` describing what the workload could read.                               |
+| `.resolveVisiblePath(path)` | The path with every symbolic link resolved, if the workload could read it; otherwise `null`.     |
+| `.isPathVisible(path)`      | `true` when `.resolveVisiblePath(path)` is not `null`.                                           |
+
+```ts
+interface FilesystemView {
+  platform: string; // process.platform the view describes
+  mode: "enforce" | "learn" | "dry-run";
+  modeled: boolean; // false where the rules are not modeled; nothing is then readable
+  readRoots: readonly string[]; // host paths readable with everything beneath them
+  writeRoots: readonly string[];
+  deniedRoots: readonly string[]; // subtrees removed from readRoots
+  deniedDylibTrees: readonly string[]; // macOS .blockInterpreters(): no .dylib reads beneath
+  denyHidden: boolean; // macOS without .allowHidden(): no path component may start with "."
+  caseInsensitive: boolean; // Windows
+}
+```
+
+Once `.run()` or `.runPipe()` has prepared a run, the view is the one recorded for that run before the engine started, so a workload cannot change how the roots resolve. Before the first run it describes the current settings. With several runs on one instance, the most recent run wins. The methods change nothing on disk or in the instance; they only resolve paths.
+
+`.resolveVisiblePath()` requires an absolute path, resolves it on the host, and checks the resolved path against the view, so a link from the project directory to `~/.aws/credentials` is reported as not readable. Open the returned path rather than the one passed in. The answer is conservative: where the model cannot tell, it says the path was not readable.
+
+| Platform | Rules applied                                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux    | A path must be readable under both the bind mounts of full isolation (read and write paths, the working directory, `protectSystem`, `protectHome`, symlinked roots that resolve outside the allowed paths dropped, and the tmpfs of `privateTmp` and `protectHome: 'tmpfs'` over `/tmp`, `/var/tmp` and `$HOME`) and the Landlock rules on the read and write paths, so the answer holds in full and reduced isolation alike. Learn mode reads everything; dry-run reads nothing. |
+| macOS    | The Seatbelt profile: the system read paths, the temporary directories, the working directory, the command and the read and write paths, minus hidden components (unless `.allowHidden()`), the keychain, cookie and browser stores, `/private/etc/master.passwd` and the other credential denies, the run registry, the device denies, `.blockCrypto()` and `.blockInterpreters()`. Dry-run and learn mode use their own profiles. |
+| Windows  | `%SystemRoot%`, the working directory and the read and write grants, compared case-insensitively. A grant on a volume root does not cover its subdirectories. The directory of the program, which the engine finds on `PATH`, is not included. Dry-run keeps only `%SystemRoot%` and the working directory.                                                                                                       |
+| Other    | `modeled` is `false` and no path is readable.                                                                                                                                                                                                                                                                                                                                                                  |
+
+```js
+const exec = new SaferExec().workingDir(projectDir).traceLibraries();
+const result = await exec.run("python3", ["app.py"]);
+for (const entry of result.auditLog.filter((e) => e.type === "lib-load")) {
+  const file = exec.resolveVisiblePath(entry.target);
+  if (file) {
+    // The workload could read `file`; it is safe to hash.
+  }
+}
+```
+
+The check covers which file a path names, not what the file contains or how large it is. A visible path can still name a device node, a FIFO or a large sparse file the workload created, so a caller that reads it should also check the file type and bound the read.
 
 ## Architecture
 

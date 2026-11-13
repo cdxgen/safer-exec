@@ -15,8 +15,8 @@
 import { describe, it } from 'node:test';
 import strict from 'node:assert/strict';
 import { SaferExec } from '../npm/src/index.js';
-import { tmpdir } from 'node:os';
-import { realpathSync, mkdtempSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { realpathSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 describe('Security Tests', () => {
@@ -533,6 +533,34 @@ describe('Security Tests', () => {
         strict.match(result.stderr, /\/forged\/libevil\.so/);
       } finally {
         rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('Filesystem visibility', () => {
+    // A workload can leave a link in its writable directory that points at a
+    // host file the sandbox hides. resolveVisiblePath must agree with what
+    // the workload could actually read.
+    it('agrees with the sandbox about a link to a hidden host file', { skip: process.platform === 'win32' }, async () => {
+      const project = realpathSync(mkdtempSync(join(tmpdir(), 'safer-exec-vis-')));
+      const hidden = realpathSync(mkdtempSync(join(homedir(), 'safer-exec-vis-hidden-')));
+      try {
+        writeFileSync(join(hidden, 'secret'), 'secret');
+        writeFileSync(join(project, 'plugin.so'), 'plugin');
+        symlinkSync(join(hidden, 'secret'), join(project, 'link'));
+        const exec = new SaferExec().workingDir(project);
+        const result = await exec.run('sh', ['-c',
+          `cat "${join(project, 'plugin.so')}"; echo; cat "${join(project, 'link')}" || echo DENIED`]);
+
+        strict.match(result.stdout, /^plugin\n/, result.stderr);
+        strict.match(result.stdout, /DENIED/, result.stdout);
+        strict.equal(exec.resolveVisiblePath(join(project, 'plugin.so')), join(project, 'plugin.so'));
+        strict.equal(exec.resolveVisiblePath(join(project, 'link')), null);
+        strict.equal(exec.isPathVisible(join(hidden, 'secret')), false);
+        strict.equal(exec.filesystemView().mode, 'enforce');
+      } finally {
+        rmSync(project, { recursive: true, force: true });
+        rmSync(hidden, { recursive: true, force: true });
       }
     });
   });
