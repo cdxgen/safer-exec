@@ -117,8 +117,8 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 | Network namespace | Network isolation         | `CLONE_NEWNET` (when `disableNetwork` is true)                             |
 | pivot_root        | Root filesystem swap      | Mounts tmpfs, bind-mounts paths, pivots with MS_PRIVATE old-root cleanup   |
 | Seccomp-bpf       | Syscall filtering         | Blocks ptrace, kcmp, unshare, mount, pivot_root + stackable custom filters |
-| Landlock v2       | Network port filtering    | Ruleset version 5 (kernel 6.2+) for TCP connect/bind                       |
-| Landlock v3+      | Filesystem confinement    | `path_beneath` rules for read/write/execute/truncate/refer access          |
+| Landlock network  | TCP port filtering        | Landlock ABI 4 (kernel 6.7+) for connect/bind; skipped when the kernel reports a lower ABI |
+| Landlock fs       | Filesystem confinement    | `path_beneath` rules for read/write/execute/truncate/refer access          |
 | cgroup v2         | Resource quotas           | `cpu.max`, `memory.max`, `pids.max`, `io.max`                              |
 | LSM BPF           | Kernel-level audits       | Attaches BPF hooks to `bprm_check_security` / `file_open`                  |
 | MS_SLAVE          | Mount propagation control | Prevents sandbox mounts from leaking to host                               |
@@ -163,7 +163,7 @@ Seatbelt profiles start with `(deny default)` then add allow rules. The profile 
 **How isolation works:**
 
 - **Linux:** A tmpfs root is mounted. Read paths are bind-mounted read-only. Write paths are bind-mounted read-write. The process only sees mounted paths plus `/proc` and `/sys`.
-- **macOS:** The Seatbelt profile allows file reads and writes for all paths by default, then adds explicit subpath rules for the specified paths. The base `system.sb` profile is imported.
+- **macOS:** The Seatbelt profile starts from `(deny default)` plus the imported `system.sb`, then adds per-path subpath rules for standard system directories, the working directory, temporary directories and any explicitly configured paths. It contains no blanket `file-read*` or `file-write*` allows.
 - **Windows:** The BaseContainer sees only granted paths plus the read-only `%SystemRoot%`; everything else, including Program Files and the user profile, is invisible. See §3.18.
 
 **Mitigation:** By default, `safer-exec` avoids blanket allows and instead restricts macOS file operations to a standard minimal set. When no custom paths are specified, the sandbox profile generates rules allowing reading of standard system directories and the working directory, and restricts write access exclusively to temporary directories (e.g. `/tmp`, `/private/tmp`). If explicit read/write paths are supplied, only those paths (plus system directories) are permitted.
@@ -220,7 +220,7 @@ an attacker server over 443). When host-pinning is requested:
 
 - Memory, CPU, and process limits default to 0 (unlimited). The timeout defaults to 60 seconds. Users should explicitly set `maxMemory`, `maxCPUCores`, and `maxProcesses` for production use. Sensible recommendations: 512 MB memory, 1.0 CPU core, 100 processes.
 - RLIMIT_CPU on macOS limits total CPU time, not wall clock time. A single-threaded process gets the full allocation.
-- The process count limit on macOS adds 10 to the configured value to account for internal processes. On Linux it adds 2.
+- The process count limit on macOS adds 10 to the configured value to account for internal processes. On Linux the configured value is written to `pids.max` unchanged.
 
 ### 3.5 Environment Inheritance
 
@@ -249,13 +249,15 @@ A key listed in `allowEnvs()` bypasses **both** filters — it is the single, de
 
 1. Version declaration and default deny
 2. Import system.sb
-3. Base allows (signal, process-exec, process-fork, file-read*, file-write*, user-preference-read, file-read-metadata)
-4. Per-path read rules
-5. Per-path write rules
-6. Network rules
-7. Fork/exec restrictions (when configured)
+3. Fork/exec rules (`process-exec`, `process-fork`, interpreter-exec denies and exec tracing as configured)
+4. Per-path read rules: standard system read paths, the working directory and temporary directories, then explicit `readPaths`; targeted `deny` rules for entropy devices, crypto libraries or interpreter frameworks are emitted after the allow they narrow
+5. Per-path write rules for explicit `writePaths`
+6. Trailing base allows (`user-preference-read`, `file-read-metadata`) and the hidden-file denies
+7. Network rules (`remote ip` allows or the proxy entry point)
 
-**Residual risk:** The base allow rules grant broad file access. The per-path rules are additive. This is functionally correct but means the Seatbelt profile is permissive by design. The Linux path provides stronger isolation through the tmpfs + bind mount approach.
+There are no blanket `file-read*` or `file-write*` allows in the enforce profile; the learning profile still uses them by design.
+
+**Residual risk:** The default read set is broad (system directories, `/Library`, Homebrew prefixes), so a workload can read any installed software even though it cannot write outside its write paths. The Linux path provides stronger isolation through the tmpfs + bind mount approach.
 
 ### 3.7 Seccomp Filter (Linux)
 
@@ -373,9 +375,9 @@ path; egress over an allowed port (which macOS Seatbelt cannot pin to a host).
 
 **Residual risk:** The unsigned-executable-memory primitive is a syscall-level
 capability that **Seatbelt cannot filter**, so on macOS in-process JIT inside an
-_allowed_ binary (including the target command itself) cannot be prevented — only
-detected, via EndpointSecurity `es_event_mmap`/`es_event_mprotect` telemetry and
-the Tcl/Ffidl framework reads surfaced by `traceLibraries`. `blockJIT` is opt-in
+_allowed_ binary (including the target command itself) can be neither prevented
+nor directly observed; `traceLibraries` surfaces the Tcl/Ffidl framework reads
+that hint at it, but there is no mmap-level JIT telemetry. `blockJIT` is opt-in
 because it breaks legitimate JITs (V8/Node, the JVM, LuaJIT). `blockInterpreters`
 is macOS-specific; on Linux the entitlement model does not apply, and arbitrary
 interpreters are governed by `allowExec`/`blockExec` and `blockJIT` instead.
@@ -455,7 +457,7 @@ privileged caches.
 
 **Network namespace:**
 
-A new network namespace is created when `disableNetwork` is true. This prevents the sandboxed process from observing host network interfaces, listening sockets, or network connection state. When a new network namespace is active, explicit `allowHosts` / `allowPorts` configuration is required for outbound connectivity.
+A new network namespace is created when `disableNetwork` is true. This prevents the sandboxed process from observing host network interfaces, listening sockets, or network connection state, and it severs outbound connectivity entirely: `allowHosts` / `allowPorts` apply only while the host network namespace is shared, and only `allowLoopback` can bring up loopback inside the new namespace.
 
 **Network Port Listening Restriction:**
 By default, the sandboxed process is prevented from listening on any network port (including local loopback `lo`) on macOS, Linux and Windows. Listening or binding to specific IP addresses or ports must be explicitly permitted using `allowListen` / `--allow-listen`.
@@ -620,9 +622,9 @@ Policies are resolved at runtime based on the operating system. The following pl
 | cargo    | Rustup: `~/.rustup`, cargo: `~/.cargo`                      | Same paths (cross-platform)                                   |
 | rubygems | Ruby: `/usr/bin/ruby`, lib: `/usr/lib/ruby`                 | Ruby: `/usr/bin/ruby`, lib: `/usr/lib/ruby`                   |
 | composer | PHP: `/usr/bin/php`, lib: `/usr/local/lib/php`              | PHP: `/usr/bin/php`, lib: `/usr/lib/php`                      |
-| deno     | Deno: `/usr/local/bin/deno`                                 | Deno: `/usr/bin/deno`                                         |
+| deno     | Deno: `/usr/local/bin/deno` (overridden by `which deno` when present) | Same defaults and `which` override on Linux                    |
 | gomod    | Go: `/usr/local/go`                                         | Go: `/usr/local/go`                                           |
-| bun      | Bun: `/usr/local/bin/bun`                                   | Bun: `/usr/bin/bun`                                           |
+| bun      | Bun: `/usr/local/bin/bun` (overridden by `which bun` when present) | Same defaults and `which` override on Linux                    |
 
 **Residual risk:** If the target binary lives in a non-standard location, the policy may not include the correct read path. For example, Homebrew-installed tools on macOS live in `/opt/homebrew/bin` on Apple Silicon, which is not covered by the default policies.
 
@@ -652,7 +654,7 @@ This section analyzes advanced threat vectors, escape techniques, and how `safer
 ## 6. Recommendations
 
 1. **Set resource limits for production use.** Resource limits (memory, CPU, process count) default to 0 (unlimited). Configure `maxMemory`, `maxCPUCores`, and `maxProcesses` explicitly. Sensible defaults for most workloads: 512 MB memory, 1.0 CPU core, 100 processes. The timeout defaults to 60 seconds.
-2. **Strengthen macOS Seatbelt rules.** Remove the blanket `(allow file-read*)` and `(allow file-write*)` rules. Use only the per-path subpath rules for actual confinement.
+2. **macOS Seatbelt rules are now per-path only.** The blanket `(allow file-read*)` and `(allow file-write*)` rules have been removed from the enforce profile, which confines through per-path subpath rules (§3.6).
 3. **Landlock port ranges are now narrowed.** Only explicitly configured ports (defaults: 80, 443) are allowed — the 1-1024 wildcard has been removed.
 4. **Include IPv6 in Landlock rules.** The current implementation adds both IPv4 and IPv6 rules, but DNS resolution may return IPv6 addresses that are not included in the allow list.
 5. **Add a policy validation step.** Before execution, verify that read paths exist and write paths do not overlap with read paths.
