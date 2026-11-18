@@ -1,0 +1,29 @@
+name: Verify actions lock
+
+# Verifies the repository's GitHub Actions dependency lockfile on pull
+# requests and pushes that touch workflows or composite actions. Run
+# gh actions-lock in the repository checkout to write
+# .github/workflows/actions.lock first, and make this check required. See
+# https://github.com/cdxgen/.github/tree/main/workflow-templates
+on:
+  pull_request:
+    paths:
+      - .github/workflows/**
+      - '**/action.y*ml'
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/**
+      - '**/action.y*ml'
+
+permissions: {}
+
+jobs:
+  verify:
+    permissions:
+      contents: read
+    # A lockfile does not cover reusable workflow calls, so the caller pins
+    # this one to the cdxgen/.github commit that carries the workflow and
+    # its own lockfile.
+    uses: cdxgen/.github/.github/workflows/verify-actions-lock.yml@3ff2219047016d816714783fa5cc6263c2b53ebb

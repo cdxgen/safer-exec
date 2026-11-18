@@ -1,0 +1,3 @@
+# The lockfile pins the commits the workflows run from, so changes to it
+# need the same review as a change to a workflow file.
+.github/workflows/actions.lock @prabhu
