@@ -28,6 +28,16 @@ const cliPath = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
 let skipReason = isWindows ? '' : 'Windows only';
 let diagnostics = {};
 
+// The diagnostics probe passes on runners whose Windows image ships MXC
+// without registering the trace and security-environment endpoints, so the
+// tests learn it only from the run itself, reported as a backend_error with
+// E_NOTIMPL (0x80004001) or EPT_S_NOT_REGISTERED (0x800706D9). That is a
+// property of the runner, not a regression in the sandbox.
+function mxcCapabilityMissing(res) {
+  const stderr = res?.stderr ?? '';
+  return /MXC backend_error/.test(stderr) && /0x80004001|0x800706D9/.test(stderr);
+}
+
 // realpathSync.native expands 8.3 short names (a runner's TEMP is often
 // C:\Users\RUNNER~1\...), matching the long names the engine reports.
 function workDir() {
@@ -153,6 +163,7 @@ describe('Windows engine (MXC)', { skip: !isWindows && 'Windows only' }, () => {
         .traceExec()
         .enableAudit()
         .run('cmd.exe', ['/c', 'cmd.exe /c echo nested-child']);
+      if (mxcCapabilityMissing(res)) return t.skip(`MXC backend lacks the capability here: ${res.stderr}`);
       strict.doesNotMatch(res.stdout, /nested-child/);
       strict.ok(res.auditLog.some((e) => e.type === 'process-exec'), JSON.stringify(res.auditLog));
       strict.ok(res.auditLog.some((e) => e.type === 'resource-limit'), JSON.stringify(res.auditLog));
@@ -173,6 +184,7 @@ describe('Windows engine (MXC)', { skip: !isWindows && 'Windows only' }, () => {
         .traceLibraries()
         .suppressLibLoadStderr(true)
         .run('cmd.exe', ['/c', 'ver']);
+      if (mxcCapabilityMissing(res)) return t.skip(`MXC backend lacks the capability here: ${res.stderr}`);
       strict.equal(res.exitCode, 0, res.stderr);
       const libs = res.auditLog.filter((e) => e.type === 'lib-load').map((e) => e.target.toLowerCase());
       strict.ok(libs.some((p) => p.endsWith('\\system32\\ntdll.dll')), JSON.stringify(libs));
@@ -200,6 +212,7 @@ describe('Windows engine (MXC)', { skip: !isWindows && 'Windows only' }, () => {
         ].join('\r\n'),
       );
       const res = await new SaferExec().workingDir(dir).writePaths(dir).enableAudit().enableDiff().run(script, []);
+      if (mxcCapabilityMissing(res)) return t.skip(`MXC backend lacks the capability here: ${res.stderr}`);
       strict.equal(res.exitCode, 0, res.stderr);
       strict.ok(!res.auditLog.some((e) => String(e.target).toLowerCase().includes('forged')), JSON.stringify(res.auditLog));
       strict.ok(!JSON.stringify(res.fsDiff ?? {}).includes('forged'), JSON.stringify(res.fsDiff));
