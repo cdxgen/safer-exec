@@ -252,6 +252,21 @@ func runEngine(t *testing.T, cfg config.ExecConfig, extraEnv ...string) runResul
 	_ = cmd.Run()
 	res := runResult{stdout: stdout.String(), stderr: stderr.String(), code: cmd.ProcessState.ExitCode()}
 	t.Logf("exit=%d\nstdout:\n%s\nstderr:\n%s", res.code, res.stdout, res.stderr)
+	// The tier probe in requireMXC passes on runners whose Windows image
+	// ships MXC without registering the trace and security-environment
+	// endpoints, so the tests learn it only from the run itself. A
+	// backend_error with E_NOTIMPL (0x80004001) or EPT_S_NOT_REGISTERED
+	// (0x800706D9) is a property of the runner, not a regression.
+	if res.code != 0 {
+		combined := res.stdout + res.stderr
+		if strings.Contains(combined, "MXC backend_error") {
+			for _, hresult := range []string{"0x80004001", "0x800706D9"} {
+				if strings.Contains(combined, hresult) {
+					t.Skipf("MXC backend lacks the capability here: %s", hresult)
+				}
+			}
+		}
+	}
 	return res
 }
 
