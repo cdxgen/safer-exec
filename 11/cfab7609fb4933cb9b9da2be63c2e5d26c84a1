@@ -1,0 +1,24 @@
+npm/src/windows.test.js
+  s_8cbdd9e5002975::t_97ad21db19b665 215
+  s_8cbdd9e5002975::t_c4bfedf1bc1708 187
+  s_8cbdd9e5002975::t_faacaf784bcc3a 31-40
+  s_8cbdd9e5002975::t_6a9be397004178 166
+go/cmd/safer-exec/engine_windows_test.go
+  s_8cbdd9e5002975::t_8c2d738d417f80 255-269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "11cfab7609fb4933cb9b9da2be63c2e5d26c84a1",
+  "prompts": {},
+  "sessions": {
+    "s_8cbdd9e5002975": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "sess_6069faca-92d9-4572-89fa-ecc8c90e7b25",
+        "model": "GLM-5.3"
+      },
+      "human_author": "Team AppThreat <cloud@appthreat.com>"
+    }
+  }
+}
